@@ -219,6 +219,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     !string.IsNullOrWhiteSpace(financialAdvisorsGroupFilter));
         }
 
+        internal static bool IsFinancialAdvisorGroupFilteredOut(
+            string financialAdvisorsGroupFilter,
+            string groupName)
+        {
+            return !string.IsNullOrEmpty(financialAdvisorsGroupFilter)
+                && !string.IsNullOrEmpty(groupName)
+                && !groupName.Equals(
+                    financialAdvisorsGroupFilter,
+                    StringComparison.InvariantCultureIgnoreCase);
+        }
+
         internal bool RequestGroupAssignment(
             string accountId,
             string targetGroupName,

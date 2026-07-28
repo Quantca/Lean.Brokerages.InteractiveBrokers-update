@@ -49,8 +49,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _financialAdvisorGroupManagementEnabled;
         private bool _financialAdvisorUnifiedGroupsEnabled;
         private InteractiveBrokersFinancialAdvisorAccountState _financialAdvisorAccountState;
-        private int _financialAdvisorAccountUpdateRequestId;
-        private int _financialAdvisorPositionRequestId;
 
         /// <inheritdoc/>
         public BrokerageAccountSnapshot GetAccountSnapshot()
@@ -163,16 +161,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
-            if (!string.IsNullOrEmpty(_financialAdvisorsGroupFilter))
-            {
-                _client.AccountUpdateMultiWithRequestId += HandleFinancialAdvisorAccountUpdateRow;
-            }
-
-            if (_algorithm != null)
-            {
-                _client.PositionMulti += HandleFinancialAdvisorPositionRow;
-            }
-
             _financialAdvisorAccountState =
                 new InteractiveBrokersFinancialAdvisorAccountState(
                     _client,
@@ -228,46 +216,50 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
-        private void HandleFinancialAdvisorAccountUpdateRow(object sender, IB.AccountUpdateMultiEventArgs e)
+        private bool IsFinancialAdvisorAccountUpdateServiceRow(
+            IB.UpdateAccountValueEventArgs eventArgs)
         {
-            _financialAdvisorAccountUpdateRequestId = e.RequestId;
-        }
-
-        private void HandleFinancialAdvisorPositionRow(object sender, IB.PositionMultiEventArgs e)
-        {
-            _financialAdvisorPositionRequestId = e.RequestId;
-        }
-
-        private bool IsFinancialAdvisorAccountUpdateServiceRow()
-        {
-            var requestId = _financialAdvisorAccountUpdateRequestId;
-            _financialAdvisorAccountUpdateRequestId = 0;
             return _financialAdvisorUnifiedGroupsEnabled &&
-                InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(requestId);
+                eventArgs.AccountUpdatesMultiRequestId.HasValue &&
+                InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
+                    eventArgs.AccountUpdatesMultiRequestId.Value);
         }
 
         private bool TryGetFinancialAdvisorPortfolioPosition(
             IB.UpdatePortfolioEventArgs eventArgs,
             out decimal position)
         {
-            var requestId = _financialAdvisorPositionRequestId;
-            _financialAdvisorPositionRequestId = 0;
             position = _financialAdvisorUnifiedGroupsEnabled
                 ? eventArgs.PositionQuantity
                 : eventArgs.Position;
             return !_financialAdvisorUnifiedGroupsEnabled ||
-                !InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(requestId);
+                !eventArgs.PositionsMultiRequestId.HasValue ||
+                !InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
+                    eventArgs.PositionsMultiRequestId.Value);
         }
 
         internal void ValidateFinancialAdvisorOrderAdmission(Order order)
         {
-            if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor || order?.Type == OrderType.OptionExercise)
+            ConfigureFinancialAdvisorOrder(new IBApi.Order(), order);
+        }
+
+        private void ConfigureFinancialAdvisorOrder(
+            IBApi.Order ibOrder,
+            Order leanOrder)
+        {
+            if (!_financialAdvisorUnifiedGroupsEnabled ||
+                !IsFinancialAdvisor ||
+                leanOrder?.Type == OrderType.OptionExercise)
             {
                 return;
             }
-            var properties = order.Properties as InteractiveBrokersOrderProperties;
+            var properties =
+                leanOrder.Properties as InteractiveBrokersOrderProperties;
             if (!string.IsNullOrWhiteSpace(properties?.Account))
             {
+                ibOrder.Account = properties.Account;
+                ibOrder.FaGroup = string.Empty;
+                ibOrder.FaMethod = string.Empty;
                 return;
             }
             if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
@@ -285,7 +277,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             if (_financialAdvisorAccountState?.IsGroupTradingBlocked == true &&
                 FAState.IsFinancialAdvisorGroupOrder(
-                    order,
+                    leanOrder,
                     _financialAdvisorsGroupFilter))
             {
                 throw new InvalidOperationException(
@@ -293,33 +285,32 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             var hasExplicitGroup = !string.IsNullOrWhiteSpace(properties?.FaGroup);
-            var allocationOrder = new IBApi.Order
-            {
-                FaGroup = hasExplicitGroup ? properties.FaGroup.Trim() : _financialAdvisorsGroupFilter,
-                FaMethod = hasExplicitGroup
-                    ? properties.FaMethod : string.Empty,
-                TotalQuantity = (int)Math.Abs(order.GroupOrderManager?.Quantity ?? order.Quantity)
-            };
-            ConfigureFinancialAdvisorOrder(allocationOrder, properties);
-        }
-
-        private void ConfigureFinancialAdvisorOrder(IBApi.Order order, InteractiveBrokersOrderProperties properties)
-        {
-            if (!_financialAdvisorUnifiedGroupsEnabled || string.IsNullOrWhiteSpace(order.FaGroup))
+            ibOrder.FaGroup = hasExplicitGroup
+                ? properties.FaGroup.Trim()
+                : _financialAdvisorsGroupFilter;
+            ibOrder.FaMethod = hasExplicitGroup
+                ? properties.FaMethod
+                : string.Empty;
+            if (string.IsNullOrWhiteSpace(ibOrder.FaGroup))
             {
                 return;
             }
 
-            order.FaGroup = order.FaGroup.Trim();
-            order.FaMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
-            if (order.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
+            ibOrder.FaGroup = ibOrder.FaGroup.Trim();
+            ibOrder.FaMethod =
+                FAState.NormalizeFinancialAdvisorAllocationMethod(ibOrder.FaMethod);
+            ibOrder.TotalQuantity = Math.Abs(
+                leanOrder.GroupOrderManager?.Quantity ?? leanOrder.Quantity);
+            if (ibOrder.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
             {
-                order.FaMethod = "PctChange";
-                order.FaPercentage =
+                ibOrder.FaMethod = "PctChange";
+                ibOrder.FaPercentage =
                     (properties.ExactFaPercentage ?? properties.FaPercentage).ToStringInvariant();
-                order.TotalQuantity = 0m;
+                ibOrder.TotalQuantity = 0m;
             }
-            ValidateFinancialAdvisorAllocationMethod(order, GetAccountSnapshot());
+            ValidateFinancialAdvisorAllocationMethod(
+                ibOrder,
+                GetAccountSnapshot());
         }
 
         internal static void ValidateFinancialAdvisorAllocationMethod(
@@ -390,11 +381,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns><c>true</c> if the group is allowed; otherwise, <c>false</c>.</returns>
         private bool IsFaGroupFlitterSet(string groupName)
         {
-            return !string.IsNullOrEmpty(_financialAdvisorsGroupFilter)
-                && !string.IsNullOrEmpty(groupName)
-                && !groupName.Equals(
-                    _financialAdvisorsGroupFilter,
-                    StringComparison.InvariantCultureIgnoreCase);
+            return FAState.IsFinancialAdvisorGroupFilteredOut(
+                _financialAdvisorsGroupFilter, groupName);
         }
     }
 }

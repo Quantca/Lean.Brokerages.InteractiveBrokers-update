@@ -138,6 +138,39 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [Test]
+        public void FinancialAdvisorServiceRowsNeverReachLegacyAccountDataTest()
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                GroupName,
+                unifiedGroupsEnabled: true);
+
+            scenario.EmitLegacyRows();
+            scenario.EmitPublicServiceRowsWithoutInternalCallbacks();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(CashBalance, scenario.GetCashBalance());
+                Assert.AreEqual(ExactPosition, scenario.GetHoldingQuantity());
+            });
+        }
+
+        [Test]
+        public void NonServiceRowsAreNeverDroppedWhenCallbacksInterleaveTest()
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                GroupName,
+                unifiedGroupsEnabled: true);
+
+            scenario.EmitNonServiceRowsInsideServiceCallbacks();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(CashBalance, scenario.GetCashBalance());
+                Assert.AreEqual(ExactPosition, scenario.GetHoldingQuantity());
+            });
+        }
+
         private static FieldInfo GetRequiredField(string name)
         {
             return typeof(InteractiveBrokersBrokerage).GetField(name, InstanceNonPublic)
@@ -156,7 +189,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             private bool _disposed;
 
             public InteractiveBrokersBrokerage Brokerage { get; }
-            public IB.InteractiveBrokersClient Client { get; }
+            public ReorderableInteractiveBrokersClient Client { get; }
 
             private LegacyAccountScenario(
                 string financialAdvisorGroupFilter,
@@ -164,7 +197,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 bool configureFeatures)
             {
                 Brokerage = new InteractiveBrokersBrokerage();
-                Client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
+                Client = new ReorderableInteractiveBrokersClient();
 
                 AccountField.SetValue(Brokerage, "F-MASTER");
                 AlgorithmField.SetValue(Brokerage, new QCAlgorithm());
@@ -284,6 +317,69 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Currencies.USD);
             }
 
+            public void EmitPublicServiceRowsWithoutInternalCallbacks()
+            {
+                Client.EmitPublicPortfolio(
+                    new IB.UpdatePortfolioEventArgs(
+                        CreateContract(),
+                        999.5m,
+                        900.5,
+                        0,
+                        900.5,
+                        0,
+                        0,
+                        AccountId,
+                        ServiceRequestId));
+                Client.EmitPublicAccountUpdate(
+                    new IB.UpdateAccountValueEventArgs(
+                        "CashBalance",
+                        "9999.99",
+                        Currencies.USD,
+                        AccountId,
+                        ServiceRequestId));
+            }
+
+            public void EmitNonServiceRowsInsideServiceCallbacks()
+            {
+                var accountRowEmitted = false;
+                var positionRowEmitted = false;
+                Client.AccountUpdateMultiWithRequestId += (_, args) =>
+                {
+                    if (args.RequestId == ServiceRequestId && !accountRowEmitted)
+                    {
+                        accountRowEmitted = true;
+                        Client.EmitPublicAccountUpdate(
+                            new IB.UpdateAccountValueEventArgs(
+                                "CashBalance",
+                                CashBalance.ToString(
+                                    System.Globalization.CultureInfo.InvariantCulture),
+                                Currencies.USD,
+                                AccountId,
+                                PositiveRequestId));
+                    }
+                };
+                Client.PositionMulti += (_, args) =>
+                {
+                    if (args.RequestId == ServiceRequestId && !positionRowEmitted)
+                    {
+                        positionRowEmitted = true;
+                        Client.EmitPublicPortfolio(
+                            new IB.UpdatePortfolioEventArgs(
+                                CreateContract(),
+                                ExactPosition,
+                                101,
+                                176.75,
+                                100.5,
+                                0,
+                                0,
+                                AccountId,
+                                PositiveRequestId));
+                    }
+                };
+
+                EmitServiceRows();
+            }
+
             public decimal GetCashBalance()
             {
                 return Brokerage.GetCashBalance().Single(
@@ -373,6 +469,27 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Client.Dispose();
                 ClientField.SetValue(Brokerage, null);
                 Brokerage.Dispose();
+            }
+        }
+
+        private sealed class ReorderableInteractiveBrokersClient :
+            IB.InteractiveBrokersClient
+        {
+            public ReorderableInteractiveBrokersClient()
+                : base(new EReaderMonitorSignal())
+            {
+            }
+
+            public void EmitPublicAccountUpdate(
+                IB.UpdateAccountValueEventArgs eventArgs)
+            {
+                OnAccountUpdateMulti(eventArgs);
+            }
+
+            public void EmitPublicPortfolio(
+                IB.UpdatePortfolioEventArgs eventArgs)
+            {
+                OnUpdatePortfolio(eventArgs);
             }
         }
     }

@@ -2263,7 +2263,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private void HandleUpdateAccountValue(object sender, IB.UpdateAccountValueEventArgs e)
         {
-            if (IsFinancialAdvisorAccountUpdateServiceRow()) return;
+            if (IsFinancialAdvisorAccountUpdateServiceRow(e)) return;
             if (Log.DebuggingEnabled)
             {
                 Log.Trace($"HandleUpdateAccountValue(): Key:{e.Key} Value:{e.Value} Currency:{e.Currency} AccountName:{e.AccountName}");
@@ -3084,7 +3084,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     ibOrder.Account ??= string.Empty;
                 }
 
-                ConfigureFinancialAdvisorOrder(ibOrder, orderProperties);
+                ConfigureFinancialAdvisorOrder(ibOrder, order);
             }
 
             // not yet supported

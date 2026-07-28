@@ -152,12 +152,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var implicitFilterOrder = CreateOrder(new InteractiveBrokersOrderProperties());
 
             Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(directOrder));
+            Assert.DoesNotThrow(() => ConvertOrder(brokerage, directOrder));
             StringAssert.Contains(
                 "blocked while account-group configuration",
-                Assert.Throws<InvalidOperationException>(() =>
-                    brokerage.ValidateFinancialAdvisorOrderAdmission(groupOrder)).Message);
-            Assert.Throws<InvalidOperationException>(() =>
-                brokerage.ValidateFinancialAdvisorOrderAdmission(implicitFilterOrder));
+                AssertAdmissionAndConversionRejectSame(
+                    brokerage,
+                    groupOrder).Message);
+            AssertAdmissionAndConversionRejectSame(
+                brokerage,
+                implicitFilterOrder);
         }
 
         [Test]
@@ -263,6 +266,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 FaGroup = $"  {FaGroupName}  "
             });
             var implicitFilterOrder = CreateOrder(new InteractiveBrokersOrderProperties());
+            var profileOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaProfile = "LegacyProfile"
+            });
 
             Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(directOrder));
             var ibOrder = ConvertOrder(brokerage, directOrder);
@@ -272,8 +279,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             StringAssert.Contains(
                 "does not match the configured",
-                Assert.Throws<InvalidOperationException>(() =>
-                    brokerage.ValidateFinancialAdvisorOrderAdmission(outsideGroupOrder)).Message);
+                AssertAdmissionAndConversionRejectSame(
+                    brokerage,
+                    outsideGroupOrder).Message);
+            Assert.IsInstanceOf<NotSupportedException>(
+                AssertAdmissionAndConversionRejectSame(
+                    brokerage,
+                    profileOrder));
             Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(matchingGroupOrder));
             Assert.AreEqual(FaGroupName, ConvertOrder(brokerage, matchingGroupOrder).FaGroup);
             Assert.AreEqual(FaGroupName, ConvertOrder(brokerage, implicitFilterOrder).FaGroup);
@@ -297,6 +309,77 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreEqual("PctChange", ibOrder.FaMethod);
             Assert.AreEqual("12.5", ibOrder.FaPercentage);
             Assert.AreEqual(0m, ibOrder.TotalQuantity);
+        }
+
+        [Test]
+        public void FractionalContractsOrSharesTotalRoundTripsThroughAdmissionAndConversionTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 9.5m,
+                    ["B"] = 10.25m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+            var order = new LimitOrder(
+                Symbols.SPY,
+                19.75m,
+                100m,
+                new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
+                properties: new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                });
+
+            Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+            var ibOrder = ConvertOrder(brokerage, order);
+
+            Assert.AreEqual(19.75m, ibOrder.TotalQuantity);
+            Assert.IsEmpty(ibOrder.FaMethod);
+        }
+
+        [Test]
+        public void ReadySnapshotWithInconsistentSavedAllocationFailsClosedTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "Ratio",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 1m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+            var order = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName
+            });
+
+            StringAssert.Contains(
+                "allocation keys must exactly match",
+                AssertAdmissionAndConversionRejectSame(
+                    brokerage,
+                    order).Message);
         }
 
         [Test]
@@ -437,6 +520,29 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             return (IBApi.Order)ConvertOrderMethod.Invoke(
                 brokerage,
                 new object[] { new List<LeanOrder> { order }, contract, 1 });
+        }
+
+        private static Exception AssertAdmissionAndConversionRejectSame(
+            InteractiveBrokersBrokerage brokerage,
+            LeanOrder order)
+        {
+            var admissionException = Assert.Catch(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+            var conversionException = Assert.Throws<TargetInvocationException>(() =>
+                ConvertOrder(brokerage, order)).InnerException;
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsNotNull(admissionException);
+                Assert.IsNotNull(conversionException);
+                Assert.AreEqual(
+                    admissionException.GetType(),
+                    conversionException.GetType());
+                Assert.AreEqual(
+                    admissionException.Message,
+                    conversionException.Message);
+            });
+            return admissionException;
         }
 
         private static BrokerageAccountSnapshot CreateSnapshot(

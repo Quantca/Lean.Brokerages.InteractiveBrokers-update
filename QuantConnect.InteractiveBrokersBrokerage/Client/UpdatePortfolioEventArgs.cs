@@ -42,6 +42,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public decimal PositionQuantity { get; }
 
         /// <summary>
+        /// Gets the originating positions-multi request identifier, if any.
+        /// </summary>
+        internal int? PositionsMultiRequestId { get; }
+
+        /// <summary>
         /// The unit price of the instrument.
         /// </summary>
         public double MarketPrice { get; }
@@ -82,11 +87,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <summary>
         /// Initializes a new instance of the <see cref="UpdatePortfolioEventArgs"/> class with an exact position.
         /// </summary>
-        internal UpdatePortfolioEventArgs(Contract contract, decimal position, double marketPrice, double marketValue, double averageCost, double unrealisedPnl, double realisedPnl, string accountName)
+        internal UpdatePortfolioEventArgs(
+            Contract contract,
+            decimal position,
+            double marketPrice,
+            double marketValue,
+            double averageCost,
+            double unrealisedPnl,
+            double realisedPnl,
+            string accountName,
+            int? positionsMultiRequestId = null)
         {
             Contract = contract;
             Position = Convert.ToInt32(position);
             PositionQuantity = position;
+            PositionsMultiRequestId = positionsMultiRequestId;
             MarketPrice = marketPrice;
             MarketValue = marketValue;
             AverageCost = averageCost;

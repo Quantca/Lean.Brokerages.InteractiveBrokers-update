@@ -92,6 +92,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual("ModelA", accountUpdate.ModelCode);
                 Assert.AreEqual("NetLiquidation", legacyAccountUpdate.Key);
                 Assert.AreEqual("DU123", legacyAccountUpdate.AccountName);
+                Assert.AreEqual(17, legacyAccountUpdate.AccountUpdatesMultiRequestId);
                 Assert.AreEqual(17, accountUpdateEnd.RequestId);
                 Assert.AreEqual(17, legacyAccountUpdateEnd.RequestId);
 
@@ -104,6 +105,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(1, legacyPositionUpdate.Position);
                 Assert.AreEqual(1.25m, legacyPositionUpdate.PositionQuantity);
                 Assert.AreEqual("DU123", legacyPositionUpdate.AccountName);
+                Assert.AreEqual(18, legacyPositionUpdate.PositionsMultiRequestId);
                 Assert.AreEqual(18, positionUpdateEnd.RequestId);
                 Assert.AreEqual(1, legacyPositionUpdateEndCount);
             });
@@ -244,14 +246,19 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
             UpdatePortfolioEventArgs update = null;
+            UpdateAccountValueEventArgs accountUpdate = null;
             client.UpdatePortfolio += (_, args) => update = args;
+            client.UpdateAccountValue += (_, args) => accountUpdate = args;
 
             client.updatePortfolio(new Contract(), 1.25m, 2, 3, 4, 5, 6, "DU123");
+            client.updateAccountValue("CashBalance", "123.45", "USD", "DU123");
 
             Assert.Multiple(() =>
             {
                 Assert.AreEqual(1, update.Position);
                 Assert.AreEqual(1.25m, update.PositionQuantity);
+                Assert.IsNull(update.PositionsMultiRequestId);
+                Assert.IsNull(accountUpdate.AccountUpdatesMultiRequestId);
             });
             Assert.Throws<OverflowException>(() =>
                 new UpdatePortfolioEventArgs(new Contract(), decimal.MaxValue, 0, 0, 0, 0, 0, "DU123"));

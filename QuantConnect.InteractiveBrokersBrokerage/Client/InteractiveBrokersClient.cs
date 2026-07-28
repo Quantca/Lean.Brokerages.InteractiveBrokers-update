@@ -429,7 +429,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             }
             finally
             {
-                OnAccountUpdateMulti(new UpdateAccountValueEventArgs(key, value, currency, account));
+                OnAccountUpdateMulti(
+                    new UpdateAccountValueEventArgs(
+                        key,
+                        value,
+                        currency,
+                        account,
+                        requestId));
             }
         }
 
@@ -474,7 +480,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             }
             finally
             {
-                OnUpdatePortfolio(new UpdatePortfolioEventArgs(contract, position, 0, 0, averageCost, 0, 0, account));
+                OnUpdatePortfolio(
+                    new UpdatePortfolioEventArgs(
+                        contract,
+                        position,
+                        0,
+                        0,
+                        averageCost,
+                        0,
+                        0,
+                        account,
+                        requestId));
             }
         }
 
