@@ -112,9 +112,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     "'ib-financial-advisors-unified-groups-enabled=true'.");
             }
 
-            // Tier 1 will pass these validated opt-in settings into the brokerage when
-            // the Financial Advisor account-state service is wired.
-
             var loadExistingHoldings = true;
             if (job.BrokerageData.ContainsKey("load-existing-holdings"))
             {
@@ -154,7 +151,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 agentDescription,
                 loadExistingHoldings,
                 weeklyRestartUtcTime,
-                financialAdvisorsGroupFilter);
+                financialAdvisorsGroupFilter,
+                financialAdvisorGroupManagementEnabled,
+                financialAdvisorUnifiedGroupsEnabled);
             Composer.Instance.AddPart<IDataQueueHandler>(ib);
 
             return ib;

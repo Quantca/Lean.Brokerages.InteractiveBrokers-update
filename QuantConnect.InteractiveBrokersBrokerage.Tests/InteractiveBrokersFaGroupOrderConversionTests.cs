@@ -52,7 +52,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private static readonly FieldInfo AgentDescriptionField =
             typeof(InteractiveBrokersBrokerage).GetField("_agentDescription", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo FaFilterField =
-            typeof(InteractiveBrokersBrokerage).GetField("_financialAdvisorsGroupFilter", BindingFlags.Static | BindingFlags.NonPublic);
+            typeof(InteractiveBrokersBrokerage).GetField("_financialAdvisorsGroupFilter", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly MethodInfo ConvertOrderMethod =
             typeof(InteractiveBrokersBrokerage).GetMethod(
                 "ConvertOrder",
@@ -60,13 +60,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 binder: null,
                 types: new[] { typeof(List<LeanOrder>), typeof(Contract), typeof(int) },
                 modifiers: null);
-
-        [TearDown]
-        public void TearDown()
-        {
-            // Reset the static FA filter so other fixtures aren't polluted.
-            FaFilterField.SetValue(null, null);
-        }
 
         /// <summary>
         /// When the FA group filter is configured and the order carries a per-order
@@ -80,7 +73,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             // Arrange
             var brokerage = CreateOfflineBrokerage();
-            FaFilterField.SetValue(null, FaGroupName);
+            FaFilterField.SetValue(brokerage, FaGroupName);
 
             const string overrideAccount = "TestSubAccount";
             var props = new InteractiveBrokersOrderProperties

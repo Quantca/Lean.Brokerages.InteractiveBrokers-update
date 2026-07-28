@@ -425,11 +425,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             var args = new AccountUpdateMultiEventArgs(requestId, account, modelCode, key, value, currency);
             try
             {
-                OnAccountUpdateMulti(new UpdateAccountValueEventArgs(key, value, currency, account));
+                OnAccountUpdateMultiWithRequestId(args);
             }
             finally
             {
-                OnAccountUpdateMultiWithRequestId(args);
+                OnAccountUpdateMulti(new UpdateAccountValueEventArgs(key, value, currency, account));
             }
         }
 
@@ -442,11 +442,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             var args = new AccountUpdateMultiEndEventArgs(requestId);
             try
             {
-                OnAccountUpdateMultiEnd(args);
+                AccountUpdateMultiEndWithRequestId?.Invoke(this, args);
             }
             finally
             {
-                AccountUpdateMultiEndWithRequestId?.Invoke(this, args);
+                OnAccountUpdateMultiEnd(args);
             }
         }
 
@@ -470,11 +470,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
                 averageCost);
             try
             {
-                OnUpdatePortfolio(new UpdatePortfolioEventArgs(contract, position, 0, 0, averageCost, 0, 0, account));
+                OnPositionMulti(args);
             }
             finally
             {
-                OnPositionMulti(args);
+                OnUpdatePortfolio(new UpdatePortfolioEventArgs(contract, position, 0, 0, averageCost, 0, 0, account));
             }
         }
 
@@ -1043,11 +1043,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         {
             try
             {
-                PositionMultiEnd?.Invoke(this, EventArgs.Empty);
+                PositionMultiEndWithRequestId?.Invoke(this, new RequestEndEventArgs(requestId));
             }
             finally
             {
-                PositionMultiEndWithRequestId?.Invoke(this, new RequestEndEventArgs(requestId));
+                PositionMultiEnd?.Invoke(this, EventArgs.Empty);
             }
         }
         #endregion

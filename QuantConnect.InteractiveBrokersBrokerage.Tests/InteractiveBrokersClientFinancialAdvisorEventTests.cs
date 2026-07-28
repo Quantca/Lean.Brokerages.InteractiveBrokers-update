@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Collections.Generic;
 using IBApi;
 using NUnit.Framework;
 using QuantConnect.Brokerages.InteractiveBrokers.Client;
@@ -24,7 +25,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
     public class InteractiveBrokersClientFinancialAdvisorEventTests
     {
         [Test]
-        public void MultiCallbacksPreservePublicEventsAndAddRequestAwareEvents()
+        public void PublicClientEventsRemainAdditiveTest()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
             AccountUpdateMultiEventArgs accountUpdate = null;
@@ -35,15 +36,48 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             AccountUpdateMultiEndEventArgs legacyAccountUpdateEnd = null;
             UpdatePortfolioEventArgs legacyPositionUpdate = null;
             var legacyPositionUpdateEndCount = 0;
+            var invocationOrder = new List<string>();
 
-            client.AccountUpdateMultiWithRequestId += (_, args) => accountUpdate = args;
-            client.AccountUpdateMultiEndWithRequestId += (_, args) => accountUpdateEnd = args;
-            client.PositionMulti += (_, args) => positionUpdate = args;
-            client.PositionMultiEndWithRequestId += (_, args) => positionUpdateEnd = args;
-            client.AccountUpdateMulti += (_, args) => legacyAccountUpdate = args;
-            client.AccountUpdateMultiEnd += (_, args) => legacyAccountUpdateEnd = args;
-            client.UpdatePortfolio += (_, args) => legacyPositionUpdate = args;
-            client.PositionMultiEnd += (_, _) => legacyPositionUpdateEndCount++;
+            client.AccountUpdateMultiWithRequestId += (_, args) =>
+            {
+                accountUpdate = args;
+                invocationOrder.Add("account-update-internal");
+            };
+            client.AccountUpdateMultiEndWithRequestId += (_, args) =>
+            {
+                accountUpdateEnd = args;
+                invocationOrder.Add("account-end-internal");
+            };
+            client.PositionMulti += (_, args) =>
+            {
+                positionUpdate = args;
+                invocationOrder.Add("position-update-internal");
+            };
+            client.PositionMultiEndWithRequestId += (_, args) =>
+            {
+                positionUpdateEnd = args;
+                invocationOrder.Add("position-end-internal");
+            };
+            client.AccountUpdateMulti += (_, args) =>
+            {
+                legacyAccountUpdate = args;
+                invocationOrder.Add("account-update-public");
+            };
+            client.AccountUpdateMultiEnd += (_, args) =>
+            {
+                legacyAccountUpdateEnd = args;
+                invocationOrder.Add("account-end-public");
+            };
+            client.UpdatePortfolio += (_, args) =>
+            {
+                legacyPositionUpdate = args;
+                invocationOrder.Add("position-update-public");
+            };
+            client.PositionMultiEnd += (_, _) =>
+            {
+                legacyPositionUpdateEndCount++;
+                invocationOrder.Add("position-end-public");
+            };
 
             var contract = new Contract { Symbol = "SPY", SecType = "STK" };
             client.accountUpdateMulti(17, "DU123", "ModelA", "NetLiquidation", "1000", "USD");
@@ -73,6 +107,19 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(18, positionUpdateEnd.RequestId);
                 Assert.AreEqual(1, legacyPositionUpdateEndCount);
             });
+            CollectionAssert.AreEqual(
+                new[]
+                {
+                    "account-update-internal",
+                    "account-update-public",
+                    "account-end-internal",
+                    "account-end-public",
+                    "position-update-internal",
+                    "position-update-public",
+                    "position-end-internal",
+                    "position-end-public"
+                },
+                invocationOrder);
         }
 
         [Test]
@@ -124,23 +171,71 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void PublicCallbackExceptionsDoNotSuppressInternalEvents()
+        public void KeyedPublicCallbackExceptionsDoNotSuppressInternalEvents()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
-            var internalReceiveFaCount = 0;
+            var internalAccountUpdateCount = 0;
+            var internalAccountEndCount = 0;
+            var internalPositionUpdateCount = 0;
             var internalPositionEndCount = 0;
-            client.ReceiveFa += (_, _) => throw new InvalidOperationException("public receiveFA");
-            client.InternalReceiveFa += (_, _) => internalReceiveFaCount++;
-            client.PositionMultiEnd += (_, _) => throw new InvalidOperationException("public positionMultiEnd");
+            client.AccountUpdateMultiWithRequestId += (_, _) => internalAccountUpdateCount++;
+            client.AccountUpdateMultiEndWithRequestId += (_, _) => internalAccountEndCount++;
+            client.PositionMulti += (_, _) => internalPositionUpdateCount++;
             client.PositionMultiEndWithRequestId += (_, _) => internalPositionEndCount++;
+            client.AccountUpdateMulti += (_, _) => throw new InvalidOperationException("public accountUpdateMulti");
+            client.AccountUpdateMultiEnd += (_, _) => throw new InvalidOperationException("public accountUpdateMultiEnd");
+            client.UpdatePortfolio += (_, _) => throw new InvalidOperationException("public positionMulti");
+            client.PositionMultiEnd += (_, _) => throw new InvalidOperationException("public positionMultiEnd");
 
-            Assert.Throws<InvalidOperationException>(() => client.receiveFA(1, "<ListOfGroups />"));
+            Assert.Throws<InvalidOperationException>(() =>
+                client.accountUpdateMulti(17, "DU123", "ModelA", "NetLiquidation", "1000", "USD"));
+            Assert.Throws<InvalidOperationException>(() => client.accountUpdateMultiEnd(17));
+            Assert.Throws<InvalidOperationException>(() =>
+                client.positionMulti(18, "DU123", "ModelA", new Contract(), 1.25m, 100.5));
             Assert.Throws<InvalidOperationException>(() => client.positionMultiEnd(18));
 
             Assert.Multiple(() =>
             {
-                Assert.AreEqual(1, internalReceiveFaCount);
+                Assert.AreEqual(1, internalAccountUpdateCount);
+                Assert.AreEqual(1, internalAccountEndCount);
+                Assert.AreEqual(1, internalPositionUpdateCount);
                 Assert.AreEqual(1, internalPositionEndCount);
+            });
+        }
+
+        [Test]
+        public void KeyedInternalCallbackExceptionsDoNotSuppressPublicEvents()
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            var publicAccountUpdateCount = 0;
+            var publicAccountEndCount = 0;
+            var publicPositionUpdateCount = 0;
+            var publicPositionEndCount = 0;
+            client.AccountUpdateMultiWithRequestId += (_, _) =>
+                throw new InvalidOperationException("internal accountUpdateMulti");
+            client.AccountUpdateMultiEndWithRequestId += (_, _) =>
+                throw new InvalidOperationException("internal accountUpdateMultiEnd");
+            client.PositionMulti += (_, _) => throw new InvalidOperationException("internal positionMulti");
+            client.PositionMultiEndWithRequestId += (_, _) =>
+                throw new InvalidOperationException("internal positionMultiEnd");
+            client.AccountUpdateMulti += (_, _) => publicAccountUpdateCount++;
+            client.AccountUpdateMultiEnd += (_, _) => publicAccountEndCount++;
+            client.UpdatePortfolio += (_, _) => publicPositionUpdateCount++;
+            client.PositionMultiEnd += (_, _) => publicPositionEndCount++;
+
+            Assert.Throws<InvalidOperationException>(() =>
+                client.accountUpdateMulti(17, "DU123", "ModelA", "NetLiquidation", "1000", "USD"));
+            Assert.Throws<InvalidOperationException>(() => client.accountUpdateMultiEnd(17));
+            Assert.Throws<InvalidOperationException>(() =>
+                client.positionMulti(18, "DU123", "ModelA", new Contract(), 1.25m, 100.5));
+            Assert.Throws<InvalidOperationException>(() => client.positionMultiEnd(18));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(1, publicAccountUpdateCount);
+                Assert.AreEqual(1, publicAccountEndCount);
+                Assert.AreEqual(1, publicPositionUpdateCount);
+                Assert.AreEqual(1, publicPositionEndCount);
             });
         }
 

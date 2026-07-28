@@ -41,6 +41,7 @@
         <Using Include="NUnit.Framework.Legacy.ClassicAssert" Alias="Assert" />
         <Using Include="NUnit.Framework.Legacy.CollectionAssert" Alias="CollectionAssert" />
         <Using Include="NUnit.Framework.Legacy.StringAssert" Alias="StringAssert" />
+        <Compile Remove="ProtectedSourceGuard/**/*.cs" />
     </ItemGroup>
     <ItemGroup>
         <None Remove="config.json" />
