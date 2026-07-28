@@ -13,6 +13,8 @@
  * limitations under the License.
 */
 
+using System;
+using System.Collections.Generic;
 using NUnit.Framework;
 using QuantConnect.Algorithm;
 using QuantConnect.Brokerages.InteractiveBrokers;
@@ -45,6 +47,52 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Assert.IsTrue(brokerage.IsConnected);
                 }
             }
+        }
+
+        [TestCase("ib-financial-advisors-group-management-enabled")]
+        [TestCase("ib-financial-advisors-unified-groups-enabled")]
+        public void RejectsInvalidFinancialAdvisorBooleanSetting(string setting)
+        {
+            using var factory = new InteractiveBrokersBrokerageFactory();
+            var job = new LiveNodePacket
+            {
+                BrokerageData = new Dictionary<string, string>
+                {
+                    ["ib-account"] = "F1234567",
+                    ["ib-user-name"] = "user",
+                    ["ib-password"] = "password",
+                    ["ib-trading-mode"] = "paper",
+                    ["ib-agent-description"] = "I",
+                    [setting] = "not-a-boolean"
+                }
+            };
+
+            var exception = Assert.Throws<Exception>(() => factory.CreateBrokerage(job, AlgorithmDependency));
+
+            StringAssert.Contains("must be either 'true' or 'false'", exception.Message);
+        }
+
+        [Test]
+        public void RejectsFinancialAdvisorGroupManagementWithoutUnifiedGroups()
+        {
+            using var factory = new InteractiveBrokersBrokerageFactory();
+            var job = new LiveNodePacket
+            {
+                BrokerageData = new Dictionary<string, string>
+                {
+                    ["ib-account"] = "F1234567",
+                    ["ib-user-name"] = "user",
+                    ["ib-password"] = "password",
+                    ["ib-trading-mode"] = "paper",
+                    ["ib-agent-description"] = "I",
+                    ["ib-financial-advisors-group-management-enabled"] = "true",
+                    ["ib-financial-advisors-unified-groups-enabled"] = "false"
+                }
+            };
+
+            var exception = Assert.Throws<Exception>(() => factory.CreateBrokerage(job, AlgorithmDependency));
+
+            StringAssert.Contains("requires 'ib-financial-advisors-unified-groups-enabled=true'", exception.Message);
         }
 
         class InteractiveBrokersBrokerageFactoryAlgorithmDependency : QCAlgorithm

@@ -129,6 +129,26 @@ If you already have a live environment configured in your Lean configuration fil
 
 The IB API does not support the IBKR LITE plan. You need an IBKR PRO plan. Individual and Financial Advisor (FA) accounts are available. IB supports cash and margin accounts.
 
+### Financial Advisor Groups
+
+LEAN supports IB's current unified Allocation Groups model, configured in TWS as **Use Account Groups with Allocation Methods**. The following settings are optional and default to an empty value or `false`:
+
+| Setting | Description |
+| --- | --- |
+| `ib-financial-advisors-group-filter` | Limits the deployment to one FA group. Leave it empty for multi-group operation and select `FaGroup` on each group order. When unified groups are enabled, a nonempty filter is a strict boundary and LEAN rejects a group order whose explicit `FaGroup` does not match it. Direct managed-account orders remain a separate route. |
+| `ib-financial-advisors-unified-groups-enabled` | Set to `true` only after confirming that TWS uses unified Allocation Groups. This enables unified-group account discovery, validation, and account-level execution features. Legacy separate Profiles are not supported by these features. |
+| `ib-financial-advisors-group-management-enabled` | Enables algorithm-initiated membership and saved-allocation updates for existing groups. This setting requires `ib-financial-advisors-unified-groups-enabled=true`. Group creation and deletion are not supported. |
+
+The supported saved user-specified allocation methods are `ContractsOrShares`, `Ratio`, and `Percent`. TWS may display `Equal` as “Equal Quantity”; LEAN uses IB's `Equal` wire value and normalizes the legacy `EqualQuantity` spelling to it. `MonetaryAmount` group management and execution are not supported.
+
+Group-order validation uses the latest authoritative brokerage snapshot. It deliberately fails open when that snapshot is unavailable, stale, reconnecting, or does not contain the requested group, preserving existing order behavior while IB remains the final authority. A configuration known to use an unsupported Profile or allocation method is rejected. Group configuration writes are stricter: they require ready, version-matched state and readback verification.
+
+IB does not provide an atomic operation that checks open orders and replaces FA configuration. Operate one configuration/order writer for each TWS user/session. While a `replaceFA` operation or its reconciliation is in progress, do not submit manual group orders or make manual group edits from TWS, Client Portal, or another API client. LEAN blocks its own conflicting group operations, but it cannot prevent an external client from racing the replacement.
+
+To discover all working orders before a configuration write, API client 0 requests all open orders. IB may bind eligible manual/TWS orders to that API client as a side effect.
+
+TWS rejects a group configuration that removes its final member. Add another managed account before moving the original final member, or manage group creation/deletion manually in TWS.
+
 ## Order Types and Asset Classes
 
 The following table describes the order types that IB supports. For specific details about each order type, refer to the IB documentation.

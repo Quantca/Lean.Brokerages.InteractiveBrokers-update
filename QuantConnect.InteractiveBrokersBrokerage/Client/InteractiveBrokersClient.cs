@@ -31,6 +31,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<ErrorEventArgs> Error;
 
         /// <summary>
+        /// Error callback used by internal request owners independently of public subscribers.
+        /// </summary>
+        internal event EventHandler<ErrorEventArgs> InternalError;
+
+        /// <summary>
         /// CurrentTimeUtc event handler
         /// </summary>
         public event EventHandler<CurrentTimeUtcEventArgs> CurrentTimeUtc;
@@ -146,6 +151,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<ReceiveFaEventArgs> ReceiveFa;
 
         /// <summary>
+        /// Financial Advisor configuration callback used by internal request owners.
+        /// </summary>
+        internal event EventHandler<ReceiveFaEventArgs> InternalReceiveFa;
+
+        /// <summary>
+        /// ReplaceFaEnd event handler
+        /// </summary>
+        internal event EventHandler<ReplaceFaEndEventArgs> ReplaceFaEnd;
+
+        /// <summary>
         /// ConnectAck event handler
         /// </summary>
         public event EventHandler ConnectAck;
@@ -156,9 +171,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<ManagedAccountsEventArgs> ManagedAccounts;
 
         /// <summary>
+        /// Managed-accounts callback used by internal request owners.
+        /// </summary>
+        internal event EventHandler<ManagedAccountsEventArgs> InternalManagedAccounts;
+
+        /// <summary>
         /// FamilyCodes event handler
         /// </summary>
         public event EventHandler<FamilyCodesEventArgs> FamilyCodes;
+
+        /// <summary>
+        /// Account-family callback used by internal request owners.
+        /// </summary>
+        internal event EventHandler<FamilyCodesEventArgs> InternalFamilyCodes;
 
         /// <summary>
         /// ReRouteMarketDataRequest event handler
@@ -176,14 +201,34 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<UpdateAccountValueEventArgs> AccountUpdateMulti;
 
         /// <summary>
+        /// Occurs when an account value update is received, preserving its request and model identifiers.
+        /// </summary>
+        internal event EventHandler<AccountUpdateMultiEventArgs> AccountUpdateMultiWithRequestId;
+
+        /// <summary>
         /// Occurs when all account updates for a Financial Advisor (FA) group request have been received.
         /// </summary>
         public event EventHandler<AccountUpdateMultiEndEventArgs> AccountUpdateMultiEnd;
 
         /// <summary>
+        /// Occurs when an internal account-update request has completed, preserving its request identifier.
+        /// </summary>
+        internal event EventHandler<AccountUpdateMultiEndEventArgs> AccountUpdateMultiEndWithRequestId;
+
+        /// <summary>
+        /// Occurs when a position update for a Financial Advisor (FA) request has been received.
+        /// </summary>
+        internal event EventHandler<PositionMultiEventArgs> PositionMulti;
+
+        /// <summary>
         /// Occurs when all position updates for a Financial Advisor (FA) group request have been received.
         /// </summary>
         public event EventHandler PositionMultiEnd;
+
+        /// <summary>
+        /// Occurs when all position updates have been received, preserving the request identifier.
+        /// </summary>
+        internal event EventHandler<RequestEndEventArgs> PositionMultiEndWithRequestId;
 
         #endregion
 
@@ -249,7 +294,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="advancedOrderRejectJson">Advanced order reject description in json format</param>
         public override void error(int id, long errorTime, int errorCode, string errorMsg, string advancedOrderRejectJson)
         {
-            OnError(new ErrorEventArgs(id, errorTime, errorCode, errorMsg));
+            var args = new ErrorEventArgs(id, errorTime, errorCode, errorMsg);
+            try
+            {
+                OnError(args);
+            }
+            finally
+            {
+                InternalError?.Invoke(this, args);
+            }
         }
 
         /// <summary>
@@ -369,7 +422,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="currency">The currency in which the parameter value is denominated.</param>
         public override void accountUpdateMulti(int requestId, string account, string modelCode, string key, string value, string currency)
         {
-            OnAccountUpdateMulti(new UpdateAccountValueEventArgs(key, value, currency, account));
+            var args = new AccountUpdateMultiEventArgs(requestId, account, modelCode, key, value, currency);
+            try
+            {
+                OnAccountUpdateMulti(new UpdateAccountValueEventArgs(key, value, currency, account));
+            }
+            finally
+            {
+                OnAccountUpdateMultiWithRequestId(args);
+            }
         }
 
         /// <summary>
@@ -378,7 +439,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="requestId">The request id</param>
         public override void accountUpdateMultiEnd(int requestId)
         {
-            OnAccountUpdateMultiEnd(new AccountUpdateMultiEndEventArgs(requestId));
+            var args = new AccountUpdateMultiEndEventArgs(requestId);
+            try
+            {
+                OnAccountUpdateMultiEnd(args);
+            }
+            finally
+            {
+                AccountUpdateMultiEndWithRequestId?.Invoke(this, args);
+            }
         }
 
         /// <summary>
@@ -392,8 +461,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="averageCost">The average cost of the position.</param>
         public override void positionMulti(int requestId, string account, string modelCode, Contract contract, decimal position, double averageCost)
         {
-            var positionValue = Convert.ToInt32(position);
-            OnUpdatePortfolio(new UpdatePortfolioEventArgs(contract, positionValue, 0, 0, averageCost, 0, 0, account));
+            var args = new PositionMultiEventArgs(
+                requestId,
+                account,
+                modelCode,
+                contract,
+                position,
+                averageCost);
+            try
+            {
+                OnUpdatePortfolio(new UpdatePortfolioEventArgs(contract, position, 0, 0, averageCost, 0, 0, account));
+            }
+            finally
+            {
+                OnPositionMulti(args);
+            }
         }
 
         /// <summary>
@@ -452,8 +534,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public override void updatePortfolio(Contract contract, decimal position, double marketPrice, double marketValue, double averageCost,
             double unrealisedPnl, double realisedPnl, string accountName)
         {
-            var positionValue = Convert.ToInt32(position);
-            OnUpdatePortfolio(new UpdatePortfolioEventArgs(contract, positionValue, marketPrice, marketValue, averageCost, unrealisedPnl, realisedPnl,
+            OnUpdatePortfolio(new UpdatePortfolioEventArgs(contract, position, marketPrice, marketValue, averageCost, unrealisedPnl, realisedPnl,
                 accountName));
         }
 
@@ -591,7 +672,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="faXmlData">The XML string containing the previously requested FA configuration information.</param>
         public override void receiveFA(int faDataType, string faXmlData)
         {
-            OnReceiveFa(new ReceiveFaEventArgs(faDataType, faXmlData));
+            var args = new ReceiveFaEventArgs(faDataType, faXmlData);
+            try
+            {
+                OnReceiveFa(args);
+            }
+            finally
+            {
+                InternalReceiveFa?.Invoke(this, args);
+            }
+        }
+
+        /// <summary>
+        /// Marks the completion of a Financial Advisor configuration replacement.
+        /// </summary>
+        public override void replaceFAEnd(int reqId, string text)
+        {
+            OnReplaceFaEnd(new ReplaceFaEndEventArgs(reqId, text));
         }
 
         /// <summary>
@@ -608,7 +705,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="accountList">A comma-separated string with the managed account ids.</param>
         public override void managedAccounts(string accountList)
         {
-            OnManagedAccounts(new ManagedAccountsEventArgs(accountList));
+            var args = new ManagedAccountsEventArgs(accountList);
+            try
+            {
+                OnManagedAccounts(args);
+            }
+            finally
+            {
+                InternalManagedAccounts?.Invoke(this, args);
+            }
         }
 
         /// <summary>
@@ -617,7 +722,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="familyCodes">An array of family codes.</param>
         public override void familyCodes(FamilyCode[] familyCodes)
         {
-            OnFamilyCodes(new FamilyCodesEventArgs(familyCodes));
+            var args = new FamilyCodesEventArgs(familyCodes);
+            try
+            {
+                OnFamilyCodes(args);
+            }
+            finally
+            {
+                InternalFamilyCodes?.Invoke(this, args);
+            }
         }
 
         /// <summary>
@@ -841,6 +954,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         }
 
         /// <summary>
+        /// ReplaceFaEnd event invocator
+        /// </summary>
+        private void OnReplaceFaEnd(ReplaceFaEndEventArgs e)
+        {
+            ReplaceFaEnd?.Invoke(this, e);
+        }
+
+        /// <summary>
         /// ConnectAck event invocator
         /// </summary>
         protected virtual void OnConnectAck()
@@ -889,6 +1010,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         }
 
         /// <summary>
+        /// AccountUpdateMultiWithRequestId event invocator
+        /// </summary>
+        /// <param name="e">Event arguments preserving the IB request and model identifiers.</param>
+        private void OnAccountUpdateMultiWithRequestId(AccountUpdateMultiEventArgs e)
+        {
+            AccountUpdateMultiWithRequestId?.Invoke(this, e);
+        }
+
+        /// <summary>
         /// AccountUpdateMultiEnd event invocator
         /// </summary>
         protected void OnAccountUpdateMultiEnd(AccountUpdateMultiEndEventArgs e)
@@ -897,12 +1027,28 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         }
 
         /// <summary>
+        /// PositionMulti event invocator
+        /// </summary>
+        /// <param name="e">Position update event arguments.</param>
+        private void OnPositionMulti(PositionMultiEventArgs e)
+        {
+            PositionMulti?.Invoke(this, e);
+        }
+
+        /// <summary>
         /// PositionMultiEnd event invocator
         /// </summary>
-        /// <param name="_"></param>
-        protected void OnPositionMultiEnd(int _)
+        /// <param name="requestId">The identifier of the originating request.</param>
+        protected void OnPositionMultiEnd(int requestId)
         {
-            PositionMultiEnd?.Invoke(this, EventArgs.Empty);
+            try
+            {
+                PositionMultiEnd?.Invoke(this, EventArgs.Empty);
+            }
+            finally
+            {
+                PositionMultiEndWithRequestId?.Invoke(this, new RequestEndEventArgs(requestId));
+            }
         }
         #endregion
     }

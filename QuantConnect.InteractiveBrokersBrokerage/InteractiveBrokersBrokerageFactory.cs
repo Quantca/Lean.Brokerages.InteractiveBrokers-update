@@ -51,7 +51,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             { "ib-trading-mode", Config.Get("ib-trading-mode") },
             { "ib-agent-description", Config.Get("ib-agent-description") },
             { "ib-weekly-restart-utc-time", Config.Get("ib-weekly-restart-utc-time") },
-            { "ib-financial-advisors-group-filter", Config.Get("ib-financial-advisors-group-filter") }
+            { "ib-financial-advisors-group-filter", Config.Get("ib-financial-advisors-group-filter") },
+            { "ib-financial-advisors-group-management-enabled", Config.Get("ib-financial-advisors-group-management-enabled") },
+            { "ib-financial-advisors-unified-groups-enabled", Config.Get("ib-financial-advisors-unified-groups-enabled") }
         };
 
         /// <summary>
@@ -82,6 +84,36 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var tradingMode = Read<string>(job.BrokerageData, "ib-trading-mode", errors);
             var agentDescription = Read<string>(job.BrokerageData, "ib-agent-description", errors);
             job.BrokerageData.TryGetValue("ib-financial-advisors-group-filter", out var financialAdvisorsGroupFilter);
+            var financialAdvisorGroupManagementEnabled = false;
+            if (job.BrokerageData.TryGetValue(
+                    "ib-financial-advisors-group-management-enabled",
+                    out var financialAdvisorGroupManagementEnabledValue) &&
+                !string.IsNullOrWhiteSpace(financialAdvisorGroupManagementEnabledValue) &&
+                !bool.TryParse(financialAdvisorGroupManagementEnabledValue, out financialAdvisorGroupManagementEnabled))
+            {
+                errors.Add(
+                    "The 'ib-financial-advisors-group-management-enabled' setting must be either 'true' or 'false'.");
+            }
+            var financialAdvisorUnifiedGroupsEnabled = false;
+            if (job.BrokerageData.TryGetValue(
+                    "ib-financial-advisors-unified-groups-enabled",
+                    out var financialAdvisorUnifiedGroupsEnabledValue) &&
+                !string.IsNullOrWhiteSpace(financialAdvisorUnifiedGroupsEnabledValue) &&
+                !bool.TryParse(financialAdvisorUnifiedGroupsEnabledValue, out financialAdvisorUnifiedGroupsEnabled))
+            {
+                errors.Add(
+                    "The 'ib-financial-advisors-unified-groups-enabled' setting must be either 'true' or 'false'.");
+            }
+            if (financialAdvisorGroupManagementEnabled &&
+                !financialAdvisorUnifiedGroupsEnabled)
+            {
+                errors.Add(
+                    "The 'ib-financial-advisors-group-management-enabled' setting requires " +
+                    "'ib-financial-advisors-unified-groups-enabled=true'.");
+            }
+
+            // Tier 1 will pass these validated opt-in settings into the brokerage when
+            // the Financial Advisor account-state service is wired.
 
             var loadExistingHoldings = true;
             if (job.BrokerageData.ContainsKey("load-existing-holdings"))

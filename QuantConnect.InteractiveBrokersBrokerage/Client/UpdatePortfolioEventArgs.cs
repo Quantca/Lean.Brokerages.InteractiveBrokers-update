@@ -36,6 +36,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public int Position { get; }
 
         /// <summary>
+        /// The exact number of positions held.
+        /// If the position is 0, it means the position has just cleared.
+        /// </summary>
+        public decimal PositionQuantity { get; }
+
+        /// <summary>
         /// The unit price of the instrument.
         /// </summary>
         public double MarketPrice { get; }
@@ -69,9 +75,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// Initializes a new instance of the <see cref="UpdatePortfolioEventArgs"/> class
         /// </summary>
         public UpdatePortfolioEventArgs(Contract contract, int position, double marketPrice, double marketValue, double averageCost, double unrealisedPnl, double realisedPnl, string accountName)
+            : this(contract, (decimal)position, marketPrice, marketValue, averageCost, unrealisedPnl, realisedPnl, accountName)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="UpdatePortfolioEventArgs"/> class with an exact position.
+        /// </summary>
+        internal UpdatePortfolioEventArgs(Contract contract, decimal position, double marketPrice, double marketValue, double averageCost, double unrealisedPnl, double realisedPnl, string accountName)
         {
             Contract = contract;
-            Position = position;
+            Position = Convert.ToInt32(position);
+            PositionQuantity = position;
             MarketPrice = marketPrice;
             MarketValue = marketValue;
             AverageCost = averageCost;
