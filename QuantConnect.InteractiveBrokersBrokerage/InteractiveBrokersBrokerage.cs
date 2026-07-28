@@ -3070,26 +3070,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             ibOrder.FaGroup = orderProperties.FaProfile;
                         }
 
-                        if (_financialAdvisorUnifiedGroupsEnabled)
+                        ibOrder.FaMethod = orderProperties.FaMethod;
+
+                        if (ibOrder.FaMethod == "PctChange")
                         {
-                            ibOrder.FaGroup = ibOrder.FaGroup.Trim();
-                            ibOrder.FaMethod = InteractiveBrokersFinancialAdvisorAccountState.NormalizeFinancialAdvisorAllocationMethod(orderProperties.FaMethod);
-                            if (ibOrder.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
-                            {
-                                ibOrder.FaMethod = "PctChange";
-                                ibOrder.FaPercentage = (orderProperties.ExactFaPercentage ??
-                                    orderProperties.FaPercentage).ToStringInvariant();
-                                ibOrder.TotalQuantity = 0;
-                            }
-                        }
-                        else
-                        {
-                            ibOrder.FaMethod = orderProperties.FaMethod;
-                            if (ibOrder.FaMethod == "PctChange")
-                            {
-                                ibOrder.FaPercentage = orderProperties.FaPercentage.ToStringInvariant();
-                                ibOrder.TotalQuantity = 0;
-                            }
+                            ibOrder.FaPercentage = orderProperties.FaPercentage.ToStringInvariant();
+                            ibOrder.TotalQuantity = 0;
                         }
                     }
                     // IB docs say "Use an empty string if not applicable."  https://www.interactivebrokers.com/campus/ibkr-api-page/twsapi-ref/#order-ref
@@ -3098,7 +3084,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     ibOrder.Account ??= string.Empty;
                 }
 
-                if (_financialAdvisorUnifiedGroupsEnabled && !string.IsNullOrWhiteSpace(ibOrder.FaGroup)) ValidateFinancialAdvisorAllocationMethod(ibOrder, GetAccountSnapshot());
+                ConfigureFinancialAdvisorOrder(ibOrder, orderProperties);
             }
 
             // not yet supported

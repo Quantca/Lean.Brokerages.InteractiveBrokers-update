@@ -112,7 +112,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var state = _financialAdvisorAccountState;
             if (!_financialAdvisorGroupManagementEnabled || state == null ||
                 !string.IsNullOrEmpty(targetGroupName) &&
-                IsOutsideFinancialAdvisorGroupFilter(targetGroupName))
+                FAState.IsOutsideFinancialAdvisorGroupFilter(
+                    _financialAdvisorsGroupFilter, targetGroupName))
             {
                 return false;
             }
@@ -142,7 +143,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             var state = _financialAdvisorAccountState;
             if (!_financialAdvisorGroupManagementEnabled || state == null ||
-                IsOutsideFinancialAdvisorGroupFilter(groupName))
+                FAState.IsOutsideFinancialAdvisorGroupFilter(
+                    _financialAdvisorsGroupFilter, groupName))
             {
                 return false;
             }
@@ -180,7 +182,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     _account,
                     _financialAdvisorsGroupFilter,
                     hasOpenFinancialAdvisorOrders: () =>
-                        _orderProvider.GetOpenOrders(IsFinancialAdvisorGroupOrder).Count != 0,
+                        _orderProvider.GetOpenOrders(order =>
+                            FAState.IsFinancialAdvisorGroupOrder(
+                                order,
+                                _financialAdvisorsGroupFilter)).Count != 0,
                     reportUnsupported: message => OnMessage(
                         new BrokerageMessageEvent(
                             BrokerageMessageType.ActionRequired,
@@ -254,26 +259,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 !InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(requestId);
         }
 
-        private bool IsOutsideFinancialAdvisorGroupFilter(string groupName)
-        {
-            return !string.IsNullOrWhiteSpace(_financialAdvisorsGroupFilter) &&
-                !string.Equals(
-                    groupName?.Trim(),
-                    _financialAdvisorsGroupFilter,
-                    StringComparison.OrdinalIgnoreCase);
-        }
-
-        private bool IsFinancialAdvisorGroupOrder(Order order)
-        {
-            var properties = order?.Properties as InteractiveBrokersOrderProperties;
-            return order != null &&
-                order.Type != OrderType.OptionExercise &&
-                string.IsNullOrWhiteSpace(properties?.Account) &&
-                (!string.IsNullOrWhiteSpace(properties?.FaGroup) ||
-                    !string.IsNullOrWhiteSpace(properties?.FaProfile) ||
-                    !string.IsNullOrWhiteSpace(_financialAdvisorsGroupFilter));
-        }
-
         internal void ValidateFinancialAdvisorOrderAdmission(Order order)
         {
             if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor || order?.Type == OrderType.OptionExercise)
@@ -291,14 +276,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     "Legacy Financial Advisor profiles are not supported when unified groups are enabled. Use FaGroup instead.");
             }
             if (!string.IsNullOrWhiteSpace(properties?.FaGroup) &&
-                IsOutsideFinancialAdvisorGroupFilter(properties.FaGroup))
+                FAState.IsOutsideFinancialAdvisorGroupFilter(
+                    _financialAdvisorsGroupFilter, properties.FaGroup))
             {
                 throw new InvalidOperationException(
                     $"Order FA group '{properties.FaGroup}' does not match the configured " +
                     $"Financial Advisor group filter '{_financialAdvisorsGroupFilter}'.");
             }
             if (_financialAdvisorAccountState?.IsGroupTradingBlocked == true &&
-                IsFinancialAdvisorGroupOrder(order))
+                FAState.IsFinancialAdvisorGroupOrder(
+                    order,
+                    _financialAdvisorsGroupFilter))
             {
                 throw new InvalidOperationException(
                     "FA group orders are blocked while account-group configuration is being updated or reconciled.");
@@ -309,17 +297,29 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 FaGroup = hasExplicitGroup ? properties.FaGroup.Trim() : _financialAdvisorsGroupFilter,
                 FaMethod = hasExplicitGroup
-                    ? FAState.NormalizeFinancialAdvisorAllocationMethod(properties.FaMethod) : string.Empty,
+                    ? properties.FaMethod : string.Empty,
                 TotalQuantity = (int)Math.Abs(order.GroupOrderManager?.Quantity ?? order.Quantity)
             };
-            if (allocationOrder.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
+            ConfigureFinancialAdvisorOrder(allocationOrder, properties);
+        }
+
+        private void ConfigureFinancialAdvisorOrder(IBApi.Order order, InteractiveBrokersOrderProperties properties)
+        {
+            if (!_financialAdvisorUnifiedGroupsEnabled || string.IsNullOrWhiteSpace(order.FaGroup))
             {
-                allocationOrder.FaMethod = "PctChange";
-                allocationOrder.FaPercentage =
-                    (properties.ExactFaPercentage ?? properties.FaPercentage).ToStringInvariant();
-                allocationOrder.TotalQuantity = 0m;
+                return;
             }
-            ValidateFinancialAdvisorAllocationMethod(allocationOrder, GetAccountSnapshot());
+
+            order.FaGroup = order.FaGroup.Trim();
+            order.FaMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
+            if (order.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
+            {
+                order.FaMethod = "PctChange";
+                order.FaPercentage =
+                    (properties.ExactFaPercentage ?? properties.FaPercentage).ToStringInvariant();
+                order.TotalQuantity = 0m;
+            }
+            ValidateFinancialAdvisorAllocationMethod(order, GetAccountSnapshot());
         }
 
         internal static void ValidateFinancialAdvisorAllocationMethod(

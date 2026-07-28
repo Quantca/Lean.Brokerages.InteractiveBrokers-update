@@ -17,7 +17,10 @@ using System.Threading.Tasks;
 using IBApi;
 using QuantConnect.Brokerages.InteractiveBrokers.Client;
 using QuantConnect.Logging;
+using QuantConnect.Orders;
 using QuantConnect.Util;
+using LeanOrder = QuantConnect.Orders.Order;
+using LeanOrderType = QuantConnect.Orders.OrderType;
 
 namespace QuantConnect.Brokerages.InteractiveBrokers
 {
@@ -191,6 +194,30 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         internal static string NormalizeFinancialAdvisorAllocationMethod(
             string allocationMethod) =>
             NormalizeGroupAllocationMethod(allocationMethod);
+
+        internal static bool IsOutsideFinancialAdvisorGroupFilter(
+            string financialAdvisorsGroupFilter,
+            string groupName)
+        {
+            return !string.IsNullOrWhiteSpace(financialAdvisorsGroupFilter) &&
+                !string.Equals(
+                    groupName?.Trim(),
+                    financialAdvisorsGroupFilter,
+                    StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool IsFinancialAdvisorGroupOrder(
+            LeanOrder order,
+            string financialAdvisorsGroupFilter)
+        {
+            var properties = order?.Properties as InteractiveBrokersOrderProperties;
+            return order != null &&
+                order.Type != LeanOrderType.OptionExercise &&
+                string.IsNullOrWhiteSpace(properties?.Account) &&
+                (!string.IsNullOrWhiteSpace(properties?.FaGroup) ||
+                    !string.IsNullOrWhiteSpace(properties?.FaProfile) ||
+                    !string.IsNullOrWhiteSpace(financialAdvisorsGroupFilter));
+        }
 
         internal bool RequestGroupAssignment(
             string accountId,

@@ -136,7 +136,7 @@ LEAN supports IB's current unified Allocation Groups model, configured in TWS as
 | Setting | Description |
 | --- | --- |
 | `ib-financial-advisors-group-filter` | Limits the deployment to one FA group. Leave it empty for multi-group operation and select `FaGroup` on each group order. When unified groups are enabled, a nonempty filter is a strict boundary and LEAN rejects a group order whose explicit `FaGroup` does not match it. Direct managed-account orders remain a separate route. |
-| `ib-financial-advisors-unified-groups-enabled` | Set to `true` only after confirming that TWS uses unified Allocation Groups. This enables unified-group account discovery, validation, and account-level execution features. Legacy separate Profiles are not supported by these features. |
+| `ib-financial-advisors-unified-groups-enabled` | Set to `true` only after confirming that TWS uses unified Allocation Groups. This enables unified-group account discovery, validation, configuration management, and account-state reconciliation. Legacy separate Profiles are not supported by these features. |
 | `ib-financial-advisors-group-management-enabled` | Enables algorithm-initiated membership and saved-allocation updates for existing groups. This setting requires `ib-financial-advisors-unified-groups-enabled=true`. Group creation and deletion are not supported. |
 
 The supported saved user-specified allocation methods are `ContractsOrShares`, `Ratio`, and `Percent`. TWS may display `Equal` as “Equal Quantity”; LEAN uses IB's `Equal` wire value and normalizes the legacy `EqualQuantity` spelling to it. `MonetaryAmount` group management and execution are not supported.
@@ -148,6 +148,12 @@ IB does not provide an atomic operation that checks open orders and replaces FA 
 Before a configuration mutation, LEAN's open-order precondition examines only Financial Advisor group orders already known to LEAN through `IOrderProvider`. It does not discover orders or quiesce configuration and order writers in TWS, Client Portal, or other API clients. Operators are responsible for ensuring those external sources remain quiescent throughout the mutation and reconciliation window.
 
 TWS rejects a group configuration that removes its final member. Add another managed account before moving the original final member, or manage group creation/deletion manually in TWS.
+
+#### Reconciling Group Orders
+
+Retain a fresh `Ready` snapshot before submitting a Financial Advisor group order, and track its aggregate parent order. When any terminal parent status arrives, capture the current snapshot `Generation` before requesting a group-scoped refresh. This includes canceled, invalid, and partially filled orders that later become terminal. Poll from `OnData` until the snapshot is `Ready` with a strictly newer generation, then diff its per-account positions against the retained pre-order snapshot.
+
+The aggregate parent `OrderEvent` is the reconciliation trigger; the refreshed snapshot is the final authority for per-account results. This mechanism intentionally adds no child-execution event, execution-correlation queue, drop counter, or additional aggregate fill.
 
 ## Order Types and Asset Classes
 
