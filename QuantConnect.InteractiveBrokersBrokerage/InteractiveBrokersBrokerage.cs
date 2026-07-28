@@ -90,6 +90,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private static readonly TimeSpan _noSubmissionOrdersResponseTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-no-submission-orders-response-timeout", 10));
         private static bool _submissionOrdersWarningSent;
         private static bool _openOrderTimeWarningSent;
+        private bool _sentFAOrderPropertiesWarning;
 
         private readonly HashSet<OrderType> _noSubmissionOrderTypes = new(new[] {
             OrderType.MarketOnOpen,

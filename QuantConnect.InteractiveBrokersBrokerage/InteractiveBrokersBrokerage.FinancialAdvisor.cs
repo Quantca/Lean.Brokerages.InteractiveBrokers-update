@@ -31,8 +31,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         IBrokerageAccountGroupManager,
         IBrokerageAccountGroupAllocationManager
     {
-        private bool _sentFAOrderPropertiesWarning;
-
         /// <summary>
         /// Stores skipped orders whose FA group does not match the configured filter.
         /// Key is the order ID; value is the FA group associated with the order.
@@ -80,15 +78,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             return state.RequestRefresh(groupNames, additionalAccountIds);
-        }
-
-        /// <inheritdoc/>
-        public bool RequestConfiguredAccountSnapshotRefresh()
-        {
-            var state = _financialAdvisorAccountState;
-            return state != null && (state.HasConfiguredScope
-                ? state.RequestConfiguredRefreshNow()
-                : RequestAccountSnapshotRefresh(Array.Empty<string>(), Array.Empty<string>()));
         }
 
         /// <inheritdoc/>

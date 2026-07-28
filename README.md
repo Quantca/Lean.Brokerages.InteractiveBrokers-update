@@ -143,6 +143,10 @@ The supported saved user-specified allocation methods are `ContractsOrShares`, `
 
 Group-order validation uses the latest authoritative brokerage snapshot. It deliberately fails open when that snapshot is unavailable, stale, reconnecting, or does not contain the requested group, preserving existing order behavior while IB remains the final authority. A configuration known to use an unsupported Profile or allocation method is rejected. Group configuration writes are stricter: they require ready, version-matched state and readback verification.
 
+#### Snapshot Freshness
+
+Account snapshots have no periodic refresh. The algorithm owns the freshness policy and must call `RequestBrokerageAccountSnapshotRefresh` for its connect-time snapshot and whenever it needs newer state. `MarkDisconnected` publishes `Stale`; if the algorithm never calls the method again after its connect-time request, that snapshot is held indefinitely.
+
 IB does not provide an atomic operation that checks open orders and replaces FA configuration. Operate one configuration/order writer for each TWS user/session. While a `replaceFA` operation or its reconciliation is in progress, do not submit manual group orders or make manual group edits from TWS, Client Portal, or another API client. LEAN blocks its own conflicting group operations, but it cannot prevent an external client from racing the replacement.
 
 Before a configuration mutation, LEAN's open-order precondition examines only Financial Advisor group orders already known to LEAN through `IOrderProvider`. It does not discover orders or quiesce configuration and order writers in TWS, Client Portal, or other API clients. Operators are responsible for ensuring those external sources remain quiescent throughout the mutation and reconciliation window.

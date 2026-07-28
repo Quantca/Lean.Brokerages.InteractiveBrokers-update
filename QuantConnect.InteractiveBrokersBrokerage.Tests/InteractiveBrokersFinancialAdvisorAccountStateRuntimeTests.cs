@@ -613,7 +613,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             var snapshot = await RunRefreshAsync(
                 state,
-                state.RequestConfiguredRefreshNow);
+                () => state.RequestRefresh(Array.Empty<string>()));
 
             Assert.Multiple(() =>
             {

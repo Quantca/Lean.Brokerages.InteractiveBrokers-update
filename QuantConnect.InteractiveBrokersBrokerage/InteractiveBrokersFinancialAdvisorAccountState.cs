@@ -73,7 +73,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         internal BrokerageAccountGroupAllocationUpdate GroupAllocationUpdate =>
             _groupAllocationUpdate;
         internal bool IsGroupTradingBlocked => _groupTradingBlocked;
-        internal bool HasConfiguredScope => true;
 
         internal InteractiveBrokersFinancialAdvisorAccountState(
             InteractiveBrokersClient client,
@@ -142,11 +141,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 0));
         }
 
-        internal bool RequestConfiguredRefreshNow() =>
-            RequestRefresh(_configuredGroup.Length == 0
-                ? Array.Empty<string>()
-                : new[] { _configuredGroup });
-
         internal void MarkConnected()
         {
             lock (_callbackStateLock)
@@ -195,6 +189,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string allocationMethod) =>
             NormalizeGroupAllocationMethod(allocationMethod);
 
+        // Intentionally distinct from IsFinancialAdvisorGroupFilteredOut: this is the normalized unified-service boundary.
         internal static bool IsOutsideFinancialAdvisorGroupFilter(
             string financialAdvisorsGroupFilter,
             string groupName)
@@ -219,6 +214,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     !string.IsNullOrWhiteSpace(financialAdvisorsGroupFilter));
         }
 
+        // Intentionally distinct: this preserves upstream IsNullOrEmpty and InvariantCultureIgnoreCase semantics for non-unified routing.
         internal static bool IsFinancialAdvisorGroupFilteredOut(
             string financialAdvisorsGroupFilter,
             string groupName)
