@@ -15,9 +15,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using QuantConnect.Interfaces;
 using QuantConnect.Logging;
+using QuantConnect.Orders;
+using QuantConnect.Util;
+using FAState = QuantConnect.Brokerages.InteractiveBrokers.InteractiveBrokersFinancialAdvisorAccountState;
 using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
 
 namespace QuantConnect.Brokerages.InteractiveBrokers
@@ -175,6 +179,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     MapSymbol,
                     _account,
                     _financialAdvisorsGroupFilter,
+                    hasOpenFinancialAdvisorOrders: () =>
+                        _orderProvider.GetOpenOrders(IsFinancialAdvisorGroupOrder).Count != 0,
                     reportUnsupported: message => OnMessage(
                         new BrokerageMessageEvent(
                             BrokerageMessageType.ActionRequired,
@@ -255,6 +261,125 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     groupName?.Trim(),
                     _financialAdvisorsGroupFilter,
                     StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool IsFinancialAdvisorGroupOrder(Order order)
+        {
+            var properties = order?.Properties as InteractiveBrokersOrderProperties;
+            return order != null &&
+                order.Type != OrderType.OptionExercise &&
+                string.IsNullOrWhiteSpace(properties?.Account) &&
+                (!string.IsNullOrWhiteSpace(properties?.FaGroup) ||
+                    !string.IsNullOrWhiteSpace(properties?.FaProfile) ||
+                    !string.IsNullOrWhiteSpace(_financialAdvisorsGroupFilter));
+        }
+
+        internal void ValidateFinancialAdvisorOrderAdmission(Order order)
+        {
+            if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor || order?.Type == OrderType.OptionExercise)
+            {
+                return;
+            }
+            var properties = order.Properties as InteractiveBrokersOrderProperties;
+            if (!string.IsNullOrWhiteSpace(properties?.Account))
+            {
+                return;
+            }
+            if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
+            {
+                throw new NotSupportedException(
+                    "Legacy Financial Advisor profiles are not supported when unified groups are enabled. Use FaGroup instead.");
+            }
+            if (!string.IsNullOrWhiteSpace(properties?.FaGroup) &&
+                IsOutsideFinancialAdvisorGroupFilter(properties.FaGroup))
+            {
+                throw new InvalidOperationException(
+                    $"Order FA group '{properties.FaGroup}' does not match the configured " +
+                    $"Financial Advisor group filter '{_financialAdvisorsGroupFilter}'.");
+            }
+            if (_financialAdvisorAccountState?.IsGroupTradingBlocked == true &&
+                IsFinancialAdvisorGroupOrder(order))
+            {
+                throw new InvalidOperationException(
+                    "FA group orders are blocked while account-group configuration is being updated or reconciled.");
+            }
+
+            var hasExplicitGroup = !string.IsNullOrWhiteSpace(properties?.FaGroup);
+            var allocationOrder = new IBApi.Order
+            {
+                FaGroup = hasExplicitGroup ? properties.FaGroup.Trim() : _financialAdvisorsGroupFilter,
+                FaMethod = hasExplicitGroup
+                    ? FAState.NormalizeFinancialAdvisorAllocationMethod(properties.FaMethod) : string.Empty,
+                TotalQuantity = (int)Math.Abs(order.GroupOrderManager?.Quantity ?? order.Quantity)
+            };
+            if (allocationOrder.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
+            {
+                allocationOrder.FaMethod = "PctChange";
+                allocationOrder.FaPercentage =
+                    (properties.ExactFaPercentage ?? properties.FaPercentage).ToStringInvariant();
+                allocationOrder.TotalQuantity = 0m;
+            }
+            ValidateFinancialAdvisorAllocationMethod(allocationOrder, GetAccountSnapshot());
+        }
+
+        internal static void ValidateFinancialAdvisorAllocationMethod(
+            IBApi.Order order,
+            BrokerageAccountSnapshot snapshot)
+        {
+            if (string.IsNullOrWhiteSpace(order?.FaGroup) ||
+                snapshot?.Status != BrokerageAccountSnapshotStatus.Ready ||
+                !snapshot.AllGroups.TryGetValue(order.FaGroup.Trim(), out var group))
+            {
+                return;
+            }
+
+            var savedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(group.AllocationMethod);
+            var requestedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
+            if (savedMethod.Equals("MonetaryAmount", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NotSupportedException(
+                    $"Financial Advisor group '{group.Name}' uses the unsupported MonetaryAmount allocation method.");
+            }
+            if (requestedMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!decimal.TryParse(order.FaPercentage, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+                {
+                    throw new InvalidOperationException(
+                        $"Financial Advisor PctChange order for group '{group.Name}' requires a valid FaPercentage.");
+                }
+                return;
+            }
+            if (FAState.IsSupportedUserSpecifiedAllocationMethod(savedMethod))
+            {
+                if (requestedMethod.Length != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Saved Financial Advisor group '{group.Name}' uses '{group.AllocationMethod}'. " +
+                        "Set FaGroup and leave FaMethod empty so IB applies its saved allocation values.");
+                }
+                FAState.ValidateGroupAllocationUpdate(group.Name, group.AccountAllocationValues, snapshot.AllGroups);
+                if (savedMethod.Equals("ContractsOrShares", StringComparison.OrdinalIgnoreCase))
+                {
+                    var requiredQuantity = group.AccountAllocationValues.Values.Sum();
+                    if (requiredQuantity <= 0m || order.TotalQuantity != requiredQuantity)
+                    {
+                        throw new InvalidOperationException(
+                            $"ContractsOrShares group '{group.Name}' requires a positive parent quantity equal " +
+                            $"to its saved allocation total {requiredQuantity.ToStringInvariant()}; " +
+                            $"received {order.TotalQuantity.ToStringInvariant()}.");
+                    }
+                }
+                return;
+            }
+
+            if ((savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
+                requestedMethod.Length != 0 &&
+                !savedMethod.Equals(requestedMethod, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Saved Financial Advisor group '{group.Name}' uses '{group.AllocationMethod}', " +
+                    $"so it cannot execute an order using '{order.FaMethod}'. Leave FaMethod empty or use the saved method.");
+            }
         }
 
         /// <summary>

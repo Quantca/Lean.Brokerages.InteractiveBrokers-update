@@ -1,0 +1,1433 @@
+/*
+ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
+ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ */
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using IBApi;
+using NUnit.Framework;
+using QuantConnect.Brokerages;
+using QuantConnect.Brokerages.InteractiveBrokers;
+using QuantConnect.Brokerages.InteractiveBrokers.Client;
+
+namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
+{
+    [TestFixture]
+    public class InteractiveBrokersFinancialAdvisorAccountStateMutationTests
+    {
+        [Test]
+        public async Task WriteRequiresReadySnapshotTest()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsFalse(state.RequestGroupAssignment(
+                    "ACC1", "Alpha", "membership", "configuration"));
+                Assert.IsFalse(state.RequestGroupAllocationUpdate(
+                    "Alpha",
+                    new Dictionary<string, decimal>
+                    {
+                        ["ACC1"] = 1m,
+                        ["ACC2"] = 2m
+                    },
+                    "membership",
+                    "configuration"));
+                Assert.AreEqual(
+                    BrokerageAccountGroupAssignmentStatus.Unavailable,
+                    state.GroupAssignment.Status);
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Unavailable,
+                    state.GroupAllocationUpdate.Status);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+
+            await ReadyAsync(state);
+            state.MarkDisconnected("test disconnect");
+            Assert.IsFalse(state.RequestGroupAssignment(
+                "ACC1",
+                "Alpha",
+                state.Snapshot.MembershipHash,
+                state.Snapshot.GroupConfigurationVersion));
+            Assert.IsTrue(state.IsGroupTradingBlocked);
+        }
+
+        [Test]
+        public async Task MutationRequiresMatchingSnapshotHashesTest()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            var version = GetRequestVersion(state);
+            var prior = state.GroupAllocationUpdate;
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsFalse(state.RequestGroupAllocationUpdate(
+                    "Alpha",
+                    MutationScenario.CurrentAllocation(),
+                    ready.MembershipHash + "-old",
+                    ready.GroupConfigurationVersion));
+                Assert.IsFalse(state.RequestGroupAllocationUpdate(
+                    "Alpha",
+                    MutationScenario.CurrentAllocation(),
+                    ready.MembershipHash,
+                    ready.GroupConfigurationVersion + "-old"));
+                Assert.AreSame(prior, state.GroupAllocationUpdate);
+                Assert.AreEqual(version, GetRequestVersion(state));
+                Assert.AreSame(ready, state.Snapshot);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+
+            Assert.IsTrue(state.RequestGroupAllocationUpdate(
+                "Alpha",
+                MutationScenario.CurrentAllocation(),
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            var completed = await AllocationTerminalAsync(state);
+            Assert.AreEqual(
+                BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                completed.Status);
+        }
+
+        [Test]
+        public async Task ReplacementAmbiguityStartsAfterWireCallTest()
+        {
+            using (var preWireScenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.ThrowBeforeReturn
+            })
+            using (var preWireState = preWireScenario.CreateState())
+            {
+                var ready = await ReadyAsync(preWireState);
+                Assert.IsTrue(RequestChangedAllocation(preWireState, ready));
+                var failed = await AllocationTerminalAsync(preWireState);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                        failed.Status);
+                    StringAssert.DoesNotContain(
+                        "may have applied", failed.ErrorMessage);
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Ready,
+                        preWireState.Snapshot.Status);
+                    Assert.IsFalse(preWireState.IsGroupTradingBlocked);
+                });
+            }
+
+            using (var postWireScenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.ReturnWithoutCompletion
+            })
+            using (var postWireState = postWireScenario.CreateState(
+                TimeSpan.FromMilliseconds(150)))
+            {
+                var ready = await ReadyAsync(postWireState);
+                Assert.IsTrue(RequestChangedAllocation(postWireState, ready));
+                var failed = await AllocationTerminalAsync(postWireState);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                        failed.Status);
+                    StringAssert.Contains(
+                        "replaceFA may have applied", failed.ErrorMessage);
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Stale,
+                        postWireState.Snapshot.Status);
+                    Assert.IsTrue(postWireState.IsGroupTradingBlocked);
+                });
+                var reconciled = await ReadyAsync(postWireState);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    reconciled.Status);
+                Assert.IsFalse(postWireState.IsGroupTradingBlocked);
+            }
+        }
+
+        [Test]
+        public async Task MutationUsesLeanOpenOrderPreconditionTest()
+        {
+            using var scenario = new MutationScenario();
+            scenario.OpenOrderResult = call => call == 2;
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                Assert.AreEqual(2, scenario.OpenOrderCheckCount);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                StringAssert.Contains("LEAN Financial Advisor group order is open",
+                    failed.ErrorMessage);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    state.Snapshot.Status);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
+        public async Task MutationExternalCallsNeverRunUnderStateMonitor()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.CallbackStateLock = GetCallbackStateLock(state);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var completed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                    completed.Status);
+                Assert.IsFalse(scenario.OpenOrderObservedUnderMonitor);
+                Assert.IsFalse(scenario.ServerVersionObservedUnderMonitor);
+                Assert.IsFalse(scenario.ReplaceObservedUnderMonitor);
+            });
+        }
+
+        [Test]
+        public void AssignmentCannotEmptySourceGroupTest()
+        {
+            const string groups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Source</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts><String>ACC1</String></ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Target</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts><String>ACC2</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+
+            var exception = Assert.Throws<InvalidOperationException>(() =>
+                InteractiveBrokersFinancialAdvisorAccountState
+                    .UpdateAccountGroupAssignmentXml(
+                        groups, "ACC1", "Target"));
+
+            StringAssert.Contains("final account", exception.Message);
+            StringAssert.Contains("does not accept an empty FA group", exception.Message);
+        }
+
+        [Test]
+        public void AllocationUpdateRequiresCompleteValidVectorTest()
+        {
+            var groups = InteractiveBrokersFinancialAdvisorAccountState.ParseGroups(
+                MutationScenario.GroupsXml);
+
+            var incomplete = Assert.Throws<InvalidOperationException>(() =>
+                InteractiveBrokersFinancialAdvisorAccountState
+                    .ValidateGroupAllocationUpdate(
+                        "Alpha",
+                        new Dictionary<string, decimal> { ["ACC1"] = 1m },
+                        groups));
+            var invalid = Assert.Throws<InvalidOperationException>(() =>
+                InteractiveBrokersFinancialAdvisorAccountState
+                    .ValidateGroupAllocationUpdate(
+                        "Alpha",
+                        new Dictionary<string, decimal>
+                        {
+                            ["ACC1"] = 1m,
+                            ["ACC2"] = 0m
+                        },
+                        groups));
+
+            StringAssert.Contains("must exactly match", incomplete.Message);
+            StringAssert.Contains("positive", invalid.Message);
+        }
+
+        [Test]
+        public async Task NoOpMutationStillReadsFreshAuthorityAndPublishesNewSnapshot()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            var managedBefore = scenario.ManagedRequestCount;
+            var groupsBefore = scenario.GroupsRequestCount;
+            scenario.BlockNextManagedRequest();
+
+            Assert.IsTrue(state.RequestGroupAllocationUpdate(
+                "Alpha",
+                MutationScenario.CurrentAllocation(),
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            Assert.IsTrue(scenario.ManagedRequestEntered.Wait(TimeSpan.FromSeconds(10)));
+            var pending = state.GroupAllocationUpdate;
+            Assert.AreEqual(
+                BrokerageAccountGroupAllocationUpdateStatus.Pending,
+                pending.Status);
+            var pendingGeneration = pending.Generation;
+            scenario.ReleaseManagedRequest();
+
+            var completed = await AllocationTerminalAsync(state);
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                    completed.Status);
+                Assert.AreEqual(pendingGeneration, completed.Generation);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreEqual(2, scenario.ManagedRequestCount - managedBefore);
+                Assert.AreEqual(4, scenario.GroupsRequestCount - groupsBefore);
+                Assert.Greater(state.Snapshot.Generation, ready.Generation);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready,
+                    state.Snapshot.Status);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
+        public async Task NoOpFinalRefreshFailureInvalidatesAuthority()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.ThrowManagedRequest(
+                scenario.ManagedRequestCount + 2);
+
+            Assert.IsTrue(state.RequestGroupAllocationUpdate(
+                "Alpha",
+                MutationScenario.CurrentAllocation(),
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+                StringAssert.Contains("reconciliation", failed.ErrorMessage);
+            });
+
+            state.MarkConnected();
+            Assert.IsTrue(state.IsGroupTradingBlocked);
+            scenario.ThrowManagedRequest(
+                scenario.ManagedRequestCount + 1);
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            await SnapshotErrorAsync(state, "simulated managed-account failure");
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+            });
+
+            scenario.ThrowManagedRequest(0);
+            var reconciled = await ReadyAsync(state);
+            Assert.AreEqual(
+                BrokerageAccountSnapshotStatus.Ready,
+                reconciled.Status);
+            Assert.IsFalse(state.IsGroupTradingBlocked);
+        }
+
+        [TestCase(1)]
+        [TestCase(2)]
+        public async Task MutationTopologyDriftBeforeWireInvalidatesAuthority(
+            int managedReadOffset)
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.BlockManagedRequest(
+                scenario.ManagedRequestCount + managedReadOffset);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            Assert.IsTrue(
+                scenario.ManagedRequestEntered.Wait(TimeSpan.FromSeconds(10)));
+            scenario.SetCurrentGroupsXml(MutationScenario.DriftedGroupsXml);
+            scenario.ReleaseManagedRequest();
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+                StringAssert.Contains("refresh and retry", failed.ErrorMessage);
+            });
+        }
+
+        [Test]
+        public async Task DisconnectAfterFinalRefreshCannotPublishSuccess()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            using var publicationEntered = new ManualResetEventSlim();
+            using var releasePublication = new ManualResetEventSlim();
+            scenario.Actions.BeforeMutationPublication = () =>
+            {
+                publicationEntered.Set();
+                releasePublication.Wait();
+            };
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            Assert.IsTrue(publicationEntered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    state.Snapshot.Status);
+                Assert.Greater(state.Snapshot.Generation, ready.Generation);
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Pending,
+                    state.GroupAllocationUpdate.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+            });
+
+            state.MarkDisconnected("disconnect before mutation publication");
+            state.MarkConnected();
+            releasePublication.Set();
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+                Assert.IsEmpty(failed.ResultingGroupConfigurationVersion);
+                StringAssert.Contains("reconciliation", failed.ErrorMessage);
+                Assert.IsNull(GetPendingMutation(state));
+            });
+        }
+
+        [Test]
+        public async Task MutationPendingRejectsRefreshAndSecondMutation()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.BlockNextManagedRequest();
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            Assert.IsTrue(scenario.ManagedRequestEntered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Pending,
+                    state.GroupAllocationUpdate.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+                Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+                Assert.IsFalse(state.RequestGroupAssignment(
+                    "ACC1",
+                    "Alpha",
+                    ready.MembershipHash,
+                    ready.GroupConfigurationVersion));
+                Assert.IsFalse(state.RequestGroupAllocationUpdate(
+                    "Alpha",
+                    MutationScenario.CurrentAllocation(),
+                    ready.MembershipHash,
+                    ready.GroupConfigurationVersion));
+            });
+            scenario.ReleaseManagedRequest();
+            Assert.AreEqual(
+                BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                (await AllocationTerminalAsync(state)).Status);
+        }
+
+        [Test]
+        public async Task AllocationPreservesCallerOrderWithCanonicalAccountCasing()
+        {
+            using var scenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.WrongIdsThenSuccess
+            };
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.BlockNextManagedRequest();
+            var requested = new Dictionary<string, decimal>
+            {
+                ["acc2"] = 4m,
+                ["acc1"] = 3m
+            };
+
+            Assert.IsTrue(state.RequestGroupAllocationUpdate(
+                "alpha",
+                requested,
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            Assert.IsTrue(scenario.ManagedRequestEntered.Wait(TimeSpan.FromSeconds(10)));
+            var pending = state.GroupAllocationUpdate;
+            CollectionAssert.AreEqual(
+                new[] { "ACC2", "ACC1" },
+                pending.RequestedAccountAllocationValues.Keys);
+            var generation = pending.Generation;
+            scenario.ReleaseManagedRequest();
+            Assert.IsTrue(
+                scenario.WrongReplacementCallbacksSent.Wait(
+                    TimeSpan.FromSeconds(10)));
+            var pendingReplacement = GetPendingRequest(state);
+            Assert.Multiple(() =>
+            {
+                Assert.LessOrEqual(scenario.ReplacementRequestId, -2);
+                Assert.LessOrEqual(scenario.WrongReplacementRequestId, -2);
+                Assert.AreNotEqual(
+                    scenario.ReplacementRequestId,
+                    scenario.WrongReplacementRequestId);
+                Assert.IsNotNull(pendingReplacement);
+                Assert.AreEqual(
+                    scenario.ReplacementRequestId,
+                    GetPendingRequestId(pendingReplacement));
+                Assert.IsFalse(GetPendingFinished(pendingReplacement));
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Pending,
+                    state.GroupAllocationUpdate.Status);
+            });
+            scenario.CompleteExactReplacement();
+
+            var completed = await AllocationTerminalAsync(state);
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                    completed.Status);
+                Assert.AreEqual(generation, completed.Generation);
+                CollectionAssert.AreEqual(
+                    new[] { "ACC2", "ACC1" },
+                    completed.RequestedAccountAllocationValues.Keys);
+                Assert.AreEqual(1, scenario.ReplaceCount);
+                Assert.AreEqual(1, scenario.MaximumConcurrentExternalCalls);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready,
+                    state.Snapshot.Status);
+            });
+        }
+
+        [Test]
+        public async Task AssignmentMutationUsesSemanticReadbackAndFullRefresh()
+        {
+            const string groups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>Ratio</defaultMethod>
+                    <ListOfAccts>
+                      <Account><acct>ACC1</acct><amount>1</amount></Account>
+                      <Account><acct>ACC2</acct><amount>2</amount></Account>
+                    </ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Beta</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts><String>ACC3</String><String>ACC4</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new MutationScenario();
+            scenario.SetTopology(
+                "MASTER,ACC1,ACC2,ACC3,ACC4",
+                groups);
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(state.RequestGroupAssignment(
+                "acc1",
+                "beta",
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            var pending = state.GroupAssignment;
+            var terminal = await AssignmentTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAssignmentStatus.Succeeded,
+                    terminal.Status);
+                Assert.AreEqual(pending.Generation, terminal.Generation);
+                Assert.AreEqual("ACC1", terminal.AccountId);
+                Assert.AreEqual("Beta", terminal.TargetGroupName);
+                CollectionAssert.AreEqual(
+                    new[] { "Alpha" }, terminal.PreviousGroupNames);
+                CollectionAssert.AreEqual(
+                    new[] { "Beta" }, terminal.ResultingGroupNames);
+                Assert.AreEqual(1, scenario.ReplaceCount);
+                Assert.AreEqual(2, scenario.OpenOrderCheckCount);
+                Assert.Greater(state.Snapshot.Generation, ready.Generation);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
+        public async Task CorrelatedEndAloneCannotReplaceSemanticReadback()
+        {
+            using var scenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.EndWithoutApplying
+            };
+            using var state = scenario.CreateState(
+                TimeSpan.FromMilliseconds(150));
+            var ready = await ReadyAsync(state);
+
+            var elapsed = Stopwatch.StartNew();
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var failed = await AllocationTerminalAsync(state);
+            elapsed.Stop();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                StringAssert.Contains("may have applied", failed.ErrorMessage);
+                StringAssert.Contains(
+                    "did not confirm the requested", failed.ErrorMessage);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+                Assert.Less(elapsed.Elapsed, TimeSpan.FromSeconds(5));
+            });
+        }
+
+        [Test]
+        public async Task SemanticReadbackRetriesStaleResponsesThenSucceeds()
+        {
+            using var scenario = new MutationScenario
+            {
+                StaleReadbacksBeforeApply = 2
+            };
+            using var state = scenario.CreateState(TimeSpan.FromSeconds(5));
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var completed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                    completed.Status);
+                Assert.AreEqual(2, scenario.StaleReadbackCount);
+                Assert.AreEqual(1, scenario.ReplaceCount);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    state.Snapshot.Status);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
+        public async Task OnlyInvalidAccountsErrorIsDefinitiveReplacementRejection()
+        {
+            using (var rejectedScenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.InvalidAccountsError
+            })
+            using (var rejectedState = rejectedScenario.CreateState())
+            {
+                var ready = await ReadyAsync(rejectedState);
+                Assert.IsTrue(RequestChangedAllocation(rejectedState, ready));
+                var failed = await AllocationTerminalAsync(rejectedState);
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                        failed.Status);
+                    StringAssert.Contains("10231", failed.ErrorMessage);
+                    StringAssert.DoesNotContain("may have applied", failed.ErrorMessage);
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready,
+                        rejectedState.Snapshot.Status);
+                    Assert.IsFalse(rejectedState.IsGroupTradingBlocked);
+                });
+            }
+
+            using (var uncertainScenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.OtherError
+            })
+            using (var uncertainState = uncertainScenario.CreateState())
+            {
+                var ready = await ReadyAsync(uncertainState);
+                Assert.IsTrue(RequestChangedAllocation(uncertainState, ready));
+                var failed = await AllocationTerminalAsync(uncertainState);
+                Assert.Multiple(() =>
+                {
+                    StringAssert.Contains("may have applied", failed.ErrorMessage);
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale,
+                        uncertainState.Snapshot.Status);
+                    Assert.IsTrue(uncertainState.IsGroupTradingBlocked);
+                });
+            }
+        }
+
+        [Test]
+        public async Task FailedMutationPublishesTerminalStateAtomically()
+        {
+            using var scenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.ThrowBeforeReturn
+            };
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            using var publicationEntered = new ManualResetEventSlim();
+            using var releasePublication = new ManualResetEventSlim();
+            scenario.Actions.BeforeMutationPublication = () =>
+            {
+                publicationEntered.Set();
+                releasePublication.Wait();
+            };
+            var callbackLock = GetCallbackStateLock(state);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            Assert.IsTrue(publicationEntered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Pending,
+                    state.GroupAllocationUpdate.Status);
+                Assert.IsFalse(state.RequestGroupAllocationUpdate(
+                    "Alpha",
+                    MutationScenario.CurrentAllocation(),
+                    ready.MembershipHash,
+                    ready.GroupConfigurationVersion));
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+                Assert.IsNotNull(GetPendingMutation(state));
+            });
+            releasePublication.Set();
+            var failed = await AllocationTerminalAsync(state);
+            lock (callbackLock)
+            {
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                        failed.Status);
+                    Assert.IsNull(GetPendingMutation(state));
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Ready,
+                        state.Snapshot.Status);
+                    Assert.IsFalse(state.IsGroupTradingBlocked);
+                });
+            }
+            AssertAtomicTerminalizationSource();
+        }
+
+        [Test]
+        public async Task FastReconnectVersionChangeInvalidatesFailedMutation()
+        {
+            using var scenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.ThrowBeforeReturn
+            };
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            using var publicationEntered = new ManualResetEventSlim();
+            using var releasePublication = new ManualResetEventSlim();
+            scenario.Actions.BeforeMutationPublication = () =>
+            {
+                publicationEntered.Set();
+                releasePublication.Wait();
+            };
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            Assert.IsTrue(publicationEntered.Wait(TimeSpan.FromSeconds(10)));
+            var callbackLock = GetCallbackStateLock(state);
+            lock (callbackLock)
+            {
+                var versionField = GetRequestVersionField();
+                versionField.SetValue(
+                    state,
+                    (long)versionField.GetValue(state) + 1);
+            }
+            state.MarkConnected();
+            releasePublication.Set();
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+                StringAssert.Contains("reconciliation", failed.ErrorMessage);
+            });
+        }
+
+        private static bool RequestChangedAllocation(
+            InteractiveBrokersFinancialAdvisorAccountState state,
+            BrokerageAccountSnapshot snapshot) =>
+            state.RequestGroupAllocationUpdate(
+                "Alpha",
+                new Dictionary<string, decimal>
+                {
+                    ["ACC1"] = 3m,
+                    ["ACC2"] = 4m
+                },
+                snapshot.MembershipHash,
+                snapshot.GroupConfigurationVersion);
+
+        private static async Task<BrokerageAccountSnapshot> ReadyAsync(
+            InteractiveBrokersFinancialAdvisorAccountState state)
+        {
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            while (DateTime.UtcNow < deadline)
+            {
+                var snapshot = state.Snapshot;
+                if (snapshot.Status == BrokerageAccountSnapshotStatus.Ready)
+                {
+                    return snapshot;
+                }
+                if (snapshot.Status == BrokerageAccountSnapshotStatus.Failed)
+                {
+                    Assert.Fail(snapshot.ErrorMessage);
+                }
+                await Task.Delay(5);
+            }
+            throw new TimeoutException("A Ready Financial Advisor snapshot was not published.");
+        }
+
+        private static async Task<BrokerageAccountGroupAllocationUpdate>
+            AllocationTerminalAsync(
+                InteractiveBrokersFinancialAdvisorAccountState state)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            while (DateTime.UtcNow < deadline)
+            {
+                var result = state.GroupAllocationUpdate;
+                if (result.Status is
+                    BrokerageAccountGroupAllocationUpdateStatus.Succeeded or
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed)
+                {
+                    return result;
+                }
+                await Task.Delay(5);
+            }
+            throw new TimeoutException(
+                "The Financial Advisor allocation mutation did not become terminal.");
+        }
+
+        private static async Task<BrokerageAccountGroupAssignment>
+            AssignmentTerminalAsync(
+                InteractiveBrokersFinancialAdvisorAccountState state)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            while (DateTime.UtcNow < deadline)
+            {
+                var result = state.GroupAssignment;
+                if (result.Status is
+                    BrokerageAccountGroupAssignmentStatus.Succeeded or
+                    BrokerageAccountGroupAssignmentStatus.Failed)
+                {
+                    return result;
+                }
+                await Task.Delay(5);
+            }
+            throw new TimeoutException(
+                "The Financial Advisor assignment mutation did not become terminal.");
+        }
+
+        private static async Task SnapshotErrorAsync(
+            InteractiveBrokersFinancialAdvisorAccountState state,
+            string expectedError)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            while (DateTime.UtcNow < deadline)
+            {
+                var snapshot = state.Snapshot;
+                if ((snapshot.Status is BrokerageAccountSnapshotStatus.Failed or
+                    BrokerageAccountSnapshotStatus.Stale) &&
+                    snapshot.ErrorMessage.Contains(
+                        expectedError,
+                        StringComparison.Ordinal))
+                {
+                    return;
+                }
+                await Task.Delay(5);
+            }
+            throw new TimeoutException(
+                "The expected Financial Advisor snapshot failure was not published.");
+        }
+
+        private static long GetRequestVersion(
+            InteractiveBrokersFinancialAdvisorAccountState state) =>
+            (long)GetRequestVersionField().GetValue(state);
+
+        private static FieldInfo GetRequestVersionField() =>
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_requestVersion",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+
+        private static object GetCallbackStateLock(
+            InteractiveBrokersFinancialAdvisorAccountState state) =>
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_callbackStateLock",
+                BindingFlags.Instance | BindingFlags.NonPublic).GetValue(state);
+
+        private static object GetPendingMutation(
+            InteractiveBrokersFinancialAdvisorAccountState state) =>
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_pendingMutation",
+                BindingFlags.Instance | BindingFlags.NonPublic).GetValue(state);
+
+        private static object GetPendingRequest(
+            InteractiveBrokersFinancialAdvisorAccountState state) =>
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_pendingRequest",
+                BindingFlags.Instance | BindingFlags.NonPublic).GetValue(state);
+
+        private static int GetPendingRequestId(object pendingRequest) =>
+            (int)pendingRequest.GetType().GetProperty(
+                "RequestId",
+                BindingFlags.Instance | BindingFlags.NonPublic).GetValue(pendingRequest);
+
+        private static bool GetPendingFinished(object pendingRequest) =>
+            (bool)pendingRequest.GetType().GetProperty(
+                "Finished",
+                BindingFlags.Instance | BindingFlags.NonPublic).GetValue(pendingRequest);
+
+        private static void AssertAtomicTerminalizationSource()
+        {
+            var testDirectory = Path.GetDirectoryName(GetTestSourcePath());
+            var runtimePath = Path.GetFullPath(Path.Combine(
+                testDirectory,
+                "..",
+                "QuantConnect.InteractiveBrokersBrokerage",
+                "InteractiveBrokersFinancialAdvisorAccountState.cs"));
+            var source = File.ReadAllText(runtimePath);
+            var terminalCall = source.IndexOf(
+                "mutationError = CompleteMutationLocked(item, failure);",
+                StringComparison.Ordinal);
+            var monitorStart = source.LastIndexOf(
+                "lock (_callbackStateLock)",
+                terminalCall,
+                StringComparison.Ordinal);
+            var monitorBodyStart = source.IndexOf(
+                '{',
+                monitorStart);
+            var monitorEnd = FindMatchingBrace(source, monitorBodyStart);
+            var pendingRelease = source.IndexOf(
+                "_pendingMutation = null;",
+                terminalCall,
+                StringComparison.Ordinal);
+            Assert.Multiple(() =>
+            {
+                Assert.Greater(monitorStart, 0);
+                Assert.Greater(terminalCall, monitorBodyStart);
+                Assert.Greater(pendingRelease, terminalCall);
+                Assert.Less(pendingRelease, monitorEnd);
+            });
+
+            var completionStart = source.IndexOf(
+                "private string CompleteMutationLocked",
+                StringComparison.Ordinal);
+            var completionEnd = source.IndexOf(
+                "private static bool AllocationValuesEqual",
+                completionStart,
+                StringComparison.Ordinal);
+            var completion = source.Substring(
+                completionStart,
+                completionEnd - completionStart);
+            StringAssert.Contains("_disposed || !_connected", completion);
+            StringAssert.Contains(
+                "item.Scope.RequestVersion != _requestVersion",
+                completion);
+        }
+
+        private static int FindMatchingBrace(string source, int openingBrace)
+        {
+            var depth = 0;
+            var inString = false;
+            for (var index = openingBrace; index < source.Length; index++)
+            {
+                var character = source[index];
+                if (inString)
+                {
+                    if (character == '\\')
+                    {
+                        index++;
+                    }
+                    else if (character == '"')
+                    {
+                        inString = false;
+                    }
+                    continue;
+                }
+                if (character == '"')
+                {
+                    inString = true;
+                }
+                else if (character == '{')
+                {
+                    depth++;
+                }
+                else if (character == '}' && --depth == 0)
+                {
+                    return index;
+                }
+            }
+            throw new InvalidOperationException(
+                "The mutation worker's final monitor block was not balanced.");
+        }
+
+        private static string GetTestSourcePath(
+            [CallerFilePath] string sourcePath = "") =>
+            sourcePath;
+
+        private enum ReplacementBehavior
+        {
+            Success,
+            WrongIdsThenSuccess,
+            ThrowBeforeReturn,
+            ReturnWithoutCompletion,
+            EndWithoutApplying,
+            InvalidAccountsError,
+            OtherError
+        }
+
+        private sealed class MutationScenario : IDisposable
+        {
+            internal const string GroupsXml = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>Ratio</defaultMethod>
+                    <ListOfAccts>
+                      <Account><acct>ACC1</acct><amount>1</amount></Account>
+                      <Account><acct>ACC2</acct><amount>2</amount></Account>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            internal const string DriftedGroupsXml = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>Ratio</defaultMethod>
+                    <ListOfAccts>
+                      <Account><acct>ACC1</acct><amount>9</amount></Account>
+                      <Account><acct>ACC2</acct><amount>2</amount></Account>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            private const string AliasesXml = "<ListOfAccountAliases />";
+
+            internal InteractiveBrokersClient Client { get; }
+            internal InteractiveBrokersFinancialAdvisorAccountState.RequestActions Actions
+                { get; }
+            internal ReplacementBehavior Replacement { get; set; }
+            internal Func<int, bool> OpenOrderResult { get; set; } = _ => false;
+            internal int StaleReadbacksBeforeApply { get; set; }
+            internal object CallbackStateLock { get; set; }
+            internal ManualResetEventSlim ManagedRequestEntered { get; } = new();
+            internal ManualResetEventSlim WrongReplacementCallbacksSent { get; } = new();
+            internal int ManagedRequestCount => Volatile.Read(ref _managedRequestCount);
+            internal int GroupsRequestCount => Volatile.Read(ref _groupsRequestCount);
+            internal int ReplaceCount => Volatile.Read(ref _replaceCount);
+            internal int OpenOrderCheckCount => Volatile.Read(ref _openOrderCheckCount);
+            internal int MaximumConcurrentExternalCalls =>
+                Volatile.Read(ref _maximumConcurrentExternalCalls);
+            internal int ReplacementRequestId =>
+                Volatile.Read(ref _replacementRequestId);
+            internal int WrongReplacementRequestId =>
+                Volatile.Read(ref _wrongReplacementRequestId);
+            internal bool OpenOrderObservedUnderMonitor =>
+                Volatile.Read(ref _openOrderObservedUnderMonitor) != 0;
+            internal bool ServerVersionObservedUnderMonitor =>
+                Volatile.Read(ref _serverVersionObservedUnderMonitor) != 0;
+            internal bool ReplaceObservedUnderMonitor =>
+                Volatile.Read(ref _replaceObservedUnderMonitor) != 0;
+            internal int StaleReadbackCount =>
+                Volatile.Read(ref _staleReadbackCount);
+            private string _currentGroupsXml = GroupsXml;
+            private string _replacementXml;
+            private int _managedRequestCount;
+            private int _groupsRequestCount;
+            private int _replaceCount;
+            private int _openOrderCheckCount;
+            private int _activeExternalCalls;
+            private int _maximumConcurrentExternalCalls;
+            private int _blockManagedRequestNumber;
+            private int _throwManagedRequestNumber;
+            private int _replacementRequestId;
+            private int _wrongReplacementRequestId;
+            private int _openOrderObservedUnderMonitor;
+            private int _serverVersionObservedUnderMonitor;
+            private int _replaceObservedUnderMonitor;
+            private int _staleReadbacksRemaining;
+            private int _staleReadbackCount;
+            private string _managedAccounts = "MASTER,ACC1,ACC2";
+            private readonly ManualResetEventSlim _releaseManagedRequest = new(true);
+
+            internal MutationScenario()
+            {
+                Client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+                Actions =
+                    new InteractiveBrokersFinancialAdvisorAccountState.RequestActions(Client)
+                    {
+                        RequestManagedAccounts = authorize =>
+                            RunAuthorized(authorize, () =>
+                            {
+                                var requestNumber =
+                                    Interlocked.Increment(ref _managedRequestCount);
+                                if (requestNumber ==
+                                    Volatile.Read(ref _blockManagedRequestNumber))
+                                {
+                                    ManagedRequestEntered.Set();
+                                    _releaseManagedRequest.Wait();
+                                }
+                                if (requestNumber ==
+                                    Volatile.Read(ref _throwManagedRequestNumber))
+                                {
+                                    throw new InvalidOperationException(
+                                        "simulated managed-account failure");
+                                }
+                                Client.managedAccounts(_managedAccounts);
+                            }),
+                        RequestFinancialAdvisor = (faDataType, authorize) =>
+                            RunAuthorized(authorize, () =>
+                            {
+                                if (faDataType == 1)
+                                {
+                                    Interlocked.Increment(ref _groupsRequestCount);
+                                    var replacementXml =
+                                        Volatile.Read(ref _replacementXml);
+                                    if (replacementXml != null)
+                                    {
+                                        if (Volatile.Read(
+                                            ref _staleReadbacksRemaining) > 0)
+                                        {
+                                            Interlocked.Decrement(
+                                                ref _staleReadbacksRemaining);
+                                            Interlocked.Increment(
+                                                ref _staleReadbackCount);
+                                        }
+                                        else
+                                        {
+                                            Volatile.Write(
+                                                ref _currentGroupsXml,
+                                                replacementXml);
+                                            Volatile.Write(
+                                                ref _replacementXml,
+                                                null);
+                                        }
+                                    }
+                                    Client.receiveFA(
+                                        faDataType,
+                                        Volatile.Read(ref _currentGroupsXml));
+                                }
+                                else
+                                {
+                                    Client.receiveFA(faDataType, AliasesXml);
+                                }
+                            }),
+                        RequestFamilyCodes = authorize =>
+                            RunAuthorized(
+                                authorize,
+                                () => Client.familyCodes(Array.Empty<FamilyCode>())),
+                        RequestPositions = (requestId, accountOrGroup, authorize) =>
+                            RunAuthorized(authorize, () =>
+                            {
+                                Client.positionMultiEnd(requestId);
+                            }),
+                        CancelPositions = (_, authorize) =>
+                            RunAuthorized(authorize, () => { }),
+                        RequestAccountUpdates = (requestId, accountId, authorize) =>
+                            RunAuthorized(
+                                authorize,
+                                () => EmitAccountValues(requestId, accountId)),
+                        CancelAccountUpdates = (_, authorize) =>
+                            RunAuthorized(authorize, () => { }),
+                        GetServerVersion = GetServerVersion,
+                        ReplaceFinancialAdvisor = ReplaceFinancialAdvisor
+                    };
+            }
+
+            internal InteractiveBrokersFinancialAdvisorAccountState CreateState(
+                TimeSpan? timeout = null) =>
+                new(
+                    Client,
+                    () => { },
+                    () => true,
+                    contract => Symbol.Create(
+                        contract.Symbol,
+                        SecurityType.Equity,
+                        Market.USA),
+                    "MASTER",
+                    requestTimeout: timeout ?? TimeSpan.FromSeconds(2),
+                    hasOpenFinancialAdvisorOrders: HasOpenFinancialAdvisorOrders,
+                    requestActions: Actions);
+
+            internal static IReadOnlyDictionary<string, decimal> CurrentAllocation() =>
+                new Dictionary<string, decimal>
+                {
+                    ["ACC1"] = 1m,
+                    ["ACC2"] = 2m
+                };
+
+            internal void SetTopology(string managedAccounts, string groupsXml)
+            {
+                _managedAccounts = managedAccounts;
+                Volatile.Write(ref _currentGroupsXml, groupsXml);
+            }
+
+            internal void SetCurrentGroupsXml(string groupsXml) =>
+                Volatile.Write(ref _currentGroupsXml, groupsXml);
+
+            internal void BlockManagedRequest(int requestNumber)
+            {
+                ManagedRequestEntered.Reset();
+                _releaseManagedRequest.Reset();
+                Volatile.Write(ref _blockManagedRequestNumber, requestNumber);
+            }
+
+            internal void BlockNextManagedRequest() =>
+                BlockManagedRequest(ManagedRequestCount + 1);
+
+            internal void ThrowManagedRequest(int requestNumber) =>
+                Volatile.Write(ref _throwManagedRequestNumber, requestNumber);
+
+            internal void ReleaseManagedRequest() => _releaseManagedRequest.Set();
+
+            internal void CompleteExactReplacement()
+            {
+                var replacementXml = Volatile.Read(ref _replacementXml);
+                Assert.IsNotNull(replacementXml);
+                Volatile.Write(ref _currentGroupsXml, replacementXml);
+                Volatile.Write(ref _replacementXml, null);
+                Client.replaceFAEnd(ReplacementRequestId, "saved");
+            }
+
+            private bool HasOpenFinancialAdvisorOrders()
+            {
+                var call = Interlocked.Increment(ref _openOrderCheckCount);
+                var result = false;
+                RunExternal(() =>
+                {
+                    ObserveMonitor(ref _openOrderObservedUnderMonitor);
+                    result = OpenOrderResult(call);
+                });
+                return result;
+            }
+
+            private int GetServerVersion()
+            {
+                var serverVersion = 0;
+                RunExternal(() =>
+                {
+                    ObserveMonitor(ref _serverVersionObservedUnderMonitor);
+                    serverVersion = int.MaxValue;
+                });
+                return serverVersion;
+            }
+
+            private bool ReplaceFinancialAdvisor(
+                int requestId,
+                int faDataType,
+                string xml,
+                Func<bool> authorize)
+            {
+                return RunAuthorized(authorize, () =>
+                {
+                    ObserveMonitor(ref _replaceObservedUnderMonitor);
+                    Interlocked.Increment(ref _replaceCount);
+                    Volatile.Write(ref _replacementRequestId, requestId);
+                    switch (Replacement)
+                    {
+                        case ReplacementBehavior.ThrowBeforeReturn:
+                            throw new InvalidOperationException(
+                                "replaceFA failed before returning.");
+
+                        case ReplacementBehavior.ReturnWithoutCompletion:
+                            break;
+
+                        case ReplacementBehavior.EndWithoutApplying:
+                            Client.replaceFAEnd(requestId, "saved");
+                            break;
+
+                        case ReplacementBehavior.InvalidAccountsError:
+                            Client.error(
+                                requestId,
+                                0,
+                                10231,
+                                "invalid account list",
+                                string.Empty);
+                            break;
+
+                        case ReplacementBehavior.OtherError:
+                            Client.error(
+                                requestId,
+                                0,
+                                500,
+                                "uncertain replacement failure",
+                                string.Empty);
+                            break;
+
+                        case ReplacementBehavior.WrongIdsThenSuccess:
+                            var wrongRequestId = requestId - 1;
+                            Volatile.Write(
+                                ref _wrongReplacementRequestId,
+                                wrongRequestId);
+                            Volatile.Write(ref _replacementXml, xml);
+                            Client.error(
+                                wrongRequestId,
+                                0,
+                                10231,
+                                "wrong request",
+                                string.Empty);
+                            Client.replaceFAEnd(
+                                wrongRequestId,
+                                "wrong request");
+                            WrongReplacementCallbacksSent.Set();
+                            break;
+
+                        default:
+                            if (StaleReadbacksBeforeApply > 0)
+                            {
+                                Volatile.Write(ref _replacementXml, xml);
+                                Volatile.Write(
+                                    ref _staleReadbacksRemaining,
+                                    StaleReadbacksBeforeApply);
+                            }
+                            else
+                            {
+                                Volatile.Write(ref _currentGroupsXml, xml);
+                            }
+                            Client.replaceFAEnd(requestId, "saved");
+                            break;
+                    }
+                });
+            }
+
+            private void ObserveMonitor(ref int observed)
+            {
+                if (CallbackStateLock != null &&
+                    Monitor.IsEntered(CallbackStateLock))
+                {
+                    Volatile.Write(ref observed, 1);
+                }
+            }
+
+            private void EmitAccountValues(int requestId, string accountId)
+            {
+                Client.accountUpdateMulti(
+                    requestId,
+                    accountId,
+                    string.Empty,
+                    "AccountReady",
+                    "true",
+                    string.Empty);
+                Client.accountUpdateMulti(
+                    requestId,
+                    accountId,
+                    string.Empty,
+                    "AccountType",
+                    "INDIVIDUAL",
+                    string.Empty);
+                Client.accountUpdateMulti(
+                    requestId,
+                    accountId,
+                    string.Empty,
+                    "NetLiquidation",
+                    "1000",
+                    "USD");
+                Client.accountUpdateMulti(
+                    requestId,
+                    accountId,
+                    string.Empty,
+                    "TotalCashValue",
+                    "250",
+                    "USD");
+                Client.accountUpdateMulti(
+                    requestId,
+                    accountId,
+                    string.Empty,
+                    "$LEDGER-USD:CashBalance",
+                    "250",
+                    string.Empty);
+                Client.accountUpdateMultiEnd(requestId);
+            }
+
+            private bool RunAuthorized(Func<bool> authorize, Action action)
+            {
+                if (!authorize())
+                {
+                    return false;
+                }
+                RunExternal(action);
+                return true;
+            }
+
+            private void RunExternal(Action action)
+            {
+                var active = Interlocked.Increment(ref _activeExternalCalls);
+                var observed = Volatile.Read(ref _maximumConcurrentExternalCalls);
+                while (active > observed)
+                {
+                    var prior = Interlocked.CompareExchange(
+                        ref _maximumConcurrentExternalCalls,
+                        active,
+                        observed);
+                    if (prior == observed)
+                    {
+                        break;
+                    }
+                    observed = prior;
+                }
+                try
+                {
+                    action();
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _activeExternalCalls);
+                }
+            }
+
+            public void Dispose()
+            {
+                _releaseManagedRequest.Set();
+                ManagedRequestEntered.Dispose();
+                WrongReplacementCallbacksSent.Dispose();
+                _releaseManagedRequest.Dispose();
+                Client.Dispose();
+            }
+        }
+    }
+}

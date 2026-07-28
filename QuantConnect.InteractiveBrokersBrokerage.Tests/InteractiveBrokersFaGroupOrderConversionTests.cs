@@ -15,9 +15,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using IBApi;
 using NUnit.Framework;
+using QuantConnect.Brokerages;
 using QuantConnect.Brokerages.InteractiveBrokers;
 using QuantConnect.Orders;
 using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
@@ -53,6 +56,24 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             typeof(InteractiveBrokersBrokerage).GetField("_agentDescription", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo FaFilterField =
             typeof(InteractiveBrokersBrokerage).GetField("_financialAdvisorsGroupFilter", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo UnifiedGroupsField =
+            typeof(InteractiveBrokersBrokerage).GetField("_financialAdvisorUnifiedGroupsEnabled", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo AccountStateField =
+            typeof(InteractiveBrokersBrokerage).GetField("_financialAdvisorAccountState", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo ClientField =
+            typeof(InteractiveBrokersBrokerage).GetField("_client", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo PendingOrderResponseField =
+            typeof(InteractiveBrokersBrokerage).GetField("_pendingOrderResponse", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo RequestInformationField =
+            typeof(InteractiveBrokersBrokerage).GetField("_requestInformation", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo GroupTradingBlockedField =
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_groupTradingBlocked",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo SnapshotField =
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_snapshot",
+                BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly MethodInfo ConvertOrderMethod =
             typeof(InteractiveBrokersBrokerage).GetMethod(
                 "ConvertOrder",
@@ -106,6 +127,373 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "FaGroup must be cleared when an Account override is supplied (IB rejects Account+FaGroup together with error 201).");
             Assert.IsTrue(string.IsNullOrEmpty(ibOrder.FaMethod),
                 "FaMethod must be cleared alongside FaGroup when an Account override is supplied.");
+        }
+
+        [Test]
+        public void ConfigurationWriteGateBlocksOnlyGroupOrdersTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            GroupTradingBlockedField.SetValue(state, true);
+            AccountStateField.SetValue(brokerage, state);
+
+            var directOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                Account = "ManagedAccount",
+                FaGroup = "AnotherGroup"
+            });
+            var groupOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName
+            });
+            var implicitFilterOrder = CreateOrder(new InteractiveBrokersOrderProperties());
+
+            Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(directOrder));
+            StringAssert.Contains(
+                "blocked while account-group configuration",
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(groupOrder)).Message);
+            Assert.Throws<InvalidOperationException>(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(implicitFilterOrder));
+        }
+
+        [Test]
+        public void AllocationMethodValidationFailsOpenWithoutAuthorityTest()
+        {
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "NetLiq",
+                new[] { "ManagedAccount" });
+            var conflictingOrder = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                FaMethod = "Equal",
+                TotalQuantity = 1m
+            };
+
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    conflictingOrder,
+                    null));
+            foreach (var status in Enum.GetValues<BrokerageAccountSnapshotStatus>()
+                .Where(status => status != BrokerageAccountSnapshotStatus.Ready))
+            {
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        conflictingOrder,
+                        CreateSnapshot(status, savedGroup)));
+            }
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    conflictingOrder,
+                    CreateSnapshot(
+                        BrokerageAccountSnapshotStatus.Ready,
+                        new BrokerageAccountGroup("OtherGroup", "Equal", new[] { "ManagedAccount" }))));
+
+            conflictingOrder.FaGroup = FaGroupName.ToLowerInvariant();
+            StringAssert.Contains(
+                "cannot execute an order",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        conflictingOrder,
+                        CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup))).Message);
+        }
+
+        [Test]
+        public void AdmissionValidationFailureLeavesBrokerageOrderStateUntouchedTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "NetLiq",
+                new[] { "ManagedAccount" });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+            var order = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName,
+                FaMethod = "Equal"
+            });
+            var client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
+            var connectedField = FindSocketConnectedField(client.ClientSocket);
+            ClientField.SetValue(brokerage, client);
+            connectedField.SetValue(client.ClientSocket, true);
+
+            try
+            {
+                Assert.IsFalse(brokerage.PlaceOrder(order));
+                Assert.IsEmpty(order.BrokerId);
+                Assert.AreEqual(0, GetCollectionCount(RequestInformationField.GetValue(brokerage)));
+                Assert.AreEqual(0, GetCollectionCount(PendingOrderResponseField.GetValue(brokerage)));
+            }
+            finally
+            {
+                connectedField.SetValue(client.ClientSocket, false);
+                client.Dispose();
+                ClientField.SetValue(brokerage, null);
+            }
+        }
+
+        [Test]
+        public void DirectAndGroupRoutingRemainExclusiveTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var directOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                Account = "ManagedAccount",
+                FaGroup = "AnotherGroup",
+                FaMethod = "Equal"
+            });
+            var outsideGroupOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = "AnotherGroup"
+            });
+            var matchingGroupOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = $"  {FaGroupName}  "
+            });
+            var implicitFilterOrder = CreateOrder(new InteractiveBrokersOrderProperties());
+
+            Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(directOrder));
+            var ibOrder = ConvertOrder(brokerage, directOrder);
+            Assert.AreEqual("ManagedAccount", ibOrder.Account);
+            Assert.IsEmpty(ibOrder.FaGroup);
+            Assert.IsEmpty(ibOrder.FaMethod);
+
+            StringAssert.Contains(
+                "does not match the configured",
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(outsideGroupOrder)).Message);
+            Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(matchingGroupOrder));
+            Assert.AreEqual(FaGroupName, ConvertOrder(brokerage, matchingGroupOrder).FaGroup);
+            Assert.AreEqual(FaGroupName, ConvertOrder(brokerage, implicitFilterOrder).FaGroup);
+        }
+
+        [Test]
+        public void UnifiedPctChangeUsesExactPercentagePrecedenceTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var ibOrder = ConvertOrder(
+                brokerage,
+                CreateOrder(new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = " pctchange ",
+                    FaPercentage = 25,
+                    ExactFaPercentage = 12.5m
+                }));
+
+            Assert.AreEqual("PctChange", ibOrder.FaMethod);
+            Assert.AreEqual("12.5", ibOrder.FaPercentage);
+            Assert.AreEqual(0m, ibOrder.TotalQuantity);
+        }
+
+        [Test]
+        public void SavedUserSpecifiedAndComputedMethodsAreValidated()
+        {
+            var ratioGroup = new BrokerageAccountGroup(
+                "RatioGroup",
+                "Ratio",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal> { ["A"] = 1m, ["B"] = 2m });
+            var ratioOrder = new IBApi.Order
+            {
+                FaGroup = ratioGroup.Name,
+                TotalQuantity = 3m
+            };
+            var ratioSnapshot = CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, ratioGroup);
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    ratioOrder,
+                    ratioSnapshot));
+            ratioOrder.FaMethod = "Ratio";
+            StringAssert.Contains(
+                "leave FaMethod empty",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        ratioOrder,
+                        ratioSnapshot)).Message);
+
+            var fixedGroup = new BrokerageAccountGroup(
+                "FixedGroup",
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal> { ["A"] = 0.4m, ["B"] = 0.6m });
+            var fixedOrder = new IBApi.Order
+            {
+                FaGroup = fixedGroup.Name,
+                TotalQuantity = 1m
+            };
+            var fixedSnapshot = CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, fixedGroup);
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    fixedOrder,
+                    fixedSnapshot));
+            fixedOrder.TotalQuantity = 2m;
+            StringAssert.Contains(
+                "saved allocation total",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        fixedOrder,
+                        fixedSnapshot)).Message);
+
+            var equalGroup = new BrokerageAccountGroup(
+                "EqualGroup",
+                "EqualQuantity",
+                new[] { "A" });
+            var computedOrder = new IBApi.Order
+            {
+                FaGroup = equalGroup.Name,
+                FaMethod = "Equal",
+                TotalQuantity = 1m
+            };
+            var computedSnapshot = CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, equalGroup);
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    computedOrder,
+                    computedSnapshot));
+            computedOrder.FaMethod = "NetLiq";
+            StringAssert.Contains(
+                "cannot execute an order",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        computedOrder,
+                        computedSnapshot)).Message);
+        }
+
+        [Test]
+        public void PctChangeAndMonetaryAmountValidationIsActionable()
+        {
+            var netLiq = new BrokerageAccountGroup(
+                FaGroupName,
+                "NetLiq",
+                new[] { "ManagedAccount" });
+            var pctChangeOrder = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                FaMethod = "PctChange",
+                FaPercentage = "invalid"
+            };
+            var snapshot = CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, netLiq);
+
+            StringAssert.Contains(
+                "valid FaPercentage",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        pctChangeOrder,
+                        snapshot)).Message);
+            pctChangeOrder.FaPercentage = "-100.5";
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    pctChangeOrder,
+                    snapshot));
+
+            var monetary = new BrokerageAccountGroup(
+                "Monetary",
+                "MonetaryAmount",
+                new[] { "ManagedAccount" },
+                new Dictionary<string, decimal> { ["ManagedAccount"] = 100m });
+            pctChangeOrder.FaGroup = monetary.Name;
+            StringAssert.Contains(
+                "unsupported MonetaryAmount",
+                Assert.Throws<NotSupportedException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        pctChangeOrder,
+                        CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, monetary))).Message);
+        }
+
+        private static LimitOrder CreateOrder(InteractiveBrokersOrderProperties properties)
+        {
+            return new LimitOrder(
+                Symbols.SPY,
+                10m,
+                100m,
+                new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
+                properties: properties);
+        }
+
+        private static IBApi.Order ConvertOrder(
+            InteractiveBrokersBrokerage brokerage,
+            LeanOrder order)
+        {
+            var contract = new Contract
+            {
+                Symbol = "SPY",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "USD"
+            };
+            return (IBApi.Order)ConvertOrderMethod.Invoke(
+                brokerage,
+                new object[] { new List<LeanOrder> { order }, contract, 1 });
+        }
+
+        private static BrokerageAccountSnapshot CreateSnapshot(
+            BrokerageAccountSnapshotStatus status,
+            params BrokerageAccountGroup[] groups)
+        {
+            var allGroups = groups.ToDictionary(group => group.Name, StringComparer.OrdinalIgnoreCase);
+            var now = DateTime.UtcNow;
+            return new BrokerageAccountSnapshot(
+                status,
+                1,
+                now,
+                now,
+                allGroups,
+                new Dictionary<string, BrokerageAccountState>(),
+                Array.Empty<string>(),
+                "membership",
+                "configuration",
+                string.Empty,
+                allGroups: allGroups);
+        }
+
+        private static int GetCollectionCount(object collection)
+        {
+            return (int)collection.GetType().GetProperty("Count").GetValue(collection);
+        }
+
+        private static FieldInfo FindSocketConnectedField(EClientSocket socket)
+        {
+            for (var type = socket.GetType(); type != null; type = type.BaseType)
+            {
+                foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.NonPublic))
+                {
+                    if (field.FieldType != typeof(bool))
+                    {
+                        continue;
+                    }
+
+                    var original = field.GetValue(socket);
+                    try
+                    {
+                        field.SetValue(socket, true);
+                        if (socket.IsConnected())
+                        {
+                            field.SetValue(socket, original);
+                            return field;
+                        }
+                    }
+                    finally
+                    {
+                        field.SetValue(socket, original);
+                    }
+                }
+            }
+
+            throw new InvalidOperationException(
+                "Unable to locate the EClientSocket in-memory connection flag.");
         }
 
         /// <summary>

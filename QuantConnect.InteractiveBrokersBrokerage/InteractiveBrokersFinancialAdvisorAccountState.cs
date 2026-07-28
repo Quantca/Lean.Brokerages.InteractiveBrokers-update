@@ -28,11 +28,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     {
         private const int GroupsFaDataType = 1;
         private const int AliasesFaDataType = 3;
+        private const int FinancialAdvisorInvalidAccountsErrorCode = 10231;
         private const int QueueCapacity = 8;
 
         private readonly InteractiveBrokersClient _client;
         private readonly Action _paceRequest;
         private readonly Func<bool> _isConnected;
+        private readonly Func<bool> _hasOpenFinancialAdvisorOrders;
         private readonly Func<Contract, Symbol> _mapSymbol;
         private readonly Action<string> _reportUnsupported;
         private readonly string _masterAccountId;
@@ -46,9 +48,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly object _callbackStateLock = new();
 
         private volatile BrokerageAccountSnapshot _snapshot = BrokerageAccountSnapshot.Unavailable;
+        private volatile BrokerageAccountGroupAssignment _groupAssignment =
+            BrokerageAccountGroupAssignment.Unavailable;
+        private volatile BrokerageAccountGroupAllocationUpdate _groupAllocationUpdate =
+            BrokerageAccountGroupAllocationUpdate.Unavailable;
+        private volatile bool _groupTradingBlocked;
         private Task _worker;
         private SnapshotScope _activeRefresh;
         private WorkItem _queuedRefresh;
+        private WorkItem _pendingMutation;
         private PendingRequest _pendingRequest;
         private string _handshakeManagedAccounts;
         private bool _connected;
@@ -58,11 +66,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private long _requestVersion;
 
         internal BrokerageAccountSnapshot Snapshot => _snapshot;
-        internal BrokerageAccountGroupAssignment GroupAssignment =>
-            BrokerageAccountGroupAssignment.Unavailable;
+        internal BrokerageAccountGroupAssignment GroupAssignment => _groupAssignment;
         internal BrokerageAccountGroupAllocationUpdate GroupAllocationUpdate =>
-            BrokerageAccountGroupAllocationUpdate.Unavailable;
-        internal bool IsGroupTradingBlocked => false;
+            _groupAllocationUpdate;
+        internal bool IsGroupTradingBlocked => _groupTradingBlocked;
         internal bool HasConfiguredScope => true;
 
         internal InteractiveBrokersFinancialAdvisorAccountState(
@@ -74,11 +81,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string financialAdvisorGroupFilter = "",
             TimeSpan? requestTimeout = null,
             Action<string> reportUnsupported = null,
+            Func<bool> hasOpenFinancialAdvisorOrders = null,
             RequestActions requestActions = null)
         {
             _client = client ?? throw new ArgumentNullException(nameof(client));
             _paceRequest = paceRequest ?? (() => { });
             _isConnected = isConnected ?? throw new ArgumentNullException(nameof(isConnected));
+            _hasOpenFinancialAdvisorOrders = hasOpenFinancialAdvisorOrders ?? (() => false);
             _mapSymbol = mapSymbol ?? throw new ArgumentNullException(nameof(mapSymbol));
             _masterAccountId = masterAccountId?.Trim() ?? string.Empty;
             _configuredGroup = financialAdvisorGroupFilter?.Trim() ?? string.Empty;
@@ -179,13 +188,191 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         internal static bool IsServiceRequestId(int requestId) => requestId <= -2;
 
-        // Tier 2 intentionally starts from unavailable mutation DTOs.
-        internal bool RequestGroupAssignment(string accountId, string targetGroupName,
+        internal static string NormalizeFinancialAdvisorAllocationMethod(
+            string allocationMethod) =>
+            NormalizeGroupAllocationMethod(allocationMethod);
+
+        internal bool RequestGroupAssignment(
+            string accountId,
+            string targetGroupName,
             string expectedMembershipHash, string expectedGroupConfigurationVersion,
-            decimal? targetAllocationValue = null) => false;
-        internal bool RequestGroupAllocationUpdate(string groupName,
+            decimal? targetAllocationValue = null)
+        {
+            if (string.IsNullOrWhiteSpace(accountId))
+            {
+                throw new ArgumentException(
+                    "A managed Financial Advisor account identifier is required.",
+                    nameof(accountId));
+            }
+            if (targetGroupName == null)
+            {
+                throw new ArgumentNullException(nameof(targetGroupName));
+            }
+            if (targetGroupName.Length != 0 && string.IsNullOrWhiteSpace(targetGroupName))
+            {
+                throw new ArgumentException(
+                    "The target group must be a non-empty name or the exact empty string.",
+                    nameof(targetGroupName));
+            }
+            ValidateExpectedHashes(
+                expectedMembershipHash, expectedGroupConfigurationVersion);
+            return QueueMutation(new WorkItem(
+                accountId.Trim(),
+                targetGroupName.Trim(),
+                expectedMembershipHash.Trim(),
+                expectedGroupConfigurationVersion.Trim(),
+                targetAllocationValue));
+        }
+
+        internal bool RequestGroupAllocationUpdate(
+            string groupName,
             IReadOnlyDictionary<string, decimal> accountAllocationValues,
-            string expectedMembershipHash, string expectedGroupConfigurationVersion) => false;
+            string expectedMembershipHash,
+            string expectedGroupConfigurationVersion)
+        {
+            if (string.IsNullOrWhiteSpace(groupName))
+            {
+                throw new ArgumentException(
+                    "A managed Financial Advisor group name is required.",
+                    nameof(groupName));
+            }
+            ValidateExpectedHashes(
+                expectedMembershipHash, expectedGroupConfigurationVersion);
+            return QueueMutation(new WorkItem(
+                groupName.Trim(),
+                NormalizeAccountAllocationValues(accountAllocationValues),
+                expectedMembershipHash.Trim(),
+                expectedGroupConfigurationVersion.Trim()));
+        }
+
+        private static void ValidateExpectedHashes(
+            string expectedMembershipHash,
+            string expectedGroupConfigurationVersion)
+        {
+            if (string.IsNullOrWhiteSpace(expectedMembershipHash))
+            {
+                throw new ArgumentException(
+                    "The expected membership hash from a ready account snapshot is required.",
+                    nameof(expectedMembershipHash));
+            }
+            if (string.IsNullOrWhiteSpace(expectedGroupConfigurationVersion))
+            {
+                throw new ArgumentException(
+                    "The expected group configuration version from a ready account snapshot is required.",
+                    nameof(expectedGroupConfigurationVersion));
+            }
+        }
+
+        private bool QueueMutation(WorkItem item)
+        {
+            lock (_callbackStateLock)
+            {
+                var snapshot = _snapshot;
+                if (_disposed || !_connected || _unkeyedRequestsPoisoned ||
+                    _activeRefresh != null || _queuedRefresh != null ||
+                    _pendingMutation != null ||
+                    snapshot.Status != BrokerageAccountSnapshotStatus.Ready ||
+                    !string.Equals(
+                        snapshot.MembershipHash,
+                        item.ExpectedMembershipHash,
+                        StringComparison.Ordinal) ||
+                    !string.Equals(
+                        snapshot.GroupConfigurationVersion,
+                        item.ExpectedConfigurationVersion,
+                        StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                if (item.Kind == WorkKind.Assignment)
+                {
+                    item.AccountId = GetCanonicalManagedAccountId(
+                        snapshot.ManagedAccountIds, item.AccountId);
+                    if (item.TargetGroupName.Length != 0)
+                    {
+                        if (!TryGetGroup(
+                            snapshot.Groups, item.TargetGroupName, out var targetGroup))
+                        {
+                            return false;
+                        }
+                        item.TargetGroupName = targetGroup.Name;
+                    }
+                    ValidateGroupAssignment(
+                        item.AccountId, item.TargetGroupName, snapshot.Groups,
+                        snapshot.ManagedAccountIds, snapshot.PrimaryAccountId,
+                        item.TargetAllocationValue);
+                    ValidateMutationScope(
+                        CaptureMutationScope(snapshot, _requestVersion, item),
+                        snapshot.AllGroups, item.AccountId, item.TargetGroupName);
+                }
+                else
+                {
+                    if (!TryGetGroup(snapshot.Groups, item.GroupName, out var group))
+                    {
+                        return false;
+                    }
+                    item.GroupName = group.Name;
+                    ValidateGroupAllocationUpdate(
+                        item.GroupName, item.Allocations, snapshot.Groups);
+                    item.Allocations = CanonicalizeAllocationValues(
+                        item.Allocations, group);
+                }
+
+                var requestVersion = _requestVersion + 1;
+                item.Scope = CaptureMutationScope(snapshot, requestVersion, item);
+                if (item.Kind == WorkKind.Assignment)
+                {
+                    item.Assignment = new BrokerageAccountGroupAssignment(
+                        BrokerageAccountGroupAssignmentStatus.Pending,
+                        _groupAssignment.Generation + 1,
+                        DateTime.UtcNow,
+                        item.AccountId,
+                        item.TargetGroupName,
+                        GetAccountGroupNames(snapshot.AllGroups, item.AccountId),
+                        Array.Empty<string>(),
+                        item.ExpectedMembershipHash,
+                        string.Empty,
+                        item.ExpectedConfigurationVersion,
+                        string.Empty,
+                        string.Empty,
+                        item.TargetAllocationValue);
+                }
+                else
+                {
+                    var group = snapshot.Groups[item.GroupName];
+                    item.Allocation = new BrokerageAccountGroupAllocationUpdate(
+                        BrokerageAccountGroupAllocationUpdateStatus.Pending,
+                        _groupAllocationUpdate.Generation + 1,
+                        DateTime.UtcNow,
+                        item.GroupName,
+                        group.AllocationMethod,
+                        item.Allocations,
+                        null,
+                        item.ExpectedMembershipHash,
+                        string.Empty,
+                        item.ExpectedConfigurationVersion,
+                        string.Empty,
+                        string.Empty);
+                }
+                if (!_work.Writer.TryWrite(item))
+                {
+                    return false;
+                }
+                _requestVersion = requestVersion;
+                _pendingMutation = item;
+                if (item.Kind == WorkKind.Assignment)
+                {
+                    _groupAssignment = item.Assignment;
+                }
+                else
+                {
+                    _groupAllocationUpdate = item.Allocation;
+                }
+                _groupTradingBlocked = true;
+                StartWorkerLocked();
+                return true;
+            }
+        }
 
         public void Dispose()
         {
@@ -223,7 +410,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             lock (_callbackStateLock)
             {
-                if (_disposed || !_connected || _unkeyedRequestsPoisoned)
+                if (_disposed || !_connected || _unkeyedRequestsPoisoned ||
+                    _pendingMutation != null)
                 {
                     return false;
                 }
@@ -253,13 +441,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         return false;
                     }
                     _queuedRefresh = item;
-                    _worker ??= Task.Run(WorkerLoopAsync);
+                    StartWorkerLocked();
                 }
                 _snapshot = CreateStatusSnapshot(
                     _snapshot, BrokerageAccountSnapshotStatus.Refreshing, string.Empty);
             }
             return true;
         }
+
+        private void StartWorkerLocked() =>
+            _worker ??= Task.Run(WorkerLoopAsync);
 
         private async Task WorkerLoopAsync()
         {
@@ -269,6 +460,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     .ConfigureAwait(false))
                 {
                     SnapshotScope scope;
+                    var rejected = false;
                     lock (_callbackStateLock)
                     {
                         if (ReferenceEquals(_queuedRefresh, item))
@@ -277,38 +469,135 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         }
                         scope = item.Scope;
                         if (_disposed || !_connected || _unkeyedRequestsPoisoned ||
-                            scope.RequestVersion != _requestVersion)
+                            scope.RequestVersion != _requestVersion ||
+                            item.Kind != WorkKind.Refresh &&
+                            !ReferenceEquals(_pendingMutation, item))
                         {
-                            continue;
+                            if (item.Kind == WorkKind.Refresh)
+                            {
+                                continue;
+                            }
+                            rejected = true;
+                            item.BrokerStateInvalidated = true;
                         }
-                        _activeRefresh = scope;
+                        else
+                        {
+                            _activeRefresh = scope;
+                        }
                     }
-
-                    // The worker loop provides operation serialization. The mandated
-                    // semaphore is an admission turnstile and never spans an external call.
-                    await _operationLock.WaitAsync(_disposeTokenSource.Token)
-                        .ConfigureAwait(false);
-                    _operationLock.Release();
-                    Exception failure = null;
+                    Exception failure = rejected
+                        ? new RequestInvalidatedException(
+                            "The Financial Advisor configuration mutation became " +
+                            "obsolete before it started.")
+                        : null;
+                    var successPublished = false;
+                    string mutationError = null;
                     try
                     {
-                        await RefreshAsync(scope).ConfigureAwait(false);
-                    }
-                    catch (Exception exception) when (exception is not OperationCanceledException)
-                    {
-                        failure = exception;
+                        if (!rejected)
+                        {
+                            // The worker loop provides operation serialization. The mandated
+                            // semaphore is an admission turnstile and never spans an external call.
+                            await _operationLock.WaitAsync(_disposeTokenSource.Token)
+                                .ConfigureAwait(false);
+                            _operationLock.Release();
+                            try
+                            {
+                                if (item.Kind == WorkKind.Refresh)
+                                {
+                                    await RefreshAsync(scope).ConfigureAwait(false);
+                                }
+                                else if (item.Kind == WorkKind.Assignment)
+                                {
+                                    item.Assignment = await RunGroupAssignmentAsync(item)
+                                        .ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    item.Allocation = await RunGroupAllocationUpdateAsync(item)
+                                        .ConfigureAwait(false);
+                                }
+                            }
+                            catch (Exception exception) when (
+                                exception is not OperationCanceledException)
+                            {
+                                failure = exception;
+                            }
+                        }
+                        if (item.Kind != WorkKind.Refresh)
+                        {
+                            _requests.BeforeMutationPublication();
+                        }
                     }
                     finally
                     {
                         lock (_callbackStateLock)
                         {
+                            if (item.Kind != WorkKind.Refresh && failure == null)
+                            {
+                                var membershipHash = item.Kind == WorkKind.Assignment
+                                    ? item.Assignment.ResultingMembershipHash
+                                    : item.Allocation.ResultingMembershipHash;
+                                var configurationVersion =
+                                    item.Kind == WorkKind.Assignment
+                                        ? item.Assignment.ResultingGroupConfigurationVersion
+                                        : item.Allocation.ResultingGroupConfigurationVersion;
+                                if (!_disposed && _connected &&
+                                    scope.RequestVersion == _requestVersion &&
+                                    _snapshot.Status ==
+                                        BrokerageAccountSnapshotStatus.Ready &&
+                                    string.Equals(
+                                        _snapshot.MembershipHash,
+                                        membershipHash,
+                                        StringComparison.Ordinal) &&
+                                    string.Equals(
+                                        _snapshot.GroupConfigurationVersion,
+                                        configurationVersion,
+                                        StringComparison.Ordinal))
+                                {
+                                    if (item.Kind == WorkKind.Assignment)
+                                    {
+                                        _groupAssignment = item.Assignment;
+                                    }
+                                    else
+                                    {
+                                        _groupAllocationUpdate = item.Allocation;
+                                    }
+                                    _groupTradingBlocked = false;
+                                    successPublished = true;
+                                }
+                                else
+                                {
+                                    item.BrokerStateInvalidated = true;
+                                    failure = new RequestInvalidatedException(
+                                        "Broker authority changed before the Financial " +
+                                        "Advisor mutation result could be published.");
+                                }
+                            }
+                            if (item.Kind != WorkKind.Refresh && !successPublished)
+                            {
+                                mutationError = CompleteMutationLocked(item, failure);
+                            }
                             if (ReferenceEquals(_activeRefresh, scope))
                             {
                                 _activeRefresh = null;
                             }
+                            if (ReferenceEquals(_pendingMutation, item))
+                            {
+                                _pendingMutation = null;
+                            }
                         }
                     }
-                    if (failure != null)
+                    if (item.Kind != WorkKind.Refresh)
+                    {
+                        if (mutationError != null)
+                        {
+                            Log.Error(
+                                "InteractiveBrokersFinancialAdvisorAccountState: " +
+                                "configuration mutation failed: " + mutationError);
+                        }
+                    }
+                    else if (failure != null)
                     {
                         var published = PublishFailure(
                             failure.Message,
@@ -359,8 +648,95 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private sealed class WorkItem
         {
+            internal WorkKind Kind { get; }
             internal SnapshotScope Scope;
-            internal WorkItem(SnapshotScope scope) => Scope = scope;
+            internal string AccountId;
+            internal string TargetGroupName;
+            internal decimal? TargetAllocationValue;
+            internal string GroupName;
+            internal IReadOnlyDictionary<string, decimal> Allocations;
+            internal string ExpectedMembershipHash;
+            internal string ExpectedConfigurationVersion;
+            internal BrokerageAccountGroupAssignment Assignment;
+            internal BrokerageAccountGroupAllocationUpdate Allocation;
+            internal bool ReplacementStarted;
+            internal bool ReplacementRejected;
+            internal bool BrokerStateInvalidated;
+
+            internal WorkItem(SnapshotScope scope)
+            {
+                Kind = WorkKind.Refresh;
+                Scope = scope;
+            }
+
+            internal WorkItem(
+                string accountId,
+                string targetGroupName,
+                string expectedMembershipHash,
+                string expectedConfigurationVersion,
+                decimal? targetAllocationValue)
+            {
+                Kind = WorkKind.Assignment;
+                AccountId = accountId;
+                TargetGroupName = targetGroupName;
+                ExpectedMembershipHash = expectedMembershipHash;
+                ExpectedConfigurationVersion = expectedConfigurationVersion;
+                TargetAllocationValue = targetAllocationValue;
+            }
+
+            internal WorkItem(
+                string groupName,
+                IReadOnlyDictionary<string, decimal> allocations,
+                string expectedMembershipHash,
+                string expectedConfigurationVersion)
+            {
+                Kind = WorkKind.Allocation;
+                GroupName = groupName;
+                Allocations = allocations;
+                ExpectedMembershipHash = expectedMembershipHash;
+                ExpectedConfigurationVersion = expectedConfigurationVersion;
+            }
+        }
+
+        private enum WorkKind
+        {
+            Refresh,
+            Assignment,
+            Allocation
+        }
+
+        private sealed class MutationTopology
+        {
+            internal IReadOnlyCollection<string> ManagedAccountIds { get; }
+            internal string PrimaryAccountId { get; }
+            internal string GroupsXml { get; }
+            internal IReadOnlyDictionary<string, BrokerageAccountGroup> AllGroups { get; }
+            internal IReadOnlyDictionary<string, BrokerageAccountGroup> SelectedGroups { get; }
+            internal IReadOnlyDictionary<string, string> Aliases { get; }
+            internal IReadOnlyDictionary<string, string> FamilyCodes { get; }
+            internal string ConfigurationVersion { get; }
+            internal string MembershipHash { get; }
+
+            internal MutationTopology(
+                IReadOnlyCollection<string> managedAccountIds,
+                string primaryAccountId,
+                string groupsXml,
+                IReadOnlyDictionary<string, BrokerageAccountGroup> allGroups,
+                IReadOnlyDictionary<string, BrokerageAccountGroup> selectedGroups,
+                IReadOnlyDictionary<string, string> aliases,
+                IReadOnlyDictionary<string, string> familyCodes)
+            {
+                ManagedAccountIds = managedAccountIds;
+                PrimaryAccountId = primaryAccountId;
+                GroupsXml = groupsXml;
+                AllGroups = allGroups;
+                SelectedGroups = selectedGroups;
+                Aliases = aliases;
+                FamilyCodes = familyCodes;
+                ConfigurationVersion = ComputeConfigurationHash(groupsXml);
+                MembershipHash = ComputeMembershipHash(
+                    selectedGroups, managedAccountIds, aliases, familyCodes);
+            }
         }
 
         private sealed class SnapshotScope
@@ -380,6 +756,47 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
+        private static SnapshotScope CaptureMutationScope(
+            BrokerageAccountSnapshot snapshot,
+            long requestVersion,
+            WorkItem item)
+        {
+            var members = snapshot.Groups.Values
+                .SelectMany(group => group.AccountIds)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var additional = snapshot.Accounts.Keys
+                .Where(accountId => !members.Contains(accountId))
+                .ToList();
+            if (item.Kind == WorkKind.Assignment)
+            {
+                additional.RemoveAll(accountId => accountId.Equals(
+                    item.AccountId, StringComparison.OrdinalIgnoreCase));
+                if (item.TargetGroupName.Length == 0)
+                {
+                    additional.Add(item.AccountId);
+                }
+            }
+            return new SnapshotScope(
+                snapshot.Groups.Keys.ToArray(),
+                additional.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+                snapshot.IsComplete,
+                requestVersion);
+        }
+
+        private static IReadOnlyDictionary<string, decimal> CanonicalizeAllocationValues(
+            IReadOnlyDictionary<string, decimal> allocations,
+            BrokerageAccountGroup group)
+        {
+            var result = new Dictionary<string, decimal>(StringComparer.Ordinal);
+            foreach (var allocation in allocations)
+            {
+                var accountId = group.AccountIds.Single(id => id.Equals(
+                    allocation.Key, StringComparison.OrdinalIgnoreCase));
+                result.Add(accountId, allocation.Value);
+            }
+            return result;
+        }
+
         private static IReadOnlyCollection<string> NormalizeNames(
             IEnumerable<string> values, string description)
         {
@@ -397,6 +814,473 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             return result.AsReadOnly();
         }
+
+        private async Task<BrokerageAccountGroupAssignment> RunGroupAssignmentAsync(
+            WorkItem item)
+        {
+            EnsureNoOpenFinancialAdvisorOrders("account-group assignment");
+            var topology = await ReadMutationTopologyAsync(item.Scope).ConfigureAwait(false);
+            VerifyMutationVersions(item, topology);
+            var accountId = GetCanonicalManagedAccountId(
+                topology.ManagedAccountIds, item.AccountId);
+            ValidateMutationScope(
+                item.Scope, topology.AllGroups, accountId, item.TargetGroupName);
+            ValidateGroupAssignment(
+                accountId, item.TargetGroupName, topology.SelectedGroups,
+                topology.ManagedAccountIds, topology.PrimaryAccountId,
+                item.TargetAllocationValue);
+            ValidateAssignmentGroups(
+                topology.AllGroups, accountId, item.TargetGroupName);
+            var previousGroupNames = GetAccountGroupNames(
+                topology.AllGroups, accountId);
+            ValidateManagedGroupMembers(
+                topology.AllGroups, topology.ManagedAccountIds,
+                topology.PrimaryAccountId,
+                previousGroupNames.Append(item.TargetGroupName));
+
+            var updatedXml = UpdateAccountGroupAssignmentXml(
+                topology.GroupsXml, accountId, item.TargetGroupName,
+                item.TargetAllocationValue);
+            var expectedConfigurationVersion = ComputeConfigurationHash(updatedXml);
+            var expectedGroups = CanonicalizeGroups(
+                ParseGroups(updatedXml, validateAllocationConfiguration: false),
+                topology.ManagedAccountIds);
+            var expectedSelectedGroups = item.Scope.CompleteDiscovery
+                ? expectedGroups
+                : SelectGroups(expectedGroups, item.Scope.GroupNames);
+            var expectedMembershipHash = ComputeMembershipHash(
+                expectedSelectedGroups, topology.ManagedAccountIds,
+                topology.Aliases, topology.FamilyCodes);
+
+            var changed = !string.Equals(
+                topology.ConfigurationVersion,
+                expectedConfigurationVersion,
+                StringComparison.Ordinal);
+            if (changed)
+            {
+                topology = await ReadMutationTopologyAsync(item.Scope)
+                    .ConfigureAwait(false);
+                VerifyMutationVersions(item, topology);
+                accountId = GetCanonicalManagedAccountId(
+                    topology.ManagedAccountIds, item.AccountId);
+                ValidateMutationScope(
+                    item.Scope, topology.AllGroups, accountId, item.TargetGroupName);
+                ValidateGroupAssignment(
+                    accountId, item.TargetGroupName, topology.SelectedGroups,
+                    topology.ManagedAccountIds, topology.PrimaryAccountId,
+                    item.TargetAllocationValue);
+                ValidateAssignmentGroups(
+                    topology.AllGroups, accountId, item.TargetGroupName);
+                previousGroupNames = GetAccountGroupNames(
+                    topology.AllGroups, accountId);
+                ValidateManagedGroupMembers(
+                    topology.AllGroups, topology.ManagedAccountIds,
+                    topology.PrimaryAccountId,
+                    previousGroupNames.Append(item.TargetGroupName));
+                updatedXml = UpdateAccountGroupAssignmentXml(
+                    topology.GroupsXml, accountId, item.TargetGroupName,
+                    item.TargetAllocationValue);
+                expectedConfigurationVersion = ComputeConfigurationHash(updatedXml);
+                expectedGroups = CanonicalizeGroups(
+                    ParseGroups(
+                        updatedXml, validateAllocationConfiguration: false),
+                    topology.ManagedAccountIds);
+                expectedSelectedGroups = item.Scope.CompleteDiscovery
+                    ? expectedGroups
+                    : SelectGroups(expectedGroups, item.Scope.GroupNames);
+                expectedMembershipHash = ComputeMembershipHash(
+                    expectedSelectedGroups, topology.ManagedAccountIds,
+                    topology.Aliases, topology.FamilyCodes);
+                EnsureNoOpenFinancialAdvisorOrders("account-group assignment");
+                await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
+            }
+            var confirmedXml = changed
+                ? await RequestExpectedGroupsXmlAsync(
+                    item.Scope, expectedConfigurationVersion).ConfigureAwait(false)
+                : await RequestFinancialAdvisorXmlAsync(
+                    item.Scope, GroupsFaDataType).ConfigureAwait(false);
+            var confirmedConfigurationVersion = ComputeConfigurationHash(confirmedXml);
+            var confirmedGroups = CanonicalizeGroups(
+                ParseGroups(confirmedXml, validateAllocationConfiguration: false),
+                topology.ManagedAccountIds);
+            var confirmedSelectedGroups = item.Scope.CompleteDiscovery
+                ? confirmedGroups
+                : SelectGroups(confirmedGroups, item.Scope.GroupNames);
+            var confirmedMembershipHash = ComputeMembershipHash(
+                confirmedSelectedGroups, topology.ManagedAccountIds,
+                topology.Aliases, topology.FamilyCodes);
+            var resultingGroupNames = GetAccountGroupNames(
+                confirmedGroups, accountId);
+            if (!string.Equals(
+                    confirmedConfigurationVersion,
+                    expectedConfigurationVersion,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    confirmedMembershipHash,
+                    expectedMembershipHash,
+                    StringComparison.Ordinal))
+            {
+                item.BrokerStateInvalidated = true;
+                throw new InvalidOperationException(
+                    "The Financial Advisor account assignment readback did not match " +
+                    "the requested configuration.");
+            }
+            ValidateResultingAssignment(
+                accountId, item.TargetGroupName, resultingGroupNames);
+
+            item.BrokerStateInvalidated = true;
+            await RefreshAsync(item.Scope).ConfigureAwait(false);
+            var refreshed = Snapshot;
+            var refreshedGroupNames = GetAccountGroupNames(
+                refreshed.AllGroups, accountId);
+            if (refreshed.Status != BrokerageAccountSnapshotStatus.Ready ||
+                !string.Equals(
+                    refreshed.MembershipHash,
+                    confirmedMembershipHash,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    refreshed.GroupConfigurationVersion,
+                    confirmedConfigurationVersion,
+                    StringComparison.Ordinal))
+            {
+                item.BrokerStateInvalidated = true;
+                throw new InvalidOperationException(
+                    "The Financial Advisor account assignment was saved, but the " +
+                    "refreshed account snapshot did not confirm it.");
+            }
+            ValidateResultingAssignment(
+                accountId, item.TargetGroupName, refreshedGroupNames);
+            item.BrokerStateInvalidated = false;
+            return new BrokerageAccountGroupAssignment(
+                BrokerageAccountGroupAssignmentStatus.Succeeded,
+                item.Assignment.Generation,
+                DateTime.UtcNow,
+                accountId,
+                item.TargetGroupName,
+                previousGroupNames,
+                refreshedGroupNames,
+                item.ExpectedMembershipHash,
+                refreshed.MembershipHash,
+                item.ExpectedConfigurationVersion,
+                refreshed.GroupConfigurationVersion,
+                string.Empty,
+                item.TargetAllocationValue);
+        }
+
+        private async Task<BrokerageAccountGroupAllocationUpdate>
+            RunGroupAllocationUpdateAsync(WorkItem item)
+        {
+            EnsureNoOpenFinancialAdvisorOrders("group allocation update");
+            var topology = await ReadMutationTopologyAsync(item.Scope).ConfigureAwait(false);
+            VerifyMutationVersions(item, topology);
+            ValidateMutationScope(
+                item.Scope, topology.AllGroups, null, item.GroupName);
+            ValidateGroupAllocationUpdate(
+                item.GroupName, item.Allocations, topology.SelectedGroups);
+            ValidateManagedGroupMembers(
+                topology.AllGroups, topology.ManagedAccountIds,
+                topology.PrimaryAccountId, new[] { item.GroupName });
+
+            var updatedXml = UpdateAccountGroupAllocationsXml(
+                topology.GroupsXml, item.GroupName, item.Allocations);
+            var expectedConfigurationVersion = ComputeConfigurationHash(updatedXml);
+            var changed = !string.Equals(
+                topology.ConfigurationVersion,
+                expectedConfigurationVersion,
+                StringComparison.Ordinal);
+            if (changed)
+            {
+                topology = await ReadMutationTopologyAsync(item.Scope)
+                    .ConfigureAwait(false);
+                VerifyMutationVersions(item, topology);
+                ValidateMutationScope(
+                    item.Scope, topology.AllGroups, null, item.GroupName);
+                ValidateGroupAllocationUpdate(
+                    item.GroupName, item.Allocations, topology.SelectedGroups);
+                ValidateManagedGroupMembers(
+                    topology.AllGroups, topology.ManagedAccountIds,
+                    topology.PrimaryAccountId, new[] { item.GroupName });
+                updatedXml = UpdateAccountGroupAllocationsXml(
+                    topology.GroupsXml, item.GroupName, item.Allocations);
+                expectedConfigurationVersion = ComputeConfigurationHash(updatedXml);
+                EnsureNoOpenFinancialAdvisorOrders("group allocation update");
+                await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
+            }
+            var confirmedXml = changed
+                ? await RequestExpectedGroupsXmlAsync(
+                    item.Scope, expectedConfigurationVersion).ConfigureAwait(false)
+                : await RequestFinancialAdvisorXmlAsync(
+                    item.Scope, GroupsFaDataType).ConfigureAwait(false);
+            var confirmedConfigurationVersion = ComputeConfigurationHash(confirmedXml);
+            var confirmedGroups = CanonicalizeGroups(
+                ParseGroups(confirmedXml, validateAllocationConfiguration: false),
+                topology.ManagedAccountIds);
+            var confirmedSelectedGroups = item.Scope.CompleteDiscovery
+                ? confirmedGroups
+                : SelectGroups(confirmedGroups, item.Scope.GroupNames);
+            if (!confirmedSelectedGroups.TryGetValue(
+                    item.GroupName, out var confirmedGroup) ||
+                !string.Equals(
+                    confirmedConfigurationVersion,
+                    expectedConfigurationVersion,
+                    StringComparison.Ordinal) ||
+                !AllocationValuesEqual(
+                    item.Allocations, confirmedGroup.AccountAllocationValues))
+            {
+                item.BrokerStateInvalidated = true;
+                throw new InvalidOperationException(
+                    $"Financial Advisor group '{item.GroupName}' allocation readback " +
+                    "did not match the requested values.");
+            }
+            var confirmedMembershipHash = ComputeMembershipHash(
+                confirmedSelectedGroups, topology.ManagedAccountIds,
+                topology.Aliases, topology.FamilyCodes);
+            if (!string.Equals(
+                confirmedMembershipHash,
+                item.ExpectedMembershipHash,
+                StringComparison.Ordinal))
+            {
+                item.BrokerStateInvalidated = true;
+                throw new InvalidOperationException(
+                    "Financial Advisor membership changed while the allocation update " +
+                    "was being saved.");
+            }
+
+            item.BrokerStateInvalidated = true;
+            await RefreshAsync(item.Scope).ConfigureAwait(false);
+            var refreshed = Snapshot;
+            if (refreshed.Status != BrokerageAccountSnapshotStatus.Ready ||
+                !string.Equals(
+                    refreshed.MembershipHash,
+                    confirmedMembershipHash,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    refreshed.GroupConfigurationVersion,
+                    confirmedConfigurationVersion,
+                    StringComparison.Ordinal) ||
+                !refreshed.Groups.TryGetValue(item.GroupName, out var refreshedGroup) ||
+                !AllocationValuesEqual(
+                    item.Allocations, refreshedGroup.AccountAllocationValues))
+            {
+                item.BrokerStateInvalidated = true;
+                throw new InvalidOperationException(
+                    "The Financial Advisor allocation was saved, but the refreshed " +
+                    "account snapshot did not confirm it.");
+            }
+            item.BrokerStateInvalidated = false;
+            return new BrokerageAccountGroupAllocationUpdate(
+                BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                item.Allocation.Generation,
+                DateTime.UtcNow,
+                item.GroupName,
+                refreshedGroup.AllocationMethod,
+                item.Allocations,
+                refreshedGroup.AccountAllocationValues,
+                item.ExpectedMembershipHash,
+                refreshed.MembershipHash,
+                item.ExpectedConfigurationVersion,
+                refreshed.GroupConfigurationVersion,
+                string.Empty);
+        }
+
+        private async Task<MutationTopology> ReadMutationTopologyAsync(
+            SnapshotScope scope)
+        {
+            var managedAccountIds = ParseManagedAccounts(
+                await RequestManagedAccountsAsync(scope, useHandshakeCache: false)
+                    .ConfigureAwait(false));
+            var groupsXml = await RequestFinancialAdvisorXmlAsync(
+                scope, GroupsFaDataType).ConfigureAwait(false);
+            var aliases = ParseAliases(await RequestFinancialAdvisorXmlAsync(
+                scope, AliasesFaDataType).ConfigureAwait(false));
+            var familyCodes = ToFamilyCodeDictionary(
+                await RequestFamilyCodesAsync(scope).ConfigureAwait(false));
+            var allGroups = CanonicalizeGroups(
+                ParseGroups(groupsXml, validateAllocationConfiguration: false),
+                managedAccountIds);
+            return new MutationTopology(
+                managedAccountIds,
+                GetCanonicalPrimaryAccountId(managedAccountIds, _masterAccountId),
+                groupsXml,
+                allGroups,
+                scope.CompleteDiscovery
+                    ? allGroups
+                    : SelectGroups(allGroups, scope.GroupNames),
+                aliases,
+                familyCodes);
+        }
+
+        private static void VerifyMutationVersions(
+            WorkItem item, MutationTopology topology)
+        {
+            if (!string.Equals(
+                    item.ExpectedConfigurationVersion,
+                    topology.ConfigurationVersion,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    item.ExpectedMembershipHash,
+                    topology.MembershipHash,
+                    StringComparison.Ordinal))
+            {
+                item.BrokerStateInvalidated = true;
+                throw new InvalidOperationException(
+                    "The Financial Advisor configuration or membership changed after " +
+                    "the algorithm snapshot; refresh and retry.");
+            }
+        }
+
+        private void EnsureNoOpenFinancialAdvisorOrders(string operation)
+        {
+            if (_hasOpenFinancialAdvisorOrders())
+            {
+                throw new InvalidOperationException(
+                    $"A Financial Advisor {operation} cannot proceed while a LEAN " +
+                    "Financial Advisor group order is open.");
+            }
+        }
+
+        private async Task ReplaceGroupsAsync(WorkItem item, string xml)
+        {
+            var serverVersion = _requests.GetServerVersion();
+            if (serverVersion > 0 && serverVersion < MinServerVer.REPLACE_FA_END)
+            {
+                throw new NotSupportedException(
+                    $"Financial Advisor group mutation requires IB server version " +
+                    $"{MinServerVer.REPLACE_FA_END} or later.");
+            }
+            var requestId = NextRequestId();
+            var pending = InstallPending(
+                item.Scope, PendingKind.Replacement, requestId,
+                GroupsFaDataType, unkeyed: false);
+            try
+            {
+                var sent = PaceAndInvoke(
+                    pending,
+                    authorize => _requests.ReplaceFinancialAdvisor(
+                        requestId, GroupsFaDataType, xml, authorize),
+                    cancellation: false);
+                if (!sent)
+                {
+                    await pending.Completion.Task.ConfigureAwait(false);
+                    return;
+                }
+                pending.WireSent = true;
+                item.ReplacementStarted = true;
+                await AwaitPendingAsync(
+                    pending,
+                    "Financial Advisor configuration replacement",
+                    poisonOnTimeout: false).ConfigureAwait(false);
+            }
+            catch
+            {
+                item.ReplacementRejected = pending.ExplicitlyRejected;
+                throw;
+            }
+            finally
+            {
+                ClearPending(pending);
+            }
+        }
+
+        private async Task<string> RequestExpectedGroupsXmlAsync(
+            SnapshotScope scope, string expectedConfigurationVersion)
+        {
+            var deadline = Environment.TickCount64 +
+                Math.Max(1L, (long)_requestTimeout.TotalMilliseconds);
+            while (true)
+            {
+                var xml = await RequestFinancialAdvisorXmlAsync(
+                    scope, GroupsFaDataType).ConfigureAwait(false);
+                if (string.Equals(
+                    ComputeConfigurationHash(xml),
+                    expectedConfigurationVersion,
+                    StringComparison.Ordinal))
+                {
+                    return xml;
+                }
+                var remainingMilliseconds = deadline - Environment.TickCount64;
+                if (remainingMilliseconds <= 0)
+                {
+                    break;
+                }
+                await Task.Delay(
+                    TimeSpan.FromMilliseconds(
+                        Math.Min(50, remainingMilliseconds)),
+                    _disposeTokenSource.Token).ConfigureAwait(false);
+            }
+            throw new InvalidOperationException(
+                "IB did not confirm the requested Financial Advisor configuration " +
+                "after replaceFAEnd.");
+        }
+
+        private string CompleteMutationLocked(WorkItem item, Exception failure)
+        {
+            var ambiguous = item.ReplacementStarted && !item.ReplacementRejected;
+            var authorityUncertain = ambiguous || item.BrokerStateInvalidated ||
+                failure is UnkeyedRequestTimeoutException or RequestInvalidatedException ||
+                _disposed || !_connected ||
+                item.Scope.RequestVersion != _requestVersion ||
+                _snapshot.Status != BrokerageAccountSnapshotStatus.Ready;
+            var errorMessage = ambiguous
+                ? "replaceFA may have applied; reconciliation is required: " +
+                    failure.Message
+                : authorityUncertain
+                    ? "Broker authority is stale; reconciliation is required: " +
+                        failure.Message
+                    : failure.Message;
+            if (authorityUncertain)
+            {
+                _snapshot = CreateStatusSnapshot(
+                    _snapshot,
+                    BrokerageAccountSnapshotStatus.Stale,
+                    "Financial Advisor configuration requires reconciliation: " +
+                        errorMessage);
+            }
+            if (item.Kind == WorkKind.Assignment)
+            {
+                var pending = item.Assignment;
+                _groupAssignment = new BrokerageAccountGroupAssignment(
+                    BrokerageAccountGroupAssignmentStatus.Failed,
+                    pending.Generation,
+                    DateTime.UtcNow,
+                    pending.AccountId,
+                    pending.TargetGroupName,
+                    pending.PreviousGroupNames,
+                    Array.Empty<string>(),
+                    pending.ExpectedMembershipHash,
+                    string.Empty,
+                    pending.ExpectedGroupConfigurationVersion,
+                    string.Empty,
+                    errorMessage,
+                    pending.TargetAllocationValue);
+            }
+            else
+            {
+                var pending = item.Allocation;
+                _groupAllocationUpdate = new BrokerageAccountGroupAllocationUpdate(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    pending.Generation,
+                    DateTime.UtcNow,
+                    pending.GroupName,
+                    pending.AllocationMethod,
+                    pending.RequestedAccountAllocationValues,
+                    null,
+                    pending.ExpectedMembershipHash,
+                    string.Empty,
+                    pending.ExpectedGroupConfigurationVersion,
+                    string.Empty,
+                        errorMessage);
+            }
+            _groupTradingBlocked = authorityUncertain;
+            return errorMessage;
+        }
+
+        private static bool AllocationValuesEqual(
+            IReadOnlyDictionary<string, decimal> expected,
+            IReadOnlyDictionary<string, decimal> actual) =>
+            expected.Count == actual.Count &&
+            expected.All(pair => actual.TryGetValue(pair.Key, out var value) &&
+                value == pair.Value);
 
         private async Task RefreshAsync(SnapshotScope scope)
         {
@@ -572,7 +1456,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             "All".Equals(accountId, StringComparison.OrdinalIgnoreCase) ||
             IsPrimaryOrAggregateAccount(accountId, primaryAccountId);
 
-        private async Task<string> RequestManagedAccountsAsync(SnapshotScope scope)
+        private async Task<string> RequestManagedAccountsAsync(
+            SnapshotScope scope, bool useHandshakeCache = true)
         {
             lock (_callbackStateLock)
             {
@@ -581,7 +1466,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     throw new RequestInvalidatedException(
                         "The account-state refresh became obsolete before managed-account discovery.");
                 }
-                if (!_unkeyedRequestsPoisoned &&
+                if (useHandshakeCache && !_unkeyedRequestsPoisoned &&
                     !string.IsNullOrWhiteSpace(_handshakeManagedAccounts))
                 {
                     var cached = _handshakeManagedAccounts;
@@ -774,6 +1659,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                     _snapshot,
                                     BrokerageAccountSnapshotStatus.Stale,
                                     timeoutMessage);
+                                _groupTradingBlocked = true;
                             }
                         }
                         else
@@ -889,6 +1775,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.AccountUpdateMultiEndWithRequestId += OnAccountUpdateEnd;
             _client.PositionMulti += OnPosition;
             _client.PositionMultiEndWithRequestId += OnPositionEnd;
+            _client.ReplaceFaEnd += OnReplaceFaEnd;
             _client.InternalError += OnError;
         }
 
@@ -903,6 +1790,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.AccountUpdateMultiEndWithRequestId -= OnAccountUpdateEnd;
             _client.PositionMulti -= OnPosition;
             _client.PositionMultiEndWithRequestId -= OnPositionEnd;
+            _client.ReplaceFaEnd -= OnReplaceFaEnd;
             _client.InternalError -= OnError;
         }
 
@@ -1005,6 +1893,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private void OnPositionEnd(object sender, RequestEndEventArgs args) =>
             CompleteKeyed(PendingKind.Positions, args.RequestId);
 
+        private void OnReplaceFaEnd(object sender, ReplaceFaEndEventArgs args) =>
+            CompleteKeyed(PendingKind.Replacement, args.RequestId);
+
         private void CompleteKeyed(PendingKind kind, int requestId)
         {
             PendingRequest completed = null;
@@ -1033,6 +1924,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
             PendingRequest completed = null;
+            Exception failure = null;
             lock (_callbackStateLock)
             {
                 if (_pendingRequest is { Finished: false } pending &&
@@ -1040,10 +1932,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     completed = pending;
                     completed.Finished = true;
+                    completed.ExplicitlyRejected =
+                        pending.Kind == PendingKind.Replacement &&
+                        args.Code == FinancialAdvisorInvalidAccountsErrorCode;
+                    failure = pending.Kind == PendingKind.Replacement
+                        ? new InvalidOperationException(
+                            $"IB rejected the Financial Advisor configuration replacement " +
+                            $"({args.Code}): {args.Message}")
+                        : new InvalidOperationException(
+                            $"IB rejected the account-state request " +
+                            $"({args.Code}): {args.Message}");
                 }
             }
-            completed?.Completion.TrySetException(new InvalidOperationException(
-                $"IB rejected the account-state request ({args.Code}): {args.Message}"));
+            if (completed != null)
+            {
+                completed.Completion.TrySetException(failure);
+            }
         }
 
         private void AddPosition(
@@ -1160,6 +2064,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     snapshot = CreateStatusSnapshot(current, status, error);
                 }
                 _snapshot = snapshot;
+                if (snapshot.Status == BrokerageAccountSnapshotStatus.Stale)
+                {
+                    _groupTradingBlocked = true;
+                }
+                else if (readySnapshot != null && _pendingMutation == null)
+                {
+                    _groupTradingBlocked = false;
+                }
             }
             return true;
         }
@@ -1351,6 +2263,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal Func<int, Func<bool>, bool> CancelPositions { get; set; }
             internal Func<int, string, Func<bool>, bool> RequestAccountUpdates { get; set; }
             internal Func<int, Func<bool>, bool> CancelAccountUpdates { get; set; }
+            internal Func<int> GetServerVersion { get; set; }
+            internal Func<int, int, string, Func<bool>, bool>
+                ReplaceFinancialAdvisor { get; set; }
+            internal Action BeforeMutationPublication { get; set; } = () => { };
 
             internal RequestActions(InteractiveBrokersClient client)
             {
@@ -1380,6 +2296,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     InvokeAuthorized(
                         authorize,
                         () => client.ClientSocket.cancelAccountUpdatesMulti(id));
+                GetServerVersion = () => client.ClientSocket.ServerVersion;
+                ReplaceFinancialAdvisor = (id, faDataType, xml, authorize) =>
+                    InvokeAuthorized(
+                        authorize,
+                        () => client.ClientSocket.replaceFA(id, faDataType, xml));
             }
 
             private static bool InvokeAuthorized(
@@ -1400,7 +2321,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             FinancialAdvisor,
             FamilyCodes,
             Positions,
-            AccountUpdates
+            AccountUpdates,
+            Replacement
         }
 
         private sealed class PendingRequest
@@ -1417,6 +2339,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal string Text { get; set; } = string.Empty;
             internal bool WireSent { get; set; }
             internal bool Finished { get; set; }
+            internal bool ExplicitlyRejected { get; set; }
 
             internal PendingRequest(
                 SnapshotScope scope, PendingKind kind, int requestId, int faDataType)
