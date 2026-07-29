@@ -469,11 +469,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             lock (_callbackStateLock)
             {
-                if (algorithmRequested)
-                {
-                    _hasRequestedRefresh = true;
-                    _lastRequestedRefreshScope = requested;
-                }
                 if (_disposed || !_connected || _unkeyedResponseMayStillArrive ||
                     algorithmRequested && _pendingMutation != null)
                 {
@@ -486,6 +481,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                      _snapshot.Status == BrokerageAccountSnapshotStatus.Refreshing &&
                      ScopesEqual(_activeRefresh, requested)))
                 {
+                    if (algorithmRequested)
+                    {
+                        _hasRequestedRefresh = true;
+                        _lastRequestedRefreshScope = requested;
+                    }
                     return true;
                 }
                 var requestVersion = _requestVersion + 1;
@@ -510,6 +510,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _requestVersion = requestVersion;
                 _snapshot = CreateStatusSnapshot(
                     _snapshot, BrokerageAccountSnapshotStatus.Refreshing, string.Empty);
+                if (algorithmRequested)
+                {
+                    _hasRequestedRefresh = true;
+                    _lastRequestedRefreshScope = requested;
+                }
             }
             return true;
         }

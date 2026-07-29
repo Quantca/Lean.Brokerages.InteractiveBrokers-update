@@ -344,7 +344,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public async Task PhysicalReconnectQueuesRefreshOnlyAfterPriorRequestTest()
+        public async Task PhysicalReconnectQueuesRefreshOnlyAfterPriorAcceptedRequestTest()
         {
             using (var unusedScenario = Scenario.SingleAccount())
             using (var unusedState = unusedScenario.CreateState())
@@ -383,10 +383,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     "fa:1",
                     "fa:3",
                     "family",
-                    "positions:Beta",
-                    "positions:ACC3",
-                    "account:ACC2",
-                    "account:ACC3",
+                    "positions:Alpha",
+                    "account:ACC1",
                     "fa:1"
                 },
                 scenario.Requests);
@@ -401,9 +399,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(alpha.Generation + 1, recovered.Generation);
                 Assert.IsFalse(recovered.IsComplete);
                 CollectionAssert.AreEquivalent(
-                    new[] { "Beta" }, recovered.Groups.Keys);
+                    new[] { "Alpha" }, recovered.Groups.Keys);
                 CollectionAssert.AreEquivalent(
-                    new[] { "ACC2", "ACC3" }, recovered.Accounts.Keys);
+                    new[] { "ACC1" }, recovered.Accounts.Keys);
                 Assert.AreEqual(requestCount, scenario.Requests.Count);
                 Assert.AreEqual(requestVersion, GetRequestVersion(state));
             });
