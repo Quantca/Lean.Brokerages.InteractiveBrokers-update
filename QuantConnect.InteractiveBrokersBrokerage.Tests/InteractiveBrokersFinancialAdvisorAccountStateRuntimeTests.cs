@@ -908,6 +908,57 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task ScopedRefreshRejectsUnsupportedSavedMethodOnlyWhenTargetedTest()
+        {
+            const string groups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts><String>ACC1</String></ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Monetary</name>
+                    <defaultMethod>MonetaryAmount</defaultMethod>
+                    <ListOfAccts><String>ACC2</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario
+            {
+                GroupsDocument = groups,
+                EndingGroupsDocument = groups
+            };
+            using var state = scenario.CreateState(configuredGroup: "Alpha");
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var supportedOrder = new IBApi.Order { FaGroup = "Alpha" };
+            var unsupportedOrder = new IBApi.Order { FaGroup = "Monetary" };
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                CollectionAssert.AreEqual(new[] { "Alpha" }, snapshot.Groups.Keys);
+                CollectionAssert.AreEquivalent(
+                    new[] { "Alpha", "Monetary" }, snapshot.AllGroups.Keys);
+                CollectionAssert.IsSubsetOf(
+                    new[] { "ACC1", "ACC2" }, snapshot.AccountDirectory.Keys);
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        supportedOrder,
+                        snapshot));
+                StringAssert.Contains(
+                    "unsupported saved allocation method 'MonetaryAmount'",
+                    Assert.Throws<NotSupportedException>(() =>
+                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                            unsupportedOrder,
+                            snapshot)).Message);
+            });
+        }
+
+        [Test]
         public async Task NoExternalCallUnderSynchronizationTest()
         {
             using var scenario = new Scenario();

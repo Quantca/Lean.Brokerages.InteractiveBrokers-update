@@ -1370,7 +1370,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var allGroups = CanonicalizeGroups(
                 ParseGroups(groupsXml, validateAllocationConfiguration: false),
                 managedAccountIds);
-            var unsupportedGroup = allGroups.Values.FirstOrDefault(group =>
+            var selectedGroups = scope.CompleteDiscovery
+                ? allGroups
+                : SelectGroups(allGroups, scope.GroupNames);
+            var unsupportedGroup = selectedGroups.Values.FirstOrDefault(group =>
                 !SupportsValueFreeMembership(group.AllocationMethod) &&
                 !IsSupportedUserSpecifiedAllocationMethod(group.AllocationMethod));
             if (unsupportedGroup != null)
@@ -1381,9 +1384,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     "allocation method in TWS to ContractsOrShares, Ratio, Percent, NetLiq, " +
                     "AvailableEquity, Equal, or PctChange and refresh the brokerage account snapshot.");
             }
-            var selectedGroups = scope.CompleteDiscovery
-                ? allGroups
-                : SelectGroups(allGroups, scope.GroupNames);
 
             ValidateAdditionalAccountIds(
                 scope.AdditionalAccountIds, allGroups, managedAccountIds, primaryAccountId);
