@@ -917,9 +917,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void AssignmentValidationSupportsExplicitUserSpecifiedValues()
+        public void AssignmentValidationRejectsSavedPctChangeAndSupportsExplicitUserSpecifiedValues()
         {
-            var computed = new BrokerageAccountGroup("Computed", "PctChange", new[] { "PaperA" });
+            var computed = new BrokerageAccountGroup("Computed", "NetLiq", new[] { "PaperA" });
             var computedGroups = new Dictionary<string, BrokerageAccountGroup> { [computed.Name] = computed };
             Assert.DoesNotThrow(() => InteractiveBrokersFinancialAdvisorAccountState.ValidateGroupAssignment(
                 "PaperB",
@@ -927,6 +927,23 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 computedGroups,
                 new[] { "PaperMaster", "PaperA", "PaperB" },
                 "PaperMaster"));
+
+            var savedPctChange = new BrokerageAccountGroup(
+                "SavedPctChange",
+                "PctChange",
+                new[] { "PaperA" });
+            StringAssert.Contains(
+                "not supported",
+                Assert.Throws<System.InvalidOperationException>(() =>
+                    InteractiveBrokersFinancialAdvisorAccountState.ValidateGroupAssignment(
+                        "PaperB",
+                        savedPctChange.Name,
+                        new Dictionary<string, BrokerageAccountGroup>
+                        {
+                            [savedPctChange.Name] = savedPctChange
+                        },
+                        new[] { "PaperMaster", "PaperA", "PaperB" },
+                        "PaperMaster")).Message);
 
             var valueBased = new BrokerageAccountGroup(
                 "ValueBased",

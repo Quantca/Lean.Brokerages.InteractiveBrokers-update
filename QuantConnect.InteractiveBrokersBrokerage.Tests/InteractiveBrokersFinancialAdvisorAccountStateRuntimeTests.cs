@@ -922,6 +922,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     <defaultMethod>MonetaryAmount</defaultMethod>
                     <ListOfAccts><String>ACC2</String></ListOfAccts>
                   </Group>
+                  <Group>
+                    <name>SavedPctChange</name>
+                    <defaultMethod>PctChange</defaultMethod>
+                    <ListOfAccts><String>ACC3</String></ListOfAccts>
+                  </Group>
                 </ListOfGroups>
                 """;
             using var scenario = new Scenario
@@ -936,15 +941,20 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 () => state.RequestRefresh(Array.Empty<string>()));
             var supportedOrder = new IBApi.Order { FaGroup = "Alpha" };
             var unsupportedOrder = new IBApi.Order { FaGroup = "Monetary" };
+            var savedPctChangeOrder = new IBApi.Order { FaGroup = "SavedPctChange" };
 
             Assert.Multiple(() =>
             {
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
                 CollectionAssert.AreEqual(new[] { "Alpha" }, snapshot.Groups.Keys);
                 CollectionAssert.AreEquivalent(
-                    new[] { "Alpha", "Monetary" }, snapshot.AllGroups.Keys);
+                    new[] { "Alpha", "Monetary", "SavedPctChange" },
+                    snapshot.AllGroups.Keys);
                 CollectionAssert.IsSubsetOf(
-                    new[] { "ACC1", "ACC2" }, snapshot.AccountDirectory.Keys);
+                    new[] { "ACC1", "ACC2", "ACC3" }, snapshot.AccountDirectory.Keys);
+                CollectionAssert.Contains(
+                    snapshot.AccountDirectory["ACC3"].GroupNames,
+                    "SavedPctChange");
                 Assert.DoesNotThrow(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         supportedOrder,
@@ -954,6 +964,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Assert.Throws<NotSupportedException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             unsupportedOrder,
+                            snapshot)).Message);
+                StringAssert.Contains(
+                    "unsupported saved allocation method 'PctChange'",
+                    Assert.Throws<NotSupportedException>(() =>
+                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                            savedPctChangeOrder,
                             snapshot)).Message);
             });
         }
@@ -1049,6 +1065,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [TestCase("MonetaryAmount")]
+        [TestCase("PctChange")]
         [TestCase("UnrecognizedMethod")]
         public async Task UnsupportedSavedMethodLatchPersistsUntilReadyTest(
             string allocationMethod)

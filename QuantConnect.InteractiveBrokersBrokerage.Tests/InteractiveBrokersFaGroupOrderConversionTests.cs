@@ -772,7 +772,16 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 BrokerageAccountSnapshotStatus.Ready,
                 group);
 
-            if (expectedAllowed)
+            if (savedMethod == "PctChange")
+            {
+                StringAssert.Contains(
+                    "unsupported saved allocation method 'PctChange'",
+                    Assert.Throws<NotSupportedException>(() =>
+                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                            order,
+                            snapshot)).Message);
+            }
+            else if (expectedAllowed)
             {
                 Assert.DoesNotThrow(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
@@ -827,6 +836,19 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         pctChangeOrder,
                         CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, monetary))).Message);
+
+            var savedPctChange = new BrokerageAccountGroup(
+                "SavedPctChange",
+                "PctChange",
+                new[] { "ManagedAccount" });
+            pctChangeOrder.FaGroup = savedPctChange.Name;
+            pctChangeOrder.FaMethod = string.Empty;
+            StringAssert.Contains(
+                "unsupported saved allocation method 'PctChange'",
+                Assert.Throws<NotSupportedException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        pctChangeOrder,
+                        CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedPctChange))).Message);
         }
 
         private static IEnumerable<TestCaseData> SavedAndRequestedAllocationMethods()
@@ -857,9 +879,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 foreach (var requestedMethod in requestedMethods)
                 {
-                    var expectedAllowed = requestedMethod.Length == 0 ||
-                        (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
-                        (requestedMethod == savedMethod || requestedMethod == "PctChange");
+                    var expectedAllowed = savedMethod != "PctChange" &&
+                        (requestedMethod.Length == 0 ||
+                            (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
+                            (requestedMethod == savedMethod || requestedMethod == "PctChange"));
                     yield return new TestCaseData(
                             savedMethod,
                             requestedMethod,

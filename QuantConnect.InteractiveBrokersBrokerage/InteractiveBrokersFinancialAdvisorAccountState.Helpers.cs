@@ -289,8 +289,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return allocationMethod.Equals("NetLiq", StringComparison.OrdinalIgnoreCase) ||
                 allocationMethod.Equals("AvailableEquity", StringComparison.OrdinalIgnoreCase) ||
                 allocationMethod.Equals("Equal", StringComparison.OrdinalIgnoreCase) ||
-                allocationMethod.Equals("EqualQuantity", StringComparison.OrdinalIgnoreCase) ||
-                allocationMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase);
+                allocationMethod.Equals("EqualQuantity", StringComparison.OrdinalIgnoreCase);
         }
 
         internal static bool IsSupportedUserSpecifiedAllocationMethod(string allocationMethod)

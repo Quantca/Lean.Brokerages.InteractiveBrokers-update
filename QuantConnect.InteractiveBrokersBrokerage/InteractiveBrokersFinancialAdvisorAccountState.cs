@@ -1382,7 +1382,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     $"Financial Advisor group '{unsupportedGroup.Name}' uses unsupported saved " +
                     $"allocation method '{unsupportedGroup.AllocationMethod}'. Change the group's " +
                     "allocation method in TWS to ContractsOrShares, Ratio, Percent, NetLiq, " +
-                    "AvailableEquity, Equal, or PctChange and refresh the brokerage account snapshot.");
+                    "AvailableEquity, or Equal and refresh the brokerage account snapshot.");
             }
 
             ValidateAdditionalAccountIds(
