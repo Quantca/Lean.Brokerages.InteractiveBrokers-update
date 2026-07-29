@@ -210,6 +210,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             IB.UpdateAccountValueEventArgs eventArgs)
         {
             return _financialAdvisorUnifiedGroupsEnabled &&
+                IsFinancialAdvisor &&
                 eventArgs.AccountUpdatesMultiRequestId.HasValue &&
                 InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
                     eventArgs.AccountUpdatesMultiRequestId.Value);
@@ -223,6 +224,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ? eventArgs.PositionQuantity
                 : eventArgs.Position;
             return !_financialAdvisorUnifiedGroupsEnabled ||
+                !IsFinancialAdvisor ||
                 !eventArgs.PositionsMultiRequestId.HasValue ||
                 !InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
                     eventArgs.PositionsMultiRequestId.Value);

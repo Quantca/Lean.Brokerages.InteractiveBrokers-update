@@ -21,6 +21,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
     /// <summary>
     /// Event based implementation of Interactive Brokers <see cref="EWrapper"/> interface
     /// </summary>
+    /// <remarks>Public subscribers must treat callback event-argument payloads as immutable.</remarks>
     public class InteractiveBrokersClient : DefaultEWrapper, IDisposable
     {
         #region Event Declarations

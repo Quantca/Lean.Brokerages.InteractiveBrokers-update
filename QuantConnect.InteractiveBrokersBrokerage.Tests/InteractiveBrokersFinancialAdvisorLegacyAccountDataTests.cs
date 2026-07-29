@@ -97,27 +97,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         public void UnifiedGroupsAffectOnlyFinancialAdvisorAccountsTest()
         {
             using var upstream = LegacyAccountScenario.CreateUpstream(
-                string.Empty,
+                GroupName,
                 isFinancialAdvisor: false);
             using var unified = LegacyAccountScenario.CreateConfigured(
-                string.Empty,
+                GroupName,
                 unifiedGroupsEnabled: true,
                 isFinancialAdvisor: false);
 
             Assert.IsFalse(unified.Brokerage.IsFinancialAdvisor);
             upstream.EmitLegacyRows();
             unified.EmitLegacyRows();
+            upstream.EmitPublicServiceRowsWithoutInternalCallbacks();
+            unified.EmitPublicServiceRowsWithoutInternalCallbacks();
 
             Assert.Multiple(() =>
             {
                 Assert.AreEqual(upstream.GetCashBalance(), unified.GetCashBalance());
+                Assert.AreEqual(9999.99m, unified.GetCashBalance());
                 Assert.AreEqual(
                     upstream.GetHoldingQuantity(),
                     unified.GetHoldingQuantity());
                 Assert.AreEqual(
-                    Convert.ToInt32(ExactPosition),
+                    Convert.ToInt32(ExactPosition) + Convert.ToInt32(999.5m),
                     unified.GetHoldingQuantity(),
-                    "Unified FA settings must preserve upstream holdings precision for a non-FA account.");
+                    "Unified FA settings must preserve upstream negative-ID rows for a non-FA account.");
             });
         }
 
@@ -397,7 +400,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         900.5,
                         0,
                         0,
-                        AccountId,
+                        "DU-SERVICE",
                         ServiceRequestId));
                 Client.EmitPublicAccountUpdate(
                     new IB.UpdateAccountValueEventArgs(
