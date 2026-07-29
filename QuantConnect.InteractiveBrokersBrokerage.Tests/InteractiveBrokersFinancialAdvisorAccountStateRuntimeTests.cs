@@ -586,6 +586,43 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void ServiceRequestOwnershipUsesBoundedConnectionEpochIntervalTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var nextRequestId = typeof(InteractiveBrokersFinancialAdvisorAccountState)
+                .GetMethod(
+                    "NextRequestId",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.IsNotNull(nextRequestId);
+            var allocated = Enumerable.Range(0, 10000)
+                .Select(_ => (int)nextRequestId.Invoke(state, null))
+                .ToArray();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(int.MinValue, allocated[0]);
+                Assert.AreEqual(int.MinValue + allocated.Length - 1, allocated[^1]);
+                Assert.IsTrue(allocated.All(state.IsServiceOwnedRequestId));
+                Assert.IsFalse(state.IsServiceOwnedRequestId(-2));
+                Assert.IsNull(typeof(InteractiveBrokersFinancialAdvisorAccountState)
+                    .GetField(
+                        "_serviceOwnedRequestIds",
+                        BindingFlags.Instance | BindingFlags.NonPublic));
+                Assert.AreEqual(
+                    (long)int.MinValue,
+                    GetPrivateField<long>(
+                        state,
+                        "_serviceOwnedRequestIdEpochStart"));
+                Assert.AreEqual(
+                    (long)allocated[^1],
+                    GetPrivateField<long>(
+                        state,
+                        "_serviceOwnedRequestIdCurrentMax"));
+            });
+        }
+
+        [Test]
         public async Task QueuedScopeDuringUnkeyedTimeoutRemainsStaleTest()
         {
             using var scenario = Scenario.SingleAccount();
@@ -1675,6 +1712,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             (long)typeof(InteractiveBrokersFinancialAdvisorAccountState)
                 .GetField("_requestVersion",
                     BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.GetValue(state);
+
+        private static T GetPrivateField<T>(
+            InteractiveBrokersFinancialAdvisorAccountState state,
+            string name) =>
+            (T)typeof(InteractiveBrokersFinancialAdvisorAccountState)
+                .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)
                 ?.GetValue(state);
 
         private static bool IsPendingRequestWireSent(

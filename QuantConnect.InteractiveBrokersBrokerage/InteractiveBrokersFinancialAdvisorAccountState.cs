@@ -48,7 +48,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly CancellationTokenSource _disposeTokenSource = new();
         private readonly RateGate _requestRateGate = new(10, TimeSpan.FromSeconds(1));
         private readonly object _callbackStateLock = new();
-        private readonly HashSet<int> _serviceOwnedRequestIds = new();
 
         private volatile BrokerageAccountSnapshot _snapshot = BrokerageAccountSnapshot.Unavailable;
         private volatile BrokerageAccountGroupAssignment _groupAssignment =
@@ -71,6 +70,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _hasRequestedRefresh;
         private bool _disposed;
         private int _nextRequestId = int.MinValue;
+        private long _serviceOwnedRequestIdEpochStart = int.MinValue;
+        private long _serviceOwnedRequestIdCurrentMax = (long)int.MinValue - 1;
         private long _requestVersion;
 
         internal BrokerageAccountSnapshot Snapshot => _snapshot;
@@ -170,7 +171,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 if (confirmedReconnect)
                 {
-                    _serviceOwnedRequestIds.Clear();
+                    _serviceOwnedRequestIdEpochStart = _nextRequestId;
+                    _serviceOwnedRequestIdCurrentMax = (long)_nextRequestId - 1;
                 }
                 _connected = true;
                 if (confirmedReconnect && _hasRequestedRefresh)
@@ -219,7 +221,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             lock (_callbackStateLock)
             {
-                return _serviceOwnedRequestIds.Contains(requestId);
+                return IsServiceRequestIdInAllocatorRange(requestId) &&
+                    requestId >= _serviceOwnedRequestIdEpochStart &&
+                    requestId <= _serviceOwnedRequestIdCurrentMax;
             }
         }
 
@@ -1906,7 +1910,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         "The FA service request ID range is exhausted.");
                 }
                 var requestId = _nextRequestId++;
-                _serviceOwnedRequestIds.Add(requestId);
+                _serviceOwnedRequestIdCurrentMax = requestId;
                 return requestId;
             }
         }
