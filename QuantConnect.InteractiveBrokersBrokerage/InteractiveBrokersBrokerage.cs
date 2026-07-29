@@ -2096,6 +2096,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             Log.Trace($"InteractiveBrokersBrokerage.HandleError(): RequestId: {requestId} ErrorCode: {errorCode} - {errorMsg}");
 
+            if (_financialAdvisorAccountState != null &&
+                InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(requestId))
+            {
+                return;
+            }
+
             // error 300: "Can't find EId with tickerId:N" - IB rejecting a cancelMktData for a ticker
             // it has no active subscription for. This is benign only when it's a market-data ticker we
             // have already unsubscribed (the async cancel races the removal, common during teardown).
