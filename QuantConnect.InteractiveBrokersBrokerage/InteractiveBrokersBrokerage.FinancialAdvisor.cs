@@ -340,6 +340,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     throw new InvalidOperationException(
                         $"Financial Advisor PctChange order for group '{group.Name}' requires a valid FaPercentage.");
                 }
+                if (savedMethod is not ("NetLiq" or "AvailableEquity" or "Equal"))
+                {
+                    throw new InvalidOperationException(
+                        $"Financial Advisor PctChange cannot override group '{group.Name}' saved method " +
+                        $"'{group.AllocationMethod}'. Change the saved method to NetLiq, AvailableEquity, or Equal " +
+                        "and refresh the snapshot, or leave FaMethod empty.");
+                }
                 return;
             }
             if (FAState.IsSupportedUserSpecifiedAllocationMethod(savedMethod))
@@ -365,8 +372,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
-            if ((savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
-                requestedMethod.Length != 0 &&
+            if (requestedMethod.Length != 0 &&
                 !savedMethod.Equals(requestedMethod, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException(

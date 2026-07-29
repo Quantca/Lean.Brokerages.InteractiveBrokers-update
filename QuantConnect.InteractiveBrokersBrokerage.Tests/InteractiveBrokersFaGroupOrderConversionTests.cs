@@ -486,7 +486,64 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.Throws<InvalidOperationException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         computedOrder,
-                        computedSnapshot)).Message);
+                    computedSnapshot)).Message);
+        }
+
+        [TestCaseSource(nameof(SavedAndRequestedAllocationMethods))]
+        public void SavedAndRequestedAllocationMethodMatrixIsEnforced(
+            string savedMethod,
+            string requestedMethod,
+            bool expectedAllowed)
+        {
+            var allocations = savedMethod switch
+            {
+                "ContractsOrShares" => new Dictionary<string, decimal>
+                {
+                    ["A"] = 0.4m,
+                    ["B"] = 0.6m
+                },
+                "Ratio" => new Dictionary<string, decimal>
+                {
+                    ["A"] = 1m,
+                    ["B"] = 2m
+                },
+                "Percent" => new Dictionary<string, decimal>
+                {
+                    ["A"] = 40m,
+                    ["B"] = 60m
+                },
+                _ => null
+            };
+            var group = new BrokerageAccountGroup(
+                FaGroupName,
+                savedMethod,
+                new[] { "A", "B" },
+                allocations);
+            var order = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                FaMethod = requestedMethod,
+                FaPercentage = "25",
+                TotalQuantity = 1m
+            };
+            var snapshot = CreateSnapshot(
+                BrokerageAccountSnapshotStatus.Ready,
+                group);
+
+            if (expectedAllowed)
+            {
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        snapshot));
+            }
+            else
+            {
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        snapshot));
+            }
         }
 
         [Test]
@@ -528,6 +585,47 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         pctChangeOrder,
                         CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, monetary))).Message);
+        }
+
+        private static IEnumerable<TestCaseData> SavedAndRequestedAllocationMethods()
+        {
+            var savedMethods = new[]
+            {
+                "ContractsOrShares",
+                "Ratio",
+                "Percent",
+                "NetLiq",
+                "AvailableEquity",
+                "Equal",
+                "PctChange"
+            };
+            var requestedMethods = new[]
+            {
+                string.Empty,
+                "ContractsOrShares",
+                "Ratio",
+                "Percent",
+                "NetLiq",
+                "AvailableEquity",
+                "Equal",
+                "PctChange"
+            };
+
+            foreach (var savedMethod in savedMethods)
+            {
+                foreach (var requestedMethod in requestedMethods)
+                {
+                    var expectedAllowed = requestedMethod.Length == 0 ||
+                        (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
+                        (requestedMethod == savedMethod || requestedMethod == "PctChange");
+                    yield return new TestCaseData(
+                            savedMethod,
+                            requestedMethod,
+                            expectedAllowed)
+                        .SetName(
+                            $"Saved_{savedMethod}_Requested_{(requestedMethod.Length == 0 ? "Blank" : requestedMethod)}");
+                }
+            }
         }
 
         private static LimitOrder CreateOrder(InteractiveBrokersOrderProperties properties)
