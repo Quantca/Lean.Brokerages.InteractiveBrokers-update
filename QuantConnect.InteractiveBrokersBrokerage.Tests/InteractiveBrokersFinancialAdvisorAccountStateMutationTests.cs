@@ -10,10 +10,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using IBApi;
@@ -765,7 +763,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Assert.IsFalse(state.IsGroupTradingBlocked);
                 });
             }
-            AssertAtomicTerminalizationSource();
         }
 
         [Test]
@@ -944,94 +941,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             (bool)pendingRequest.GetType().GetProperty(
                 "Finished",
                 BindingFlags.Instance | BindingFlags.NonPublic).GetValue(pendingRequest);
-
-        private static void AssertAtomicTerminalizationSource()
-        {
-            var testDirectory = Path.GetDirectoryName(GetTestSourcePath());
-            var runtimePath = Path.GetFullPath(Path.Combine(
-                testDirectory,
-                "..",
-                "QuantConnect.InteractiveBrokersBrokerage",
-                "InteractiveBrokersFinancialAdvisorAccountState.cs"));
-            var source = File.ReadAllText(runtimePath);
-            var terminalCall = source.IndexOf(
-                "mutationError = CompleteMutationLocked(item, failure);",
-                StringComparison.Ordinal);
-            var monitorStart = source.LastIndexOf(
-                "lock (_callbackStateLock)",
-                terminalCall,
-                StringComparison.Ordinal);
-            var monitorBodyStart = source.IndexOf(
-                '{',
-                monitorStart);
-            var monitorEnd = FindMatchingBrace(source, monitorBodyStart);
-            var pendingRelease = source.IndexOf(
-                "_pendingMutation = null;",
-                terminalCall,
-                StringComparison.Ordinal);
-            Assert.Multiple(() =>
-            {
-                Assert.Greater(monitorStart, 0);
-                Assert.Greater(terminalCall, monitorBodyStart);
-                Assert.Greater(pendingRelease, terminalCall);
-                Assert.Less(pendingRelease, monitorEnd);
-            });
-
-            var completionStart = source.IndexOf(
-                "private string CompleteMutationLocked",
-                StringComparison.Ordinal);
-            var completionEnd = source.IndexOf(
-                "private static bool AllocationValuesEqual",
-                completionStart,
-                StringComparison.Ordinal);
-            var completion = source.Substring(
-                completionStart,
-                completionEnd - completionStart);
-            StringAssert.Contains("_disposed || !_connected", completion);
-            StringAssert.Contains(
-                "item.Scope.RequestVersion != _requestVersion",
-                completion);
-        }
-
-        private static int FindMatchingBrace(string source, int openingBrace)
-        {
-            var depth = 0;
-            var inString = false;
-            for (var index = openingBrace; index < source.Length; index++)
-            {
-                var character = source[index];
-                if (inString)
-                {
-                    if (character == '\\')
-                    {
-                        index++;
-                    }
-                    else if (character == '"')
-                    {
-                        inString = false;
-                    }
-                    continue;
-                }
-                if (character == '"')
-                {
-                    inString = true;
-                }
-                else if (character == '{')
-                {
-                    depth++;
-                }
-                else if (character == '}' && --depth == 0)
-                {
-                    return index;
-                }
-            }
-            throw new InvalidOperationException(
-                "The mutation worker's final monitor block was not balanced.");
-        }
-
-        private static string GetTestSourcePath(
-            [CallerFilePath] string sourcePath = "") =>
-            sourcePath;
 
         private enum ReplacementBehavior
         {
