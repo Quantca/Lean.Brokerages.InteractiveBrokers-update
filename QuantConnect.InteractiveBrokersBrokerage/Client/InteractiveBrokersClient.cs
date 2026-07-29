@@ -692,11 +692,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             var args = new ReceiveFaEventArgs(faDataType, faXmlData);
             try
             {
-                OnReceiveFa(args);
+                InternalReceiveFa?.Invoke(this, args);
             }
             finally
             {
-                InternalReceiveFa?.Invoke(this, args);
+                OnReceiveFa(args);
             }
         }
 
@@ -725,11 +725,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             var args = new ManagedAccountsEventArgs(accountList);
             try
             {
-                OnManagedAccounts(args);
+                InternalManagedAccounts?.Invoke(this, args);
             }
             finally
             {
-                InternalManagedAccounts?.Invoke(this, args);
+                OnManagedAccounts(args);
             }
         }
 
@@ -742,11 +742,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             var args = new FamilyCodesEventArgs(familyCodes);
             try
             {
-                OnFamilyCodes(args);
+                InternalFamilyCodes?.Invoke(this, args);
             }
             finally
             {
-                InternalFamilyCodes?.Invoke(this, args);
+                // Public subscribers must not mutate event-argument payloads shared with internal request owners.
+                OnFamilyCodes(args);
             }
         }
 
@@ -1055,12 +1056,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <summary>
         /// PositionMultiEnd event invocator
         /// </summary>
-        /// <param name="requestId">The identifier of the originating request.</param>
-        protected void OnPositionMultiEnd(int requestId)
+        /// <param name="_">The identifier of the originating request.</param>
+        protected void OnPositionMultiEnd(int _)
         {
             try
             {
-                PositionMultiEndWithRequestId?.Invoke(this, new RequestEndEventArgs(requestId));
+                PositionMultiEndWithRequestId?.Invoke(this, new RequestEndEventArgs(_));
             }
             finally
             {

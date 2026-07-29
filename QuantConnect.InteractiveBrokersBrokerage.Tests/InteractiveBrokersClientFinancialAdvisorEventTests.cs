@@ -140,16 +140,49 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var internalManagedAccountsCount = 0;
             var publicFamilyCodesCount = 0;
             var internalFamilyCodesCount = 0;
+            var invocationOrder = new List<string>();
             ReplaceFaEndEventArgs replacement = null;
 
-            client.Error += (_, _) => publicErrorCount++;
-            client.InternalError += (_, _) => internalErrorCount++;
-            client.ReceiveFa += (_, _) => publicReceiveFaCount++;
-            client.InternalReceiveFa += (_, _) => internalReceiveFaCount++;
-            client.ManagedAccounts += (_, _) => publicManagedAccountsCount++;
-            client.InternalManagedAccounts += (_, _) => internalManagedAccountsCount++;
-            client.FamilyCodes += (_, _) => publicFamilyCodesCount++;
-            client.InternalFamilyCodes += (_, _) => internalFamilyCodesCount++;
+            client.Error += (_, _) =>
+            {
+                publicErrorCount++;
+                invocationOrder.Add("error-public");
+            };
+            client.InternalError += (_, _) =>
+            {
+                internalErrorCount++;
+                invocationOrder.Add("error-internal");
+            };
+            client.ReceiveFa += (_, _) =>
+            {
+                publicReceiveFaCount++;
+                invocationOrder.Add("receive-fa-public");
+            };
+            client.InternalReceiveFa += (_, _) =>
+            {
+                internalReceiveFaCount++;
+                invocationOrder.Add("receive-fa-internal");
+            };
+            client.ManagedAccounts += (_, _) =>
+            {
+                publicManagedAccountsCount++;
+                invocationOrder.Add("managed-accounts-public");
+            };
+            client.InternalManagedAccounts += (_, _) =>
+            {
+                internalManagedAccountsCount++;
+                invocationOrder.Add("managed-accounts-internal");
+            };
+            client.FamilyCodes += (_, _) =>
+            {
+                publicFamilyCodesCount++;
+                invocationOrder.Add("family-codes-public");
+            };
+            client.InternalFamilyCodes += (_, _) =>
+            {
+                internalFamilyCodesCount++;
+                invocationOrder.Add("family-codes-internal");
+            };
             client.ReplaceFaEnd += (_, args) => replacement = args;
 
             client.error(17, 123, 10230, "configuration pending", string.Empty);
@@ -173,6 +206,50 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(1, internalFamilyCodesCount);
                 Assert.AreEqual(19, replacement.RequestId);
                 Assert.AreEqual(string.Empty, replacement.Message);
+            });
+            CollectionAssert.AreEqual(
+                new[]
+                {
+                    "error-public",
+                    "error-internal",
+                    "receive-fa-internal",
+                    "receive-fa-public",
+                    "managed-accounts-internal",
+                    "managed-accounts-public",
+                    "family-codes-internal",
+                    "family-codes-public"
+                },
+                invocationOrder);
+        }
+
+        [Test]
+        public void UnkeyedInternalCallbackExceptionsDoNotSuppressPublicEvents()
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            var publicReceiveFaCount = 0;
+            var publicManagedAccountsCount = 0;
+            var publicFamilyCodesCount = 0;
+
+            client.InternalReceiveFa += (_, _) => throw new InvalidOperationException("internal receiveFA");
+            client.InternalManagedAccounts += (_, _) =>
+                throw new InvalidOperationException("internal managedAccounts");
+            client.InternalFamilyCodes += (_, _) => throw new InvalidOperationException("internal familyCodes");
+            client.ReceiveFa += (_, _) => publicReceiveFaCount++;
+            client.ManagedAccounts += (_, _) => publicManagedAccountsCount++;
+            client.FamilyCodes += (_, _) => publicFamilyCodesCount++;
+
+            Assert.Throws<InvalidOperationException>(() => client.receiveFA(1, "<ListOfGroups />"));
+            Assert.Throws<InvalidOperationException>(() => client.managedAccounts("DU123"));
+            Assert.Throws<InvalidOperationException>(() => client.familyCodes(new[]
+            {
+                new FamilyCode { AccountID = "DU123", FamilyCodeStr = "FamilyA" }
+            }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(1, publicReceiveFaCount);
+                Assert.AreEqual(1, publicManagedAccountsCount);
+                Assert.AreEqual(1, publicFamilyCodesCount);
             });
         }
 
