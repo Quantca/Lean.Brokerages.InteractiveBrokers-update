@@ -141,7 +141,7 @@ LEAN supports IB's current unified Allocation Groups model, configured in TWS as
 
 **Account-group movement requires `ib-financial-advisors-group-filter` to be empty and `ib-financial-advisors-group-management-enabled=true`, which implies unified groups. A configured filter rejects movement to any other destination group.**
 
-The supported saved user-specified allocation methods are `ContractsOrShares`, `Ratio`, and `Percent`. TWS may display `Equal` as “Equal Quantity”; LEAN uses IB's `Equal` wire value and normalizes the legacy `EqualQuantity` spelling to it. `MonetaryAmount` group management and execution are not supported.
+The supported saved user-specified allocation methods are `ContractsOrShares`, `Ratio`, and `Percent`. Saved `ContractsOrShares` child values may be fractional, but their total must be a valid parent quantity for the symbol's lot size; for a lot size of one, `12.5 + 7.5 = 20` is valid. TWS may display `Equal` as “Equal Quantity”; LEAN uses IB's `Equal` wire value and normalizes the legacy `EqualQuantity` spelling to it. `MonetaryAmount` group management and execution are not supported.
 
 Group-order validation uses the latest authoritative brokerage snapshot. It deliberately fails open when that snapshot is unavailable, stale, reconnecting, or does not contain the requested group, preserving existing order behavior while IB remains the final authority. A configuration known to use an unsupported Profile or allocation method is rejected. Group configuration writes are stricter: they require ready, version-matched state and readback verification.
 

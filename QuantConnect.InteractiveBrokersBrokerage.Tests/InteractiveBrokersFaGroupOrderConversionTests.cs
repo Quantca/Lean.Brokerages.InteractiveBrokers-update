@@ -20,9 +20,15 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using IBApi;
 using NUnit.Framework;
+using QuantConnect.Algorithm;
 using QuantConnect.Brokerages;
+using QuantConnect.Brokerages.Backtesting;
 using QuantConnect.Brokerages.InteractiveBrokers;
+using QuantConnect.Data.Market;
+using QuantConnect.Lean.Engine.TransactionHandlers;
 using QuantConnect.Orders;
+using QuantConnect.Tests.Engine;
+using QuantConnect.Tests.Engine.DataFeeds;
 using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
 using LeanOrder = QuantConnect.Orders.Order;
 
@@ -52,6 +58,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         private static readonly FieldInfo AccountField =
             typeof(InteractiveBrokersBrokerage).GetField("_account", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo AlgorithmField =
+            typeof(InteractiveBrokersBrokerage).GetField("_algorithm", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo AgentDescriptionField =
             typeof(InteractiveBrokersBrokerage).GetField("_agentDescription", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo FaFilterField =
@@ -401,10 +409,26 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreEqual(0m, ibOrder.TotalQuantity);
         }
 
-        [Test]
-        public void FractionalContractsOrSharesTotalRoundTripsThroughAdmissionAndConversionTest()
+        [TestCase(12.5, 7.5, 20, true)]
+        [TestCase(9.5, 10.25, 19.75, false)]
+        public void ContractsOrSharesLotAlignmentFlowsThroughBrokerageTransactionHandlerTest(
+            decimal firstAllocation,
+            decimal secondAllocation,
+            decimal requestedQuantity,
+            bool expectedSuccess)
         {
-            var brokerage = CreateOfflineBrokerage();
+            var algorithm = new AlgorithmStub();
+            algorithm.SetCash(100000m);
+            var security = algorithm.AddEquity("SPY");
+            security.SetMarketPrice(new Tick(
+                DateTime.UtcNow,
+                security.Symbol,
+                100m,
+                100m,
+                100m));
+            algorithm.SetFinishedWarmingUp();
+
+            var brokerage = CreateOfflineBrokerage(algorithm);
             UnifiedGroupsField.SetValue(brokerage, true);
             var savedGroup = new BrokerageAccountGroup(
                 FaGroupName,
@@ -412,8 +436,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 new[] { "A", "B" },
                 new Dictionary<string, decimal>
                 {
-                    ["A"] = 9.5m,
-                    ["B"] = 10.25m
+                    ["A"] = firstAllocation,
+                    ["B"] = secondAllocation
                 });
             var state = (InteractiveBrokersFinancialAdvisorAccountState)
                 RuntimeHelpers.GetUninitializedObject(typeof(InteractiveBrokersFinancialAdvisorAccountState));
@@ -421,21 +445,74 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 state,
                 CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup));
             AccountStateField.SetValue(brokerage, state);
-            var order = new LimitOrder(
-                Symbols.SPY,
-                19.75m,
-                100m,
-                new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
-                properties: new InteractiveBrokersOrderProperties
+            using var orderBrokerage =
+                new FinancialAdvisorOrderBrokerage(algorithm, brokerage);
+            var transactionHandler =
+                new ImmediateBrokerageTransactionHandler();
+            transactionHandler.Initialize(
+                algorithm,
+                orderBrokerage,
+                new TestResultHandler());
+            algorithm.Transactions.SetOrderProcessor(transactionHandler);
+
+            try
+            {
+                var request = new SubmitOrderRequest(
+                    OrderType.Limit,
+                    security.Type,
+                    security.Symbol,
+                    requestedQuantity,
+                    0m,
+                    100m,
+                    DateTime.UtcNow,
+                    string.Empty,
+                    new InteractiveBrokersOrderProperties
+                    {
+                        FaGroup = FaGroupName
+                    },
+                    asynchronous: true);
+                var ticket = algorithm.Transactions.AddOrder(request);
+
+                Assert.AreEqual(expectedSuccess, request.Response.IsSuccess);
+                Assert.AreEqual(
+                    decimal.Truncate(requestedQuantity),
+                    orderBrokerage.ReceivedQuantity);
+                if (expectedSuccess)
                 {
-                    FaGroup = FaGroupName
+                    Assert.Multiple(() =>
+                    {
+                        Assert.AreEqual(1, orderBrokerage.WireReadyCount);
+                        Assert.AreEqual(20m, orderBrokerage.ConvertedOrder.TotalQuantity);
+                        Assert.AreEqual(FaGroupName, orderBrokerage.ConvertedOrder.FaGroup);
+                        Assert.IsEmpty(orderBrokerage.ConvertedOrder.FaMethod);
+                        Assert.AreEqual(12.5m, savedGroup.AccountAllocationValues["A"]);
+                        Assert.AreEqual(7.5m, savedGroup.AccountAllocationValues["B"]);
+                    });
+                    return;
+                }
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(0, orderBrokerage.WireReadyCount);
+                    Assert.IsNull(orderBrokerage.ConvertedOrder);
+                    Assert.AreEqual(OrderStatus.Invalid, ticket.Status);
+                    Assert.IsInstanceOf<InvalidOperationException>(
+                        orderBrokerage.AdmissionException);
+                    StringAssert.Contains(
+                        "ContractsOrShares group 'TestGroup1' has a saved allocation total of 19.75",
+                        orderBrokerage.AdmissionException.Message);
+                    StringAssert.Contains(
+                        "SPY (lot size 1)",
+                        orderBrokerage.AdmissionException.Message);
+                    StringAssert.Contains(
+                        "Adjust the saved vector so its total is a whole multiple of the lot size.",
+                        orderBrokerage.AdmissionException.Message);
                 });
-
-            Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(order));
-            var ibOrder = ConvertOrder(brokerage, order);
-
-            Assert.AreEqual(19.75m, ibOrder.TotalQuantity);
-            Assert.IsEmpty(ibOrder.FaMethod);
+            }
+            finally
+            {
+                transactionHandler.Exit();
+            }
         }
 
         [Test]
@@ -794,12 +871,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         /// Builds an <see cref="InteractiveBrokersBrokerage"/> with just enough state for
         /// <c>ConvertOrder</c> to run without opening a TCP connection to TWS / IB Gateway.
         /// </summary>
-        private static InteractiveBrokersBrokerage CreateOfflineBrokerage()
+        private static InteractiveBrokersBrokerage CreateOfflineBrokerage(
+            QCAlgorithm algorithm = null)
         {
             var brokerage = new InteractiveBrokersBrokerage();
 
             AccountField.SetValue(brokerage, FaMasterAccount);
             AgentDescriptionField.SetValue(brokerage, AgentDescription);
+            AlgorithmField.SetValue(brokerage, algorithm);
 
             // Stub contract-details provider — returns a deterministic min tick of 0.01 so the
             // limit price round-trips cleanly through NormalizePriceToBrokerage.
@@ -811,6 +890,52 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 });
 
             return brokerage;
+        }
+
+        private sealed class FinancialAdvisorOrderBrokerage : BacktestingBrokerage
+        {
+            private readonly InteractiveBrokersBrokerage _interactiveBrokersBrokerage;
+
+            public decimal ReceivedQuantity { get; private set; }
+            public int WireReadyCount { get; private set; }
+            public IBApi.Order ConvertedOrder { get; private set; }
+            public Exception AdmissionException { get; private set; }
+
+            public FinancialAdvisorOrderBrokerage(
+                QCAlgorithm algorithm,
+                InteractiveBrokersBrokerage interactiveBrokersBrokerage)
+                : base(algorithm)
+            {
+                _interactiveBrokersBrokerage = interactiveBrokersBrokerage;
+            }
+
+            public override bool PlaceOrder(LeanOrder order)
+            {
+                ReceivedQuantity = order.Quantity;
+                try
+                {
+                    _interactiveBrokersBrokerage.ValidateFinancialAdvisorOrderAdmission(order);
+                    ConvertedOrder = ConvertOrder(_interactiveBrokersBrokerage, order);
+                    WireReadyCount++;
+                    return true;
+                }
+                catch (Exception exception)
+                {
+                    AdmissionException = exception;
+                    return false;
+                }
+            }
+        }
+
+        private sealed class ImmediateBrokerageTransactionHandler :
+            BrokerageTransactionHandler
+        {
+            protected override bool SynchronousProcessing => true;
+
+            protected override void WaitForOrderSubmission(OrderTicket ticket)
+            {
+                ProcessPendingRequests();
+            }
         }
     }
 }

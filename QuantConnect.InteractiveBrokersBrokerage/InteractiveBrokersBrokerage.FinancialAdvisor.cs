@@ -318,12 +318,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             ValidateFinancialAdvisorAllocationMethod(
                 ibOrder,
-                GetAccountSnapshot());
+                GetAccountSnapshot(),
+                leanOrder.Symbol,
+                _algorithm?.Securities.TryGetValue(leanOrder.Symbol, out var security) == true
+                    ? security.SymbolProperties.LotSize
+                    : GetSymbolProperties(leanOrder.Symbol).LotSize);
         }
 
         internal static void ValidateFinancialAdvisorAllocationMethod(
             IBApi.Order order,
-            BrokerageAccountSnapshot snapshot)
+            BrokerageAccountSnapshot snapshot,
+            Symbol symbol = null,
+            decimal lotSize = 0m)
         {
             if (string.IsNullOrWhiteSpace(order?.FaGroup) ||
                 snapshot?.Status != BrokerageAccountSnapshotStatus.Ready ||
@@ -370,6 +376,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 if (savedMethod.Equals("ContractsOrShares", StringComparison.OrdinalIgnoreCase))
                 {
                     var requiredQuantity = group.AccountAllocationValues.Values.Sum();
+                    if (requiredQuantity > 0m &&
+                        lotSize > 0m &&
+                        requiredQuantity % lotSize != 0m)
+                    {
+                        throw new InvalidOperationException(
+                            $"ContractsOrShares group '{group.Name}' has a saved allocation total of " +
+                            $"{requiredQuantity.ToStringInvariant()}, which is not a valid parent quantity for " +
+                            $"{symbol} (lot size {lotSize.ToStringInvariant()}). Adjust the saved vector so its " +
+                            "total is a whole multiple of the lot size.");
+                    }
                     if (requiredQuantity <= 0m || order.TotalQuantity != requiredQuantity)
                     {
                         throw new InvalidOperationException(
