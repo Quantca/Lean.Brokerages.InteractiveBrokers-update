@@ -355,7 +355,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 StringAssert.Contains("reconciliation", failed.ErrorMessage);
             });
 
-            state.MarkConnected();
+            scenario.Client.connectionClosed();
+            scenario.Client.nextValidId(123);
             Assert.IsTrue(state.IsGroupTradingBlocked);
             scenario.ThrowManagedRequest(
                 scenario.ManagedRequestCount + 1);
@@ -370,6 +371,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
 
             scenario.ThrowManagedRequest(0);
+            scenario.Client.connectionClosed();
+            scenario.Client.nextValidId(124);
             var reconciled = await ReadyAsync(state);
             Assert.AreEqual(
                 BrokerageAccountSnapshotStatus.Ready,
