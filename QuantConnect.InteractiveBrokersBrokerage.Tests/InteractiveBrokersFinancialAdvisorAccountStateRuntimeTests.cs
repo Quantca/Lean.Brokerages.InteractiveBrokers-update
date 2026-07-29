@@ -343,6 +343,121 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
         }
 
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task AutomaticManagedAccountsDoesNotCompleteExplicitRequestTest(
+            bool reconnect)
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var previousGeneration = 0L;
+            if (reconnect)
+            {
+                var ready = await RunRefreshAsync(
+                    state,
+                    () => state.RequestRefresh(Array.Empty<string>()));
+                previousGeneration = ready.Generation;
+                scenario.Client.connectionClosed();
+                scenario.Requests.Clear();
+            }
+
+            using var explicitRequestSent = new ManualResetEventSlim();
+            scenario.Actions.RequestManagedAccounts = authorize =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.Requests.Add("managed-explicit");
+                    explicitRequestSent.Set();
+                });
+
+            scenario.Client.connectAck();
+            Task<BrokerageAccountSnapshot> refresh;
+            if (reconnect)
+            {
+                scenario.Client.nextValidId(321);
+                refresh = WaitForReadyGenerationAsync(state, previousGeneration);
+            }
+            else
+            {
+                refresh = RunRefreshAsync(
+                    state,
+                    () => state.RequestRefresh(Array.Empty<string>()));
+            }
+
+            Assert.IsTrue(explicitRequestSent.Wait(TimeSpan.FromSeconds(5)));
+            scenario.Client.managedAccounts("MASTER,AUTO");
+            scenario.Client.managedAccounts(scenario.ManagedAccounts);
+            var snapshot = await refresh;
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                CollectionAssert.AreEquivalent(
+                    new[] { "MASTER", "ACC1" }, snapshot.ManagedAccountIds);
+                CollectionAssert.DoesNotContain(
+                    snapshot.ManagedAccountIds, "AUTO");
+                Assert.AreEqual(
+                    1,
+                    scenario.Requests.Count(request => request == "managed-explicit"));
+            });
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task DuplicateAutomaticManagedAccountsKeepsFirstHandshakeTest(
+            bool reconnect)
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var previousGeneration = 0L;
+            if (reconnect)
+            {
+                var ready = await RunRefreshAsync(
+                    state,
+                    () => state.RequestRefresh(Array.Empty<string>()));
+                previousGeneration = ready.Generation;
+                scenario.Client.connectionClosed();
+            }
+
+            scenario.Requests.Clear();
+            scenario.Actions.RequestManagedAccounts = authorize =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.Requests.Add("unexpected-managed-request");
+                    scenario.Client.managedAccounts("MASTER,EXPLICIT");
+                });
+
+            scenario.Client.connectAck();
+            scenario.Client.managedAccounts(scenario.ManagedAccounts);
+            scenario.Client.managedAccounts("MASTER,DUPLICATE");
+
+            BrokerageAccountSnapshot snapshot;
+            if (reconnect)
+            {
+                scenario.Client.nextValidId(654);
+                snapshot = await WaitForReadyGenerationAsync(
+                    state, previousGeneration);
+            }
+            else
+            {
+                snapshot = await RunRefreshAsync(
+                    state,
+                    () => state.RequestRefresh(Array.Empty<string>()));
+            }
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                CollectionAssert.AreEquivalent(
+                    new[] { "MASTER", "ACC1" }, snapshot.ManagedAccountIds);
+                CollectionAssert.DoesNotContain(
+                    snapshot.ManagedAccountIds, "DUPLICATE");
+                CollectionAssert.DoesNotContain(
+                    snapshot.ManagedAccountIds, "EXPLICIT");
+                CollectionAssert.DoesNotContain(
+                    scenario.Requests, "unexpected-managed-request");
+            });
+        }
+
         [Test]
         public async Task PhysicalReconnectQueuesRefreshOnlyAfterPriorAcceptedRequestTest()
         {

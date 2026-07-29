@@ -56,6 +56,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             BrokerageAccountGroupAllocationUpdate.Unavailable;
         private volatile string _unsupportedConfigurationError;
         private volatile bool _groupTradingBlocked;
+        private volatile bool _expectingHandshakeManagedAccounts;
         private Task _worker;
         private SnapshotScope _lastRequestedRefreshScope;
         private SnapshotScope _activeRefresh;
@@ -167,7 +168,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     _unkeyedResponseMayStillArrive = false;
                 }
                 _connected = true;
-                _handshakeManagedAccounts = null;
                 if (confirmedReconnect && _hasRequestedRefresh)
                 {
                     QueueRefresh(_lastRequestedRefreshScope, algorithmRequested: false);
@@ -189,6 +189,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 _connected = false;
                 _physicalConnectionClosed |= physicalConnectionClosed;
+                _expectingHandshakeManagedAccounts = false;
                 _handshakeManagedAccounts = null;
                 ++_requestVersion;
                 disconnectVersion = _requestVersion;
@@ -1881,6 +1882,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private void AttachCallbacks()
         {
+            _client.ConnectAck += OnConnectAck;
             _client.NextValidId += OnNextValidId;
             _client.ConnectionClosed += OnConnectionClosed;
             _client.InternalManagedAccounts += OnManagedAccounts;
@@ -1896,6 +1898,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private void DetachCallbacks()
         {
+            _client.ConnectAck -= OnConnectAck;
             _client.NextValidId -= OnNextValidId;
             _client.ConnectionClosed -= OnConnectionClosed;
             _client.InternalManagedAccounts -= OnManagedAccounts;
@@ -1908,6 +1911,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.ReplaceFaEnd -= OnReplaceFaEnd;
             _client.InternalError -= OnError;
         }
+
+        private void OnConnectAck(object sender, EventArgs args) =>
+            _expectingHandshakeManagedAccounts = true;
 
         private void OnNextValidId(object sender, NextValidIdEventArgs args) =>
             RestoreConnectivity(afterNextValidId: true);
@@ -1922,19 +1928,25 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             PendingRequest completed = null;
             lock (_callbackStateLock)
             {
-                if (_disposed || !_connected || _unkeyedResponseMayStillArrive)
+                if (_disposed)
                 {
                     return;
                 }
-                if (_pendingRequest is { Kind: PendingKind.ManagedAccounts, Finished: false })
+                if (_expectingHandshakeManagedAccounts)
+                {
+                    _handshakeManagedAccounts = args.AccountList;
+                    _expectingHandshakeManagedAccounts = false;
+                }
+                else if (!_connected || _unkeyedResponseMayStillArrive)
+                {
+                    return;
+                }
+                else if (_pendingRequest is
+                    { Kind: PendingKind.ManagedAccounts, Finished: false })
                 {
                     completed = _pendingRequest;
                     completed.Text = args.AccountList;
                     completed.Finished = true;
-                }
-                else
-                {
-                    _handshakeManagedAccounts = args.AccountList;
                 }
             }
             completed?.Completion.TrySetResult(completed);
