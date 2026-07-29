@@ -269,10 +269,18 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
                 Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
             });
+            var disconnectedRequestVersion = GetRequestVersion(state);
+            var disconnectedRequestCount = scenario.Requests.Count;
 
             scenario.Client.error(
                 -1, 0, recoveryCode, "Connectivity between IB and TWS was restored.",
                 string.Empty);
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
+                Assert.AreEqual(disconnectedRequestVersion, GetRequestVersion(state));
+                Assert.AreEqual(disconnectedRequestCount, scenario.Requests.Count);
+            });
             var recovered = await RunRefreshAsync(
                 state,
                 () => state.RequestRefresh(Array.Empty<string>()));
