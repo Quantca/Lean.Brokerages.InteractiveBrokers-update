@@ -641,17 +641,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             using var scenario = new Scenario();
             object callbackStateLock = null;
-            SemaphoreSlim operationLock = null;
             var callObservedUnderLock = false;
             scenario.ExternalCallProbe = () =>
             {
                 if (callbackStateLock != null)
                 {
                     callObservedUnderLock |= Monitor.IsEntered(callbackStateLock);
-                }
-                if (operationLock != null)
-                {
-                    callObservedUnderLock |= operationLock.CurrentCount == 0;
                 }
             };
             using var state = scenario.CreateState(
@@ -667,12 +662,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 .GetField("_callbackStateLock",
                     BindingFlags.Instance | BindingFlags.NonPublic)
                 ?.GetValue(state);
-            operationLock = typeof(InteractiveBrokersFinancialAdvisorAccountState)
-                .GetField("_operationLock",
-                    BindingFlags.Instance | BindingFlags.NonPublic)
-                ?.GetValue(state) as SemaphoreSlim;
             Assert.IsNotNull(callbackStateLock);
-            Assert.IsNotNull(operationLock);
 
             var snapshot = await RunRefreshAsync(
                 state,

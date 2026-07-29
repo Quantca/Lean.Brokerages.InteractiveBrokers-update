@@ -45,7 +45,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly TimeSpan _requestTimeout;
         private readonly RequestActions _requests;
         private readonly Channel<WorkItem> _work;
-        private readonly SemaphoreSlim _operationLock = new(1, 1);
         private readonly CancellationTokenSource _disposeTokenSource = new();
         private readonly RateGate _requestRateGate = new(10, TimeSpan.FromSeconds(1));
         private readonly object _callbackStateLock = new();
@@ -432,7 +431,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _ =>
                 {
                     _requestRateGate.Dispose();
-                    _operationLock.Dispose();
                     _disposeTokenSource.Dispose();
                 },
                 CancellationToken.None,
@@ -530,11 +528,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     {
                         if (!rejected)
                         {
-                            // The worker loop provides operation serialization. The mandated
-                            // semaphore is an admission turnstile and never spans an external call.
-                            await _operationLock.WaitAsync(_disposeTokenSource.Token)
-                                .ConfigureAwait(false);
-                            _operationLock.Release();
+                            // The single-consumer worker loop is the serialization point for every brokerage operation.
                             try
                             {
                                 if (item.Kind == WorkKind.Refresh)
