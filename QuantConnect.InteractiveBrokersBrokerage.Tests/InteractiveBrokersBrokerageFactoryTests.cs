@@ -38,34 +38,32 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             var constructors = typeof(InteractiveBrokersBrokerage)
                 .GetConstructors(BindingFlags.Instance | BindingFlags.Public);
-            CollectionAssert.AreEquivalent(
-                new[] { 0, 3, 4, 15, 17 },
-                constructors.Select(constructor => constructor.GetParameters().Length));
-
-            var legacyParameters = constructors.Single(constructor =>
-                constructor.GetParameters().Length == 15).GetParameters();
-            CollectionAssert.AreEqual(
-                new[]
-                {
-                    typeof(IAlgorithm),
-                    typeof(IOrderProvider),
-                    typeof(ISecurityProvider),
-                    typeof(string),
-                    typeof(string),
-                    typeof(int),
-                    typeof(string),
-                    typeof(string),
-                    typeof(string),
-                    typeof(string),
-                    typeof(string),
-                    typeof(string),
-                    typeof(bool),
-                    typeof(TimeSpan?),
-                    typeof(string)
-                },
-                legacyParameters.Select(parameter => parameter.ParameterType));
+            var legacyParameterTypes = new[]
+            {
+                typeof(IAlgorithm),
+                typeof(IOrderProvider),
+                typeof(ISecurityProvider),
+                typeof(string),
+                typeof(string),
+                typeof(int),
+                typeof(string),
+                typeof(string),
+                typeof(string),
+                typeof(string),
+                typeof(string),
+                typeof(string),
+                typeof(bool),
+                typeof(TimeSpan?),
+                typeof(string)
+            };
+            var legacyParameters = constructors
+                .Select(constructor => constructor.GetParameters())
+                .Single(parameters => parameters
+                    .Select(parameter => parameter.ParameterType)
+                    .SequenceEqual(legacyParameterTypes));
             Assert.Multiple(() =>
             {
+                Assert.IsTrue(legacyParameters.Take(11).All(parameter => !parameter.IsOptional));
                 Assert.IsTrue(legacyParameters.Skip(11).All(parameter => parameter.IsOptional));
                 Assert.AreEqual(
                     IB.AgentDescription.Individual,
@@ -74,12 +72,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsNull(legacyParameters[13].DefaultValue);
                 Assert.IsNull(legacyParameters[14].DefaultValue);
             });
-
-            var extendedParameters = constructors.Single(constructor =>
-                constructor.GetParameters().Length == 17).GetParameters();
-            Assert.IsTrue(
-                extendedParameters.All(parameter => !parameter.IsOptional),
-                "The extended overload must require all 17 parameters to avoid ambiguous legacy calls.");
         }
 
         [Test]

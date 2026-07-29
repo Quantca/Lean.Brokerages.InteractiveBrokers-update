@@ -480,7 +480,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     return true;
                 }
-                var requestVersion = ++_requestVersion;
+                var requestVersion = _requestVersion + 1;
                 if (_queuedRefresh != null)
                 {
                     _queuedRefresh.Scope = MergeScopes(
@@ -499,6 +499,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     _queuedRefresh = item;
                     StartWorkerLocked();
                 }
+                _requestVersion = requestVersion;
                 _snapshot = CreateStatusSnapshot(
                     _snapshot, BrokerageAccountSnapshotStatus.Refreshing, string.Empty);
             }

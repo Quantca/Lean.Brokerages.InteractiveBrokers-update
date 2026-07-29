@@ -643,6 +643,50 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task FullChannelDoesNotAdvanceVersionOrOrphanActiveRefreshTest()
+        {
+            using var scenario = new Scenario();
+            using var paceEntered = new ManualResetEventSlim();
+            using var releasePacing = new ManualResetEventSlim();
+            var paceCalls = 0;
+            using var state = scenario.CreateState(paceRequest: () =>
+            {
+                if (Interlocked.Increment(ref paceCalls) == 1)
+                {
+                    paceEntered.Set();
+                    if (!releasePacing.Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        throw new TimeoutException("Test pacing was not released.");
+                    }
+                }
+            });
+
+            var activeRefresh = RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(new[] { "Alpha" }));
+            try
+            {
+                Assert.IsTrue(paceEntered.Wait(TimeSpan.FromSeconds(5)));
+                FillRefreshQueue(state);
+                var requestVersion = GetRequestVersion(state);
+
+                Assert.IsFalse(state.RequestRefresh(new[] { "Beta" }));
+                Assert.AreEqual(requestVersion, GetRequestVersion(state));
+            }
+            finally
+            {
+                releasePacing.Set();
+            }
+
+            var snapshot = await activeRefresh;
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                CollectionAssert.AreEqual(new[] { "Alpha" }, snapshot.Groups.Keys);
+            });
+        }
+
+        [Test]
         public async Task UnkeyedGlobalErrorsAreIgnoredTest()
         {
             using var scenario = Scenario.SingleAccount();
@@ -1091,6 +1135,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 .GetField("_queuedRefresh",
                     BindingFlags.Instance | BindingFlags.NonPublic)
                 ?.GetValue(state) != null;
+
+        private static void FillRefreshQueue(
+            InteractiveBrokersFinancialAdvisorAccountState state)
+        {
+            var stateType = typeof(InteractiveBrokersFinancialAdvisorAccountState);
+            var scopeType = stateType.GetNestedType(
+                "SnapshotScope",
+                BindingFlags.NonPublic);
+            var workItemType = stateType.GetNestedType(
+                "WorkItem",
+                BindingFlags.NonPublic);
+            var channel = stateType.GetField(
+                    "_work",
+                    BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.GetValue(state);
+            var writer = channel?.GetType().GetProperty("Writer")?.GetValue(channel);
+            var tryWrite = writer?.GetType().GetMethod(
+                "TryWrite",
+                new[] { workItemType });
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsNotNull(scopeType);
+                Assert.IsNotNull(workItemType);
+                Assert.IsNotNull(writer);
+                Assert.IsNotNull(tryWrite);
+            });
+            for (var index = 0; index < 8; index++)
+            {
+                var scope = Activator.CreateInstance(
+                    scopeType,
+                    BindingFlags.Instance | BindingFlags.NonPublic,
+                    null,
+                    new object[]
+                    {
+                        Array.Empty<string>(),
+                        Array.Empty<string>(),
+                        false,
+                        0L
+                    },
+                    null);
+                var item = Activator.CreateInstance(
+                    workItemType,
+                    BindingFlags.Instance | BindingFlags.NonPublic,
+                    null,
+                    new[] { scope },
+                    null);
+                Assert.IsTrue(
+                    (bool)tryWrite.Invoke(writer, new[] { item }),
+                    $"Expected bounded queue slot {index + 1} to accept a dummy item.");
+            }
+        }
 
         private static (
             IReadOnlyCollection<string> Groups,
