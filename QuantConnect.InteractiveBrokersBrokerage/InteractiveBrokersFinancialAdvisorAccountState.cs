@@ -1395,24 +1395,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var selectedGroups = scope.CompleteDiscovery
                 ? allGroups
                 : SelectGroups(allGroups, scope.GroupNames);
-            var unsupportedGroup = selectedGroups.Values.FirstOrDefault(group =>
-                !SupportsValueFreeMembership(group.AllocationMethod) &&
-                !IsSupportedUserSpecifiedAllocationMethod(group.AllocationMethod));
-            if (unsupportedGroup != null)
-            {
-                throw new UnsupportedFinancialAdvisorConfigurationException(
-                    $"Financial Advisor group '{unsupportedGroup.Name}' uses unsupported saved " +
-                    $"allocation method '{unsupportedGroup.AllocationMethod}'. Change the group's " +
-                    "allocation method in TWS to ContractsOrShares, Ratio, Percent, NetLiq, " +
-                    "AvailableEquity, or Equal and refresh the brokerage account snapshot.");
-            }
 
             ValidateAdditionalAccountIds(
                 scope.AdditionalAccountIds, allGroups, managedAccountIds, primaryAccountId);
             try
             {
                 ValidateManagedGroupMembers(
-                    allGroups, managedAccountIds, primaryAccountId, allGroups.Keys);
+                    selectedGroups,
+                    managedAccountIds,
+                    primaryAccountId,
+                    selectedGroups.Keys);
             }
             catch (InvalidOperationException exception)
             {
@@ -1422,7 +1414,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var topologyDirectory = BuildAccountDirectory(
                 primaryAccountId, managedAccountIds, allGroups, familyCodes,
                 new Dictionary<string, BrokerageAccountState>(), aliases);
-            ValidateSupportedGroupAccountRelationships(allGroups, topologyDirectory);
+            ValidateSupportedGroupAccountRelationships(selectedGroups, topologyDirectory);
 
             var managed = managedAccountIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
             var accountsToCollect = (scope.CompleteDiscovery

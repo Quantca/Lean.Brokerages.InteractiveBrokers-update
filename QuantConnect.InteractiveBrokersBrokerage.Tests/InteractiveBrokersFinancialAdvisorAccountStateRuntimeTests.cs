@@ -1151,6 +1151,116 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task CompleteDiscoveryPublishesUnsupportedSavedMethodsTest()
+        {
+            const string groups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts><String>ACC1</String></ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Monetary</name>
+                    <defaultMethod>MonetaryAmount</defaultMethod>
+                    <ListOfAccts><String>ACC2</String></ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>SavedPctChange</name>
+                    <defaultMethod>PctChange</defaultMethod>
+                    <ListOfAccts><String>ACC3</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario
+            {
+                GroupsDocument = groups,
+                EndingGroupsDocument = groups
+            };
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.IsTrue(snapshot.IsComplete);
+                CollectionAssert.AreEquivalent(
+                    new[] { "Alpha", "Monetary", "SavedPctChange" },
+                    snapshot.AllGroups.Keys);
+                CollectionAssert.AreEquivalent(
+                    snapshot.AllGroups.Keys,
+                    snapshot.Groups.Keys);
+                Assert.IsNull(state.UnsupportedConfigurationError);
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        new IBApi.Order { FaGroup = "Alpha" },
+                        snapshot));
+                Assert.Throws<NotSupportedException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        new IBApi.Order { FaGroup = "Monetary" },
+                        snapshot));
+                Assert.Throws<NotSupportedException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        new IBApi.Order { FaGroup = "SavedPctChange" },
+                        snapshot));
+            });
+        }
+
+        [Test]
+        public async Task BlankConfiguredFilterScopesRelationshipValidationTest()
+        {
+            const string groups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts><String>ACC1</String></ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Monetary</name>
+                    <defaultMethod>MonetaryAmount</defaultMethod>
+                    <ListOfAccts><String>ACC2</String></ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>External</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts><String>NOT_MANAGED</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario
+            {
+                GroupsDocument = groups,
+                EndingGroupsDocument = groups
+            };
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.IsFalse(snapshot.IsComplete);
+                CollectionAssert.AreEqual(new[] { "Alpha" }, snapshot.Groups.Keys);
+                CollectionAssert.AreEquivalent(
+                    new[] { "Alpha", "Monetary", "External" },
+                    snapshot.AllGroups.Keys);
+                Assert.AreEqual(
+                    BrokerageAccountRelationship.Unknown,
+                    snapshot.AccountDirectory["NOT_MANAGED"].Relationship);
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        new IBApi.Order { FaGroup = "Alpha" },
+                        snapshot));
+            });
+        }
+
+        [Test]
         public async Task NoExternalCallUnderSynchronizationTest()
         {
             using var scenario = new Scenario();
@@ -1240,24 +1350,20 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
-        [TestCase("MonetaryAmount")]
-        [TestCase("PctChange")]
-        [TestCase("UnrecognizedMethod")]
-        public async Task UnsupportedSavedMethodLatchPersistsUntilReadyTest(
-            string allocationMethod)
+        [Test]
+        public async Task MalformedTopologyLatchPersistsUntilReadyTest()
         {
-            var unsupportedGroups = $"""
+            const string malformedGroups = """
                 <ListOfGroups>
                   <Group>
-                    <name>Unsupported</name>
-                    <defaultMethod>{allocationMethod}</defaultMethod>
+                    <name>Malformed</name>
                     <ListOfAccts><String>ACC1</String></ListOfAccts>
                   </Group>
                 </ListOfGroups>
-                """;
+            """;
             using var scenario = Scenario.SingleAccount();
-            scenario.GroupsDocument = unsupportedGroups;
-            scenario.EndingGroupsDocument = unsupportedGroups;
+            scenario.GroupsDocument = malformedGroups;
+            scenario.EndingGroupsDocument = malformedGroups;
             var reports = new List<string>();
             using var state = scenario.CreateState(reportUnsupported: reports.Add);
 
@@ -1270,8 +1376,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, unsupported.Status);
                 Assert.AreEqual(unsupportedReason, state.UnsupportedConfigurationError);
-                StringAssert.Contains(allocationMethod, unsupportedReason);
-                StringAssert.Contains("Change the group's allocation method in TWS", unsupportedReason);
+                StringAssert.Contains("contained no allocation method", unsupportedReason);
                 CollectionAssert.AreEqual(new[] { unsupportedReason }, reports);
             });
 
