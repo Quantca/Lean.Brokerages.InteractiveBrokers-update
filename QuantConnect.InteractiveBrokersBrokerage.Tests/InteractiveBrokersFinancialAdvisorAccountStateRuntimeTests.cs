@@ -887,6 +887,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
                 Assert.AreEqual(snapshot.ErrorMessage, reported);
+                Assert.AreEqual(snapshot.ErrorMessage, state.UnsupportedConfigurationError);
                 Assert.IsFalse(reporterCalledUnderLock);
                 StringAssert.Contains("not a managed subaccount", snapshot.ErrorMessage);
                 StringAssert.Contains("Correct the group membership in TWS",
@@ -897,6 +898,104 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsFalse(scenario.Requests.Any(request =>
                     request.StartsWith("positions:", StringComparison.Ordinal) ||
                     request.StartsWith("account:", StringComparison.Ordinal)));
+            });
+        }
+
+        [TestCase("MonetaryAmount")]
+        [TestCase("UnrecognizedMethod")]
+        public async Task UnsupportedSavedMethodLatchPersistsUntilReadyTest(
+            string allocationMethod)
+        {
+            var unsupportedGroups = $"""
+                <ListOfGroups>
+                  <Group>
+                    <name>Unsupported</name>
+                    <defaultMethod>{allocationMethod}</defaultMethod>
+                    <ListOfAccts><String>ACC1</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = Scenario.SingleAccount();
+            scenario.GroupsDocument = unsupportedGroups;
+            scenario.EndingGroupsDocument = unsupportedGroups;
+            var reports = new List<string>();
+            using var state = scenario.CreateState(reportUnsupported: reports.Add);
+
+            var unsupported = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var unsupportedReason = unsupported.ErrorMessage;
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, unsupported.Status);
+                Assert.AreEqual(unsupportedReason, state.UnsupportedConfigurationError);
+                StringAssert.Contains(allocationMethod, unsupportedReason);
+                StringAssert.Contains("Change the group's allocation method in TWS", unsupportedReason);
+                CollectionAssert.AreEqual(new[] { unsupportedReason }, reports);
+            });
+
+            state.MarkDisconnected("simulated disconnect");
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
+                Assert.AreEqual(unsupportedReason, state.UnsupportedConfigurationError);
+            });
+            state.MarkConnected();
+            scenario.GroupsDocument = Scenario.EmptyGroupsXml;
+            scenario.EndingGroupsDocument = Scenario.EmptyGroupsXml;
+
+            using var refreshStarted = new ManualResetEventSlim();
+            using var releaseRefresh = new ManualResetEventSlim();
+            var requestManagedAccounts = scenario.Actions.RequestManagedAccounts;
+            var requestPositions = scenario.Actions.RequestPositions;
+            scenario.Actions.RequestManagedAccounts = authorize =>
+            {
+                refreshStarted.Set();
+                if (!releaseRefresh.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    throw new TimeoutException("The ordinary refresh was not released.");
+                }
+                return requestManagedAccounts(authorize);
+            };
+            scenario.Actions.RequestPositions = (requestId, accountOrGroup, authorize) =>
+                scenario.RunAuthorized(authorize, () =>
+                    throw new InvalidOperationException(
+                        "simulated ordinary refresh failure"));
+
+            var ordinaryTask = RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(refreshStarted.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Refreshing,
+                    state.Snapshot.Status);
+                Assert.AreEqual(unsupportedReason, state.UnsupportedConfigurationError);
+            });
+            releaseRefresh.Set();
+            var ordinaryFailure = await ordinaryTask;
+
+            Assert.Multiple(() =>
+            {
+                StringAssert.Contains(
+                    "simulated ordinary refresh failure",
+                    ordinaryFailure.ErrorMessage);
+                Assert.AreEqual(unsupportedReason, state.UnsupportedConfigurationError);
+            });
+
+            scenario.Actions.RequestManagedAccounts = requestManagedAccounts;
+            scenario.Actions.RequestPositions = requestPositions;
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, ready.Status);
+                Assert.IsNull(state.UnsupportedConfigurationError);
+                CollectionAssert.AreEqual(new[] { unsupportedReason }, reports);
             });
         }
 

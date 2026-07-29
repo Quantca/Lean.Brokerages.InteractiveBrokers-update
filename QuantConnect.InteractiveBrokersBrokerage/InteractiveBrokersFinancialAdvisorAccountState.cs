@@ -54,6 +54,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             BrokerageAccountGroupAssignment.Unavailable;
         private volatile BrokerageAccountGroupAllocationUpdate _groupAllocationUpdate =
             BrokerageAccountGroupAllocationUpdate.Unavailable;
+        private volatile string _unsupportedConfigurationError;
         private volatile bool _groupTradingBlocked;
         private Task _worker;
         private SnapshotScope _activeRefresh;
@@ -73,6 +74,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         internal BrokerageAccountGroupAssignment GroupAssignment => _groupAssignment;
         internal BrokerageAccountGroupAllocationUpdate GroupAllocationUpdate =>
             _groupAllocationUpdate;
+        internal string UnsupportedConfigurationError => _unsupportedConfigurationError;
         internal bool IsGroupTradingBlocked => _groupTradingBlocked;
 
         internal InteractiveBrokersFinancialAdvisorAccountState(
@@ -649,12 +651,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                     else if (failure != null)
                     {
+                        var unsupportedConfiguration =
+                            failure is UnsupportedFinancialAdvisorConfigurationException;
                         var published = PublishFailure(
                             failure.Message,
                             forceStale: failure is UnkeyedRequestTimeoutException,
-                            expectedRequestVersion: scope.RequestVersion);
-                        if (published &&
-                            failure is UnsupportedFinancialAdvisorConfigurationException)
+                            expectedRequestVersion: scope.RequestVersion,
+                            unsupportedConfiguration: unsupportedConfiguration);
+                        if (published && unsupportedConfiguration)
                         {
                             ReportUnsupported(failure.Message);
                         }
@@ -1357,6 +1361,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var allGroups = CanonicalizeGroups(
                 ParseGroups(groupsXml, validateAllocationConfiguration: false),
                 managedAccountIds);
+            var unsupportedGroup = allGroups.Values.FirstOrDefault(group =>
+                !SupportsValueFreeMembership(group.AllocationMethod) &&
+                !IsSupportedUserSpecifiedAllocationMethod(group.AllocationMethod));
+            if (unsupportedGroup != null)
+            {
+                throw new UnsupportedFinancialAdvisorConfigurationException(
+                    $"Financial Advisor group '{unsupportedGroup.Name}' uses unsupported saved " +
+                    $"allocation method '{unsupportedGroup.AllocationMethod}'. Change the group's " +
+                    "allocation method in TWS to ContractsOrShares, Ratio, Percent, NetLiq, " +
+                    "AvailableEquity, Equal, or PctChange and refresh the brokerage account snapshot.");
+            }
             var selectedGroups = scope.CompleteDiscovery
                 ? allGroups
                 : SelectGroups(allGroups, scope.GroupNames);
@@ -2124,24 +2139,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool PublishFailure(
             string error,
             bool forceStale = false,
-            long? expectedRequestVersion = null) =>
+            long? expectedRequestVersion = null,
+            bool unsupportedConfiguration = false) =>
             TryPublishSnapshot(
                 null, error, forceStale, expectedRequestVersion,
-                requireConnected: false);
+                requireConnected: false,
+                unsupportedConfiguration: unsupportedConfiguration);
 
         private void PublishReady(
             BrokerageAccountSnapshot snapshot, long requestVersion) =>
             TryPublishSnapshot(
                 snapshot, null, forceStale: false,
                 expectedRequestVersion: requestVersion,
-                requireConnected: true);
+                requireConnected: true, unsupportedConfiguration: false);
 
         private bool TryPublishSnapshot(
             BrokerageAccountSnapshot readySnapshot,
             string error,
             bool forceStale,
             long? expectedRequestVersion,
-            bool requireConnected)
+            bool requireConnected,
+            bool unsupportedConfiguration)
         {
             BrokerageAccountSnapshot snapshot;
             lock (_callbackStateLock)
@@ -2164,6 +2182,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     snapshot = CreateStatusSnapshot(current, status, error);
                 }
                 _snapshot = snapshot;
+                if (unsupportedConfiguration)
+                {
+                    _unsupportedConfigurationError = error;
+                }
+                else if (readySnapshot != null)
+                {
+                    _unsupportedConfigurationError = null;
+                }
                 if (readySnapshot != null && _pendingMutation == null)
                 {
                     _groupTradingBlocked = false;

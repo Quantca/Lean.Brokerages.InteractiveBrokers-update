@@ -70,6 +70,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
                 "_groupTradingBlocked",
                 BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo UnsupportedConfigurationErrorField =
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_unsupportedConfigurationError",
+                BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo SnapshotField =
             typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
                 "_snapshot",
@@ -161,6 +165,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             AssertAdmissionAndConversionRejectSame(
                 brokerage,
                 implicitFilterOrder);
+        }
+
+        [Test]
+        public void UnsupportedTopologyLatchBlocksOnlyGroupOrdersTest()
+        {
+            const string unsupportedReason =
+                "Correct the unsupported FA topology in TWS and refresh.";
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            UnsupportedConfigurationErrorField.SetValue(state, unsupportedReason);
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(BrokerageAccountSnapshotStatus.Stale));
+            AccountStateField.SetValue(brokerage, state);
+
+            var directOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                Account = "ManagedAccount",
+                FaGroup = "AnotherGroup"
+            });
+            var groupOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName
+            });
+            var implicitFilterOrder = CreateOrder(
+                new InteractiveBrokersOrderProperties());
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(directOrder));
+            Assert.DoesNotThrow(() => ConvertOrder(brokerage, directOrder));
+            Assert.AreEqual(
+                unsupportedReason,
+                AssertAdmissionAndConversionRejectSame(
+                    brokerage,
+                    groupOrder).Message);
+            Assert.AreEqual(
+                unsupportedReason,
+                AssertAdmissionAndConversionRejectSame(
+                    brokerage,
+                    implicitFilterOrder).Message);
+
+            UnsupportedConfigurationErrorField.SetValue(state, null);
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(groupOrder));
+            Assert.DoesNotThrow(() => ConvertOrder(brokerage, groupOrder));
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(implicitFilterOrder));
+            Assert.DoesNotThrow(() => ConvertOrder(brokerage, implicitFilterOrder));
         }
 
         [Test]

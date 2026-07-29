@@ -261,6 +261,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ibOrder.FaMethod = string.Empty;
                 return;
             }
+            var unsupportedConfigurationError =
+                _financialAdvisorAccountState?.UnsupportedConfigurationError;
+            if (!string.IsNullOrEmpty(unsupportedConfigurationError) &&
+                FAState.IsFinancialAdvisorGroupOrder(
+                    leanOrder,
+                    _financialAdvisorsGroupFilter))
+            {
+                throw new InvalidOperationException(unsupportedConfigurationError);
+            }
             if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
             {
                 throw new NotSupportedException(
