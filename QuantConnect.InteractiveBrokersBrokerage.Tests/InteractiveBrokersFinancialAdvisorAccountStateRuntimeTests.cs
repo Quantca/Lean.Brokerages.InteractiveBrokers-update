@@ -336,6 +336,72 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task PhysicalReconnectQueuesRefreshOnlyAfterPriorRequestTest()
+        {
+            using (var unusedScenario = Scenario.SingleAccount())
+            using (var unusedState = unusedScenario.CreateState())
+            {
+                unusedScenario.Client.connectionClosed();
+                unusedScenario.Client.nextValidId(123);
+                unusedScenario.Client.nextValidId(124);
+
+                Assert.Multiple(() =>
+                {
+                    CollectionAssert.IsEmpty(unusedScenario.Requests);
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Stale,
+                        unusedState.Snapshot.Status);
+                });
+            }
+
+            using var scenario = new Scenario();
+            using var state = scenario.CreateState();
+            var alpha = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(new[] { "Alpha" }));
+
+            scenario.Client.connectionClosed();
+            Assert.IsFalse(state.RequestRefresh(
+                new[] { "Beta" }, new[] { "ACC3" }));
+            scenario.Requests.Clear();
+            scenario.Client.nextValidId(125);
+            var recovered = await WaitForReadyGenerationAsync(
+                state, alpha.Generation);
+
+            CollectionAssert.AreEqual(
+                new[]
+                {
+                    "managed",
+                    "fa:1",
+                    "fa:3",
+                    "family",
+                    "positions:Beta",
+                    "positions:ACC3",
+                    "account:ACC2",
+                    "account:ACC3",
+                    "fa:1"
+                },
+                scenario.Requests);
+            var requestCount = scenario.Requests.Count;
+            var requestVersion = GetRequestVersion(state);
+
+            scenario.Client.nextValidId(126);
+            await Task.Delay(50);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(alpha.Generation + 1, recovered.Generation);
+                Assert.IsFalse(recovered.IsComplete);
+                CollectionAssert.AreEquivalent(
+                    new[] { "Beta" }, recovered.Groups.Keys);
+                CollectionAssert.AreEquivalent(
+                    new[] { "ACC2", "ACC3" }, recovered.Accounts.Keys);
+                Assert.AreEqual(requestCount, scenario.Requests.Count);
+                Assert.AreEqual(requestVersion, GetRequestVersion(state));
+            });
+        }
+
+        [Test]
         public async Task QueuedScopeDuringUnkeyedTimeoutRemainsStaleTest()
         {
             using var scenario = Scenario.SingleAccount();
@@ -405,22 +471,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             };
             using var state = scenario.CreateState();
 
-            var staleTask = RunRefreshAsync(
-                state,
-                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
             try
             {
                 Assert.IsTrue(reconnected.Wait(TimeSpan.FromSeconds(5)));
-                var stale = await staleTask;
-                Assert.AreEqual(
-                    BrokerageAccountSnapshotStatus.Stale, stale.Status);
-
                 scenario.Actions.RequestManagedAccounts = requestManagedAccounts;
-                var recoveredTask = RunRefreshAsync(
-                    state,
-                    () => state.RequestRefresh(Array.Empty<string>()));
                 releaseOldAction.Set();
-                var recovered = await recoveredTask;
+                var recovered = await WaitForReadyGenerationAsync(state, 0);
 
                 Assert.Multiple(() =>
                 {
@@ -460,28 +517,22 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 }
                 finally
                 {
+                    scenario.Actions.RequestManagedAccounts = requestManagedAccounts;
                     boundaryReturned.Set();
                 }
             };
             using var state = scenario.CreateState();
 
-            var stale = await RunRefreshAsync(
-                state,
-                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
             Assert.IsTrue(boundaryReturned.Wait(TimeSpan.FromSeconds(5)));
+            var recovered = await WaitForReadyGenerationAsync(state, 0);
 
             Assert.Multiple(() =>
             {
-                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, stale.Status);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
                 CollectionAssert.DoesNotContain(
                     scenario.Requests, "unauthorized-managed-write");
             });
-
-            scenario.Actions.RequestManagedAccounts = requestManagedAccounts;
-            var recovered = await RunRefreshAsync(
-                state,
-                () => state.RequestRefresh(Array.Empty<string>()));
-            Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
         }
 
         [Test]
@@ -503,13 +554,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 }
             });
 
-            var staleTask = RunRefreshAsync(
-                state,
-                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
             try
             {
                 Assert.IsTrue(paceEntered.Wait(TimeSpan.FromSeconds(5)));
                 scenario.Client.connectionClosed();
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
                 scenario.Client.nextValidId(456);
             }
             finally
@@ -517,11 +568,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 releasePacing.Set();
             }
 
-            Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale,
-                (await staleTask).Status);
-            var recovered = await RunRefreshAsync(
-                state,
-                () => state.RequestRefresh(Array.Empty<string>()));
+            var recovered = await WaitForReadyGenerationAsync(state, 0);
 
             Assert.Multiple(() =>
             {
@@ -550,13 +597,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 }
             });
 
-            var staleTask = RunRefreshAsync(
-                state,
-                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            var staleRequestId = 0;
             try
             {
                 Assert.IsTrue(cancelPaceEntered.Wait(TimeSpan.FromSeconds(5)));
+                staleRequestId = scenario.KeyedRequestIds.Single();
                 scenario.Client.connectionClosed();
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
                 scenario.Client.nextValidId(789);
             }
             finally
@@ -564,12 +613,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 releaseCancelPacing.Set();
             }
 
-            Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale,
-                (await staleTask).Status);
-            var staleRequestId = scenario.KeyedRequestIds.Single();
-            var recovered = await RunRefreshAsync(
-                state,
-                () => state.RequestRefresh(Array.Empty<string>()));
+            var recovered = await WaitForReadyGenerationAsync(state, 0);
 
             Assert.Multiple(() =>
             {
@@ -1109,6 +1153,25 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 await Task.Delay(5);
             }
             throw new TimeoutException("The refresh did not publish a terminal snapshot.");
+        }
+
+        private static async Task<BrokerageAccountSnapshot> WaitForReadyGenerationAsync(
+            InteractiveBrokersFinancialAdvisorAccountState state,
+            long previousGeneration)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (DateTime.UtcNow < deadline)
+            {
+                var snapshot = state.Snapshot;
+                if (snapshot.Status == BrokerageAccountSnapshotStatus.Ready &&
+                    snapshot.Generation > previousGeneration)
+                {
+                    return snapshot;
+                }
+                await Task.Delay(5);
+            }
+            throw new TimeoutException(
+                "The reconnect refresh did not publish a newer Ready snapshot.");
         }
 
         private static long GetRequestVersion(
