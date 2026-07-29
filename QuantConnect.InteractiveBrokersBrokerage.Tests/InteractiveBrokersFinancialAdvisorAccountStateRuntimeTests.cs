@@ -131,6 +131,65 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase("managed", false)]
+        [TestCase("managed", true)]
+        [TestCase("fa:1", false)]
+        [TestCase("fa:1", true)]
+        [TestCase("fa:3", false)]
+        [TestCase("fa:3", true)]
+        [TestCase("family", false)]
+        [TestCase("family", true)]
+        public async Task UnkeyedSocketExceptionUsesAuthorizationBoundaryTest(
+            string request,
+            bool afterAuthorization)
+        {
+            using var scenario = new Scenario();
+            var managedAccounts = scenario.Actions.RequestManagedAccounts;
+            var financialAdvisor = scenario.Actions.RequestFinancialAdvisor;
+            var familyCodes = scenario.Actions.RequestFamilyCodes;
+            bool Fail(Func<bool> authorize)
+            {
+                if (afterAuthorization && !authorize())
+                {
+                    return false;
+                }
+                throw new System.Net.Sockets.SocketException(
+                    (int)System.Net.Sockets.SocketError.ConnectionReset);
+            }
+            scenario.Actions.RequestManagedAccounts = authorize =>
+                request == "managed" ? Fail(authorize) : managedAccounts(authorize);
+            scenario.Actions.RequestFinancialAdvisor = (faDataType, authorize) =>
+                request == $"fa:{faDataType}"
+                    ? Fail(authorize)
+                    : financialAdvisor(faDataType, authorize);
+            scenario.Actions.RequestFamilyCodes = authorize =>
+                request == "family" ? Fail(authorize) : familyCodes(authorize);
+            using var state = scenario.CreateState();
+
+            var failed = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            scenario.Actions.RequestManagedAccounts = managedAccounts;
+            scenario.Actions.RequestFinancialAdvisor = financialAdvisor;
+            scenario.Actions.RequestFamilyCodes = familyCodes;
+            if (afterAuthorization)
+            {
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, failed.Status);
+                    Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+                });
+                return;
+            }
+
+            Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, failed.Status);
+            var recovered = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+        }
+
         [Test]
         public async Task UnkeyedTimeoutRequiresFreshConnectionTest()
         {

@@ -1578,12 +1578,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var sent = false;
             try
             {
-                sent = PaceAndInvoke(pending, send, cancellation: false);
+                sent = PaceAndInvoke(
+                    pending,
+                    authorize => send(() =>
+                    {
+                        if (!authorize())
+                        {
+                            return false;
+                        }
+                        pending.WireSent = true;
+                        return true;
+                    }),
+                    cancellation: false);
                 if (!sent)
                 {
                     return await pending.Completion.Task.ConfigureAwait(false);
                 }
-                pending.WireSent = true;
                 return await AwaitPendingAsync(pending, description, poisonOnTimeout: true)
                     .ConfigureAwait(false);
             }
@@ -1610,12 +1620,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var sent = false;
             try
             {
-                sent = PaceAndInvoke(pending, send, cancellation: false);
+                sent = PaceAndInvoke(
+                    pending,
+                    authorize => send(() =>
+                    {
+                        if (!authorize())
+                        {
+                            return false;
+                        }
+                        pending.WireSent = true;
+                        return true;
+                    }),
+                    cancellation: false);
                 if (!sent)
                 {
                     return await pending.Completion.Task.ConfigureAwait(false);
                 }
-                pending.WireSent = true;
                 return await AwaitPendingAsync(pending, description, poisonOnTimeout: false)
                     .ConfigureAwait(false);
             }
@@ -1731,6 +1751,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 if (ReferenceEquals(_pendingRequest, pending))
                 {
+                    if (pending.RequestId == 0 && pending.WireSent && !pending.Finished)
+                    {
+                        _unkeyedRequestsPoisoned = true;
+                        _unkeyedResponseMayStillArrive = true;
+                        _handshakeManagedAccounts = null;
+                        _snapshot = CreateStatusSnapshot(
+                            _snapshot,
+                            BrokerageAccountSnapshotStatus.Stale,
+                            "An authorized unkeyed IB request may have reached TWS; reconnect before retrying.");
+                    }
                     _pendingRequest = null;
                 }
             }
