@@ -154,7 +154,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(directOrder));
             Assert.DoesNotThrow(() => ConvertOrder(brokerage, directOrder));
             StringAssert.Contains(
-                "blocked while account-group configuration",
+                "FA configuration mutation is active",
                 AssertAdmissionAndConversionRejectSame(
                     brokerage,
                     groupOrder).Message);

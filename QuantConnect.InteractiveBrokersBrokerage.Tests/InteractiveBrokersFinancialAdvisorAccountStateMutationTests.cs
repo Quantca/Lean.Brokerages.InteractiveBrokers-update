@@ -62,7 +62,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "Alpha",
                 state.Snapshot.MembershipHash,
                 state.Snapshot.GroupConfigurationVersion));
-            Assert.IsTrue(state.IsGroupTradingBlocked);
+            Assert.IsFalse(state.IsGroupTradingBlocked);
         }
 
         [Test]

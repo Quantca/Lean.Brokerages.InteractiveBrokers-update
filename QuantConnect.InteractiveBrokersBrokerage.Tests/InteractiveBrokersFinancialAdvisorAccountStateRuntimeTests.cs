@@ -104,6 +104,34 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task OrdinaryRefreshFailureDoesNotBlockGroupTradingTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            scenario.Actions.RequestPositions =
+                (requestId, accountOrGroup, authorize) =>
+                    scenario.RunAuthorized(authorize, () =>
+                        throw new InvalidOperationException(
+                            "simulated ordinary position refresh failure"));
+
+            var stale = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, ready.Status);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, stale.Status);
+                StringAssert.Contains(
+                    "simulated ordinary position refresh failure", stale.ErrorMessage);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
         public async Task UnkeyedTimeoutRequiresFreshConnectionTest()
         {
             using var scenario = new Scenario

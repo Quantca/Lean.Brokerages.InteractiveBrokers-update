@@ -1707,7 +1707,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                     _snapshot,
                                     BrokerageAccountSnapshotStatus.Stale,
                                     timeoutMessage);
-                                _groupTradingBlocked = true;
                             }
                         }
                         else
@@ -2119,11 +2118,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     snapshot = CreateStatusSnapshot(current, status, error);
                 }
                 _snapshot = snapshot;
-                if (snapshot.Status == BrokerageAccountSnapshotStatus.Stale)
-                {
-                    _groupTradingBlocked = true;
-                }
-                else if (readySnapshot != null && _pendingMutation == null)
+                if (readySnapshot != null && _pendingMutation == null)
                 {
                     _groupTradingBlocked = false;
                 }

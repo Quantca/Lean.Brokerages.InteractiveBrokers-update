@@ -275,7 +275,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     _financialAdvisorsGroupFilter))
             {
                 throw new InvalidOperationException(
-                    "FA group orders are blocked while account-group configuration is being updated or reconciled.");
+                    "FA group orders are blocked while an FA configuration mutation is active or its broker outcome requires reconciliation.");
             }
 
             var hasExplicitGroup = !string.IsNullOrWhiteSpace(properties?.FaGroup);
