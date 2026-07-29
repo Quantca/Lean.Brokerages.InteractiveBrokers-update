@@ -13,7 +13,6 @@
 */
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -31,12 +30,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         IBrokerageAccountGroupManager,
         IBrokerageAccountGroupAllocationManager
     {
-        /// <summary>
-        /// Stores skipped orders whose FA group does not match the configured filter.
-        /// Key is the order ID; value is the FA group associated with the order.
-        /// </summary>
-        private readonly ConcurrentDictionary<int, string> _skippedOrdersByFaGroup = new();
-
         /// <summary>
         /// Represents the allocation group managed by financial advisors.
         /// </summary>
@@ -234,6 +227,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         internal void ValidateFinancialAdvisorOrderAdmission(Order order)
         {
+            if (!_financialAdvisorUnifiedGroupsEnabled ||
+                !IsFinancialAdvisor ||
+                order?.Type == OrderType.OptionExercise)
+            {
+                return;
+            }
+
             ConfigureFinancialAdvisorOrder(new IBApi.Order(), order);
         }
 

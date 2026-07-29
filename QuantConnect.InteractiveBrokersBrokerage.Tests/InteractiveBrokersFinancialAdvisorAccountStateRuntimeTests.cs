@@ -160,6 +160,88 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreEqual(1, recovered.Generation);
         }
 
+        [TestCase(1101)]
+        [TestCase(1102)]
+        public async Task LogicalReconnectRestoresAvailabilityWithoutOutstandingUnkeyedRequestTest(
+            int recoveryCode)
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            scenario.Client.error(
+                -1, 0, 1100, "Connectivity between IB and TWS was lost.", string.Empty);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
+                Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+            });
+
+            scenario.Client.error(
+                -1, 0, recoveryCode, "Connectivity between IB and TWS was restored.",
+                string.Empty);
+            var recovered = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+                Assert.AreEqual(ready.Generation + 1, recovered.Generation);
+            });
+        }
+
+        [Test]
+        public async Task LogicalReconnectDoesNotClearOutstandingUnkeyedRequestTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var wireSent = new ManualResetEventSlim();
+            scenario.Actions.RequestManagedAccounts = authorize =>
+            {
+                if (!authorize())
+                {
+                    return false;
+                }
+                wireSent.Set();
+                return true;
+            };
+            using var state = scenario.CreateState();
+            var interruptedRefresh = RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(wireSent.Wait(TimeSpan.FromSeconds(5)));
+            Assert.IsTrue(SpinWait.SpinUntil(
+                () => IsPendingRequestWireSent(state), TimeSpan.FromSeconds(5)));
+
+            scenario.Client.error(
+                -1, 0, 1100, "Connectivity between IB and TWS was lost.", string.Empty);
+            var stale = await interruptedRefresh;
+            scenario.Client.error(
+                -1, 0, 1102, "Connectivity between IB and TWS was restored.", string.Empty);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, stale.Status);
+                Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+            });
+
+            scenario.Actions.RequestManagedAccounts = authorize =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.Requests.Add("managed-reconnected");
+                    scenario.Client.managedAccounts(scenario.ManagedAccounts);
+                });
+            scenario.Client.nextValidId(123);
+
+            var recovered = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+        }
+
         [Test]
         public async Task QueuedScopeDuringUnkeyedTimeoutRemainsStaleTest()
         {
@@ -799,6 +881,17 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 .GetField("_requestVersion",
                     BindingFlags.Instance | BindingFlags.NonPublic)
                 ?.GetValue(state);
+
+        private static bool IsPendingRequestWireSent(
+            InteractiveBrokersFinancialAdvisorAccountState state)
+        {
+            var pending = typeof(InteractiveBrokersFinancialAdvisorAccountState)
+                .GetField("_pendingRequest", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.GetValue(state);
+            return pending != null && (bool)pending.GetType()
+                .GetProperty("WireSent", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.GetValue(pending);
+        }
 
         private static bool HasQueuedRefresh(
             InteractiveBrokersFinancialAdvisorAccountState state) =>

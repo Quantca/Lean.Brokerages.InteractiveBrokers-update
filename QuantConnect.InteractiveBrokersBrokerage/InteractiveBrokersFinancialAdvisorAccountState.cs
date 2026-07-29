@@ -63,6 +63,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private string _handshakeManagedAccounts;
         private bool _connected;
         private bool _unkeyedRequestsPoisoned;
+        private bool _unkeyedResponseMayStillArrive;
         private bool _disposed;
         private int _nextRequestId = int.MinValue;
         private long _requestVersion;
@@ -140,7 +141,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 0));
         }
 
-        internal void MarkConnected()
+        internal void MarkConnected() => RestoreConnectivity(clearUnkeyedAmbiguity: true);
+
+        private void RestoreConnectivity(bool clearUnkeyedAmbiguity)
         {
             lock (_callbackStateLock)
             {
@@ -148,8 +151,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     return;
                 }
+                if (clearUnkeyedAmbiguity)
+                {
+                    _unkeyedResponseMayStillArrive = false;
+                }
                 _connected = true;
-                _unkeyedRequestsPoisoned = false;
+                _unkeyedRequestsPoisoned = _unkeyedResponseMayStillArrive;
                 _handshakeManagedAccounts = null;
             }
         }
@@ -172,6 +179,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _activeRefresh = null;
                 _queuedRefresh = null;
                 pending = _pendingRequest;
+                if (pending is { RequestId: 0, Finished: false, WireSent: true })
+                {
+                    _unkeyedResponseMayStillArrive = true;
+                }
                 _pendingRequest = null;
             }
             pending?.Completion.TrySetException(new InvalidOperationException(
@@ -1682,6 +1693,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             if (pending.WireSent)
                             {
                                 _unkeyedRequestsPoisoned = true;
+                                _unkeyedResponseMayStillArrive = true;
                                 _handshakeManagedAccounts = null;
                                 _snapshot = CreateStatusSnapshot(
                                     _snapshot,
@@ -1841,6 +1853,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     completed = _pendingRequest;
                     completed.Text = args.AccountList;
                     completed.Finished = true;
+                    _unkeyedResponseMayStillArrive = false;
                 }
                 else
                 {
@@ -1881,6 +1894,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         completed.FamilyCodes = familyCodes;
                     }
                     completed.Finished = true;
+                    _unkeyedResponseMayStillArrive = false;
                 }
             }
             completed?.Completion.TrySetResult(completed);
@@ -1947,7 +1961,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     $"Interactive Brokers connectivity was lost (1100): {args.Message}");
                 return;
             }
-            if (args.Code is 1101 or 1102 || args.Id is -1 or 0)
+            if (args.Code is 1101 or 1102)
+            {
+                RestoreConnectivity(clearUnkeyedAmbiguity: false);
+                return;
+            }
+            if (args.Id is -1 or 0)
             {
                 return;
             }

@@ -151,6 +151,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly ManualResetEvent _accountHoldingsResetEvent = new ManualResetEvent(false);
         private Exception _accountHoldingsLastException;
 
+        /// <summary>
+        /// Stores skipped orders whose FA group does not match the configured filter.
+        /// Key is the order ID; value is the FA group associated with the order.
+        /// </summary>
+        private readonly ConcurrentDictionary<int, string> _skippedOrdersByFaGroup = new();
+
         // tracks pending brokerage order responses. In some cases we've seen orders been placed and they never get through to IB
         private readonly ConcurrentDictionary<int, ManualResetEventSlim> _pendingOrderResponse = new();
 
