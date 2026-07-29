@@ -230,6 +230,47 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     eventArgs.PositionsMultiRequestId.Value);
         }
 
+        private IOrderProperties CreateRecoveredOrderProperties(IBApi.Order order)
+        {
+            if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor)
+            {
+                return null;
+            }
+
+            var group = order?.FaGroup?.Trim() ?? string.Empty;
+            var account = order?.Account?.Trim() ?? string.Empty;
+            var isGroupOrder = group.Length != 0;
+            if (!isGroupOrder &&
+                (account.Length == 0 ||
+                    account.Equals(_account, StringComparison.OrdinalIgnoreCase)))
+            {
+                return null;
+            }
+
+            var properties = new InteractiveBrokersOrderProperties
+            {
+                Account = isGroupOrder ? string.Empty : account,
+                FaGroup = isGroupOrder ? group : string.Empty,
+                FaMethod = isGroupOrder ? order.FaMethod ?? string.Empty : string.Empty,
+                OutsideRegularTradingHours = order.OutsideRth
+            };
+            if (isGroupOrder &&
+                decimal.TryParse(order.FaPercentage, NumberStyles.Float,
+                    CultureInfo.InvariantCulture, out var percentage))
+            {
+                if (percentage == decimal.Truncate(percentage) &&
+                    percentage >= int.MinValue && percentage <= int.MaxValue)
+                {
+                    properties.FaPercentage = (int)percentage;
+                }
+                else
+                {
+                    properties.ExactFaPercentage = percentage;
+                }
+            }
+            return properties;
+        }
+
         internal void ValidateFinancialAdvisorOrderAdmission(Order order)
         {
             if (!_financialAdvisorUnifiedGroupsEnabled ||

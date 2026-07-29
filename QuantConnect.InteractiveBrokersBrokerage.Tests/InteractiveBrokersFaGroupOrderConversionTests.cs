@@ -25,10 +25,14 @@ using QuantConnect.Brokerages;
 using QuantConnect.Brokerages.Backtesting;
 using QuantConnect.Brokerages.InteractiveBrokers;
 using QuantConnect.Data.Market;
+using QuantConnect.Interfaces;
 using QuantConnect.Lean.Engine.TransactionHandlers;
 using QuantConnect.Orders;
+using QuantConnect.Tests.Brokerages;
 using QuantConnect.Tests.Engine;
 using QuantConnect.Tests.Engine.DataFeeds;
+using QuantConnect.Util;
+using FAState = QuantConnect.Brokerages.InteractiveBrokers.InteractiveBrokersFinancialAdvisorAccountState;
 using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
 using LeanOrder = QuantConnect.Orders.Order;
 
@@ -60,6 +64,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             typeof(InteractiveBrokersBrokerage).GetField("_account", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo AlgorithmField =
             typeof(InteractiveBrokersBrokerage).GetField("_algorithm", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo SymbolMapperField =
+            typeof(InteractiveBrokersBrokerage).GetField("_symbolMapper", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo AgentDescriptionField =
             typeof(InteractiveBrokersBrokerage).GetField("_agentDescription", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo FaFilterField =
@@ -93,6 +99,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 binder: null,
                 types: new[] { typeof(List<LeanOrder>), typeof(Contract), typeof(int) },
                 modifiers: null);
+        private static readonly MethodInfo ConvertOrdersMethod =
+            typeof(InteractiveBrokersBrokerage).GetMethod(
+                "ConvertOrders",
+                BindingFlags.Instance | BindingFlags.NonPublic);
 
         /// <summary>
         /// When the FA group filter is configured and the order carries a per-order
@@ -516,6 +526,105 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void StartupAndReconnectRecoveryPreserveFinancialAdvisorIdentityTest()
+        {
+            var algorithm = new AlgorithmStub();
+            algorithm.AddEquity("SPY");
+            var brokerage = CreateOfflineBrokerage(algorithm);
+            UnifiedGroupsField.SetValue(brokerage, true);
+
+            foreach (var recoveryPass in new[] { "startup", "reconnect" })
+            {
+                var groupOrder = RecoverOrder(brokerage, new IBApi.Order
+                {
+                    Account = FaMasterAccount,
+                    FaGroup = FaGroupName,
+                    FaMethod = "NetLiq",
+                    FaPercentage = "12.5",
+                    TotalQuantity = 19.75m,
+                    Action = "BUY",
+                    OrderType = "LMT",
+                    LmtPrice = 100d,
+                    Tif = IB.TimeInForce.GoodTillCancel,
+                    OutsideRth = true,
+                    OrderId = recoveryPass == "startup" ? 10 : 20
+                });
+                var directOrder = RecoverOrder(brokerage, new IBApi.Order
+                {
+                    Account = "DU1234567",
+                    TotalQuantity = 0.5m,
+                    Action = "BUY",
+                    OrderType = "LMT",
+                    LmtPrice = 100d,
+                    Tif = IB.TimeInForce.Day,
+                    OrderId = recoveryPass == "startup" ? 11 : 21
+                });
+
+                var groupProperties =
+                    (InteractiveBrokersOrderProperties)groupOrder.Properties;
+                var directProperties =
+                    (InteractiveBrokersOrderProperties)directOrder.Properties;
+                var orderProvider = new OrderProvider(
+                    new List<LeanOrder> { groupOrder, directOrder });
+                var mutationBlockingOrders = orderProvider.GetOpenOrders(order =>
+                    FAState.IsFinancialAdvisorGroupOrder(order, string.Empty));
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(19.75m, groupOrder.Quantity, recoveryPass);
+                    Assert.AreEqual(FaGroupName, groupProperties.FaGroup, recoveryPass);
+                    Assert.IsEmpty(groupProperties.Account, recoveryPass);
+                    Assert.AreEqual("NetLiq", groupProperties.FaMethod, recoveryPass);
+                    Assert.AreEqual(12.5m, groupProperties.ExactFaPercentage, recoveryPass);
+                    Assert.AreEqual(TimeInForce.GoodTilCanceled.GetType(),
+                        groupProperties.TimeInForce.GetType(), recoveryPass);
+                    Assert.IsTrue(
+                        groupProperties.OutsideRegularTradingHours, recoveryPass);
+                    Assert.AreEqual(0.5m, directOrder.Quantity, recoveryPass);
+                    Assert.AreEqual(
+                        "DU1234567", directProperties.Account, recoveryPass);
+                    Assert.IsEmpty(directProperties.FaGroup, recoveryPass);
+                    Assert.AreEqual(1, mutationBlockingOrders.Count, recoveryPass);
+                    Assert.AreEqual(
+                        groupOrder.BrokerId.Single(),
+                        mutationBlockingOrders[0].BrokerId.Single(),
+                        recoveryPass);
+                });
+            }
+        }
+
+        [TestCase(false, FaMasterAccount)]
+        [TestCase(true, "DU7654321")]
+        public void OrdinaryRecoveryKeepsUpstreamQuantityAndPropertiesTest(
+            bool unifiedGroupsEnabled,
+            string account)
+        {
+            var algorithm = new AlgorithmStub();
+            algorithm.AddEquity("SPY");
+            var brokerage = CreateOfflineBrokerage(algorithm);
+            UnifiedGroupsField.SetValue(brokerage, unifiedGroupsEnabled);
+            AccountField.SetValue(brokerage, account);
+
+            var recovered = RecoverOrder(brokerage, new IBApi.Order
+            {
+                Account = "DU1234567",
+                FaGroup = FaGroupName,
+                TotalQuantity = 19.75m,
+                Action = "BUY",
+                OrderType = "LMT",
+                LmtPrice = 100d,
+                Tif = IB.TimeInForce.Day,
+                OrderId = 30
+            });
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(20m, recovered.Quantity);
+                Assert.AreEqual(typeof(OrderProperties), recovered.Properties.GetType());
+            });
+        }
+
+        [Test]
         public void ReadySnapshotWithInconsistentSavedAllocationFailsClosedTest()
         {
             var brokerage = CreateOfflineBrokerage();
@@ -787,6 +896,23 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 new object[] { new List<LeanOrder> { order }, contract, 1 });
         }
 
+        private static LeanOrder RecoverOrder(
+            InteractiveBrokersBrokerage brokerage,
+            IBApi.Order order)
+        {
+            var contract = new Contract
+            {
+                Symbol = "SPY",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "USD"
+            };
+            var orderState = new OrderState { Status = "Submitted" };
+            return ((List<LeanOrder>)ConvertOrdersMethod.Invoke(
+                brokerage,
+                new object[] { order, contract, orderState })).Single();
+        }
+
         private static Exception AssertAdmissionAndConversionRejectSame(
             InteractiveBrokersBrokerage brokerage,
             LeanOrder order)
@@ -879,6 +1005,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             AccountField.SetValue(brokerage, FaMasterAccount);
             AgentDescriptionField.SetValue(brokerage, AgentDescription);
             AlgorithmField.SetValue(brokerage, algorithm);
+            SymbolMapperField.SetValue(
+                brokerage,
+                new InteractiveBrokersSymbolMapper(
+                    Composer.Instance.GetPart<IMapFileProvider>()));
 
             // Stub contract-details provider — returns a deterministic min tick of 0.01 so the
             // limit price round-trips cleanly through NormalizePriceToBrokerage.

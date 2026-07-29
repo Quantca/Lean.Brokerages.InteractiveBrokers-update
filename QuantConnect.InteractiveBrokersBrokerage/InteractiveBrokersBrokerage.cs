@@ -3173,7 +3173,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             var result = new List<Order>();
             var quantitySign = ConvertOrderDirection(ibOrder.Action) == OrderDirection.Sell ? -1 : 1;
-            var quantity = Convert.ToInt32(ibOrder.TotalQuantity) * quantitySign;
+            var properties = CreateRecoveredOrderProperties(ibOrder);
+            var quantity = (properties != null && contract.SecType != IB.SecurityType.Bag
+                ? ibOrder.TotalQuantity : Convert.ToInt32(ibOrder.TotalQuantity)) * quantitySign;
 
             if (contract.SecType == IB.SecurityType.Bag)
             {
@@ -3205,7 +3207,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!TryConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, orderType,
                             comboLeg.Ratio * quantitySignLeg * quantity, legLimitPrice, 0, 0, contractDetails.Contract, group, orderState,
-                            out var leanOrder))
+                            properties?.Clone(), out var leanOrder))
                     {
                         // if we fail to convert one leg, we fail the whole order
                         return new List<Order>();
@@ -3215,7 +3217,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
             else if (TryConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, ConvertOrderType(ibOrder), quantity,
-                ibOrder.LmtPrice, ibOrder.TrailStopPrice, ibOrder.TrailingPercent, contract, null, orderState, out var leanOrder))
+                ibOrder.LmtPrice, ibOrder.TrailStopPrice, ibOrder.TrailingPercent, contract, null, orderState, properties, out var leanOrder))
             {
                 result.Add(leanOrder);
             }
@@ -3245,12 +3247,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private bool TryConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
             double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState,
-            out Order leanOrder)
+            IOrderProperties properties, out Order leanOrder)
         {
             try
             {
                 leanOrder = ConvertOrder(timeInForce, goodTillDate, ibOrderId, auxPrice, orderType, quantity,
-                    limitPrice, trailingStopPrice, trailingPercentage, contract, groupOrderManager, orderState);
+                    limitPrice, trailingStopPrice, trailingPercentage, contract, groupOrderManager, orderState, properties);
                 return true;
             }
             catch (Exception ex)
@@ -3262,7 +3264,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         private Order ConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
-            double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState)
+            double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState,
+            IOrderProperties properties)
         {
             // GetOpenOrders rebuilds orders that predate the algorithm; IB doesn't report their original
             // submission time, so we stamp the discovery time instead of DateTime.MinValue to keep
@@ -3277,20 +3280,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 case OrderType.Market:
                     order = new MarketOrder(mappedSymbol,
                         quantity,
-                        orderTime
+                        orderTime,
+                        properties: properties
                         );
                     break;
 
                 case OrderType.MarketOnOpen:
                     order = new MarketOnOpenOrder(mappedSymbol,
                         quantity,
-                        orderTime);
+                        orderTime,
+                        properties: properties);
                     break;
 
                 case OrderType.MarketOnClose:
                     order = new MarketOnCloseOrder(mappedSymbol,
                         quantity,
-                        orderTime
+                        orderTime,
+                        properties: properties
                         );
                     break;
 
@@ -3298,7 +3304,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new LimitOrder(mappedSymbol,
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        orderTime
+                        orderTime,
+                        properties: properties
                         );
                     break;
 
@@ -3306,7 +3313,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new StopMarketOrder(mappedSymbol,
                         quantity,
                         NormalizePriceToLean(auxPrice, mappedSymbol),
-                        orderTime
+                        orderTime,
+                        properties: properties
                         );
                     break;
 
@@ -3315,7 +3323,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(auxPrice, mappedSymbol),
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        orderTime
+                        orderTime,
+                        properties: properties
                         );
                     break;
 
@@ -3338,7 +3347,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         NormalizePriceToLean(trailingStopPrice, mappedSymbol),
                         trailingAmount,
                         trailingAsPecentage,
-                        orderTime
+                        orderTime,
+                        properties: properties
                     );
                     break;
 
@@ -3347,7 +3357,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(auxPrice, mappedSymbol),
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        orderTime
+                        orderTime,
+                        properties: properties
                     );
                     break;
 
@@ -3355,7 +3366,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new ComboMarketOrder(mappedSymbol,
                         quantity,
                         orderTime,
-                        groupOrderManager
+                        groupOrderManager,
+                        properties: properties
                     );
                     break;
 
@@ -3364,7 +3376,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
                         orderTime,
-                        groupOrderManager
+                        groupOrderManager,
+                        properties: properties
                     );
                     break;
 
@@ -3373,7 +3386,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
                         orderTime,
-                        groupOrderManager
+                        groupOrderManager,
+                        properties: properties
                     );
                     break;
 
