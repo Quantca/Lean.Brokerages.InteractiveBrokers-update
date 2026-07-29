@@ -36,7 +36,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private const decimal CashBalance = 123.45m;
         private const decimal ExactPosition = 1.75m;
         private const int PositiveRequestId = 41;
-        private const int ServiceRequestId = -2;
+        private const int UnallocatedNegativeRequestId = -2;
 
         private static readonly FieldInfo AccountField =
             GetRequiredField("_account");
@@ -46,6 +46,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             GetRequiredField("_client");
         private static readonly FieldInfo FinancialAdvisorGroupFilterField =
             GetRequiredField("_financialAdvisorsGroupFilter");
+        private static readonly FieldInfo FinancialAdvisorAccountStateField =
+            GetRequiredField("_financialAdvisorAccountState");
         private static readonly FieldInfo LoadExistingHoldingsField =
             GetRequiredField("_loadExistingHoldings");
         private static readonly FieldInfo SymbolMapperField =
@@ -60,6 +62,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             GetRequiredMethod("HandleUpdateAccountValue");
         private static readonly MethodInfo InitializeFinancialAdvisorAccountStateMethod =
             GetRequiredMethod("InitializeFinancialAdvisorAccountState");
+        private static readonly MethodInfo NextServiceRequestIdMethod =
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetMethod(
+                "NextRequestId", InstanceNonPublic)
+            ?? throw new InvalidOperationException(
+                "Missing Financial Advisor service request ID allocator.");
 
         [Test]
         public void UnifiedGroupsDisabledIsUpstreamEquivalentTest()
@@ -222,6 +229,23 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void UnallocatedNegativeRequestRowsReachLegacyAccountDataTest()
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                GroupName,
+                unifiedGroupsEnabled: true);
+
+            scenario.EmitPublicRowsWithoutInternalCallbacks(
+                UnallocatedNegativeRequestId);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(9999.99m, scenario.GetCashBalance());
+                Assert.AreEqual(999.5m, scenario.GetHoldingQuantity());
+            });
+        }
+
+        [Test]
         public void ConfiguredGroupFilterRejectsAdditionalAccountRefreshWithoutThrowingTest()
         {
             using var scenario = LegacyAccountScenario.CreateConfigured(
@@ -251,6 +275,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private sealed class LegacyAccountScenario : IDisposable
         {
             private readonly FieldInfo _socketConnectedField;
+            private readonly int _serviceRequestId;
             private bool _disposed;
 
             public InteractiveBrokersBrokerage Brokerage { get; }
@@ -295,6 +320,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 }
 
                 InitializeFinancialAdvisorAccountStateMethod.Invoke(Brokerage, null);
+                var accountState = FinancialAdvisorAccountStateField.GetValue(Brokerage)
+                    as InteractiveBrokersFinancialAdvisorAccountState;
+                _serviceRequestId = accountState == null
+                    ? UnallocatedNegativeRequestId
+                    : (int)NextServiceRequestIdMethod.Invoke(accountState, null);
                 Client.UpdateAccountValue += HandleUpdateAccountValue;
                 Client.UpdatePortfolio += HandlePortfolioUpdate;
                 if (!string.IsNullOrEmpty(
@@ -374,14 +404,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             public void EmitServiceRows()
             {
                 Client.positionMulti(
-                    ServiceRequestId,
+                    _serviceRequestId,
                     "DU-SERVICE",
                     string.Empty,
                     CreateContract(),
                     999.5m,
                     900.5);
                 Client.accountUpdateMulti(
-                    ServiceRequestId,
+                    _serviceRequestId,
                     AccountId,
                     string.Empty,
                     "CashBalance",
@@ -390,6 +420,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
 
             public void EmitPublicServiceRowsWithoutInternalCallbacks()
+            {
+                EmitPublicRowsWithoutInternalCallbacks(_serviceRequestId);
+            }
+
+            public void EmitPublicRowsWithoutInternalCallbacks(int requestId)
             {
                 Client.EmitPublicPortfolio(
                     new IB.UpdatePortfolioEventArgs(
@@ -401,14 +436,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         0,
                         0,
                         "DU-SERVICE",
-                        ServiceRequestId));
+                        requestId));
                 Client.EmitPublicAccountUpdate(
                     new IB.UpdateAccountValueEventArgs(
                         "CashBalance",
                         "9999.99",
                         Currencies.USD,
                         AccountId,
-                        ServiceRequestId));
+                        requestId));
             }
 
             public void EmitNonServiceRowsInsideServiceCallbacks()
@@ -417,7 +452,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 var positionRowEmitted = false;
                 Client.AccountUpdateMultiWithRequestId += (_, args) =>
                 {
-                    if (args.RequestId == ServiceRequestId && !accountRowEmitted)
+                    if (args.RequestId == _serviceRequestId && !accountRowEmitted)
                     {
                         accountRowEmitted = true;
                         Client.EmitPublicAccountUpdate(
@@ -432,7 +467,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 };
                 Client.PositionMulti += (_, args) =>
                 {
-                    if (args.RequestId == ServiceRequestId && !positionRowEmitted)
+                    if (args.RequestId == _serviceRequestId && !positionRowEmitted)
                     {
                         positionRowEmitted = true;
                         Client.EmitPublicPortfolio(

@@ -63,8 +63,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 CollectionAssert.AreEqual(
                     Enumerable.Range(0, 6).Select(offset => int.MinValue + offset),
                     scenario.KeyedRequestIds);
-                Assert.IsTrue(scenario.KeyedRequestIds.All(
-                    InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId));
+                Assert.IsTrue(
+                    scenario.KeyedRequestIds.All(state.IsServiceOwnedRequestId));
                 Assert.AreEqual(2, snapshot.Groups.Count);
                 Assert.AreEqual(2, snapshot.AllGroups.Count);
                 Assert.AreEqual(3, snapshot.Accounts.Count);
@@ -523,6 +523,53 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task ServiceRequestOwnershipPersistsUntilPhysicalReconnectTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var retiredRequestId = scenario.KeyedRequestIds.First();
+            var firstConnectionRequestCount = scenario.KeyedRequestIds.Count;
+
+            Assert.IsTrue(state.IsServiceOwnedRequestId(retiredRequestId));
+
+            scenario.Client.error(
+                -1, 0, 1100,
+                "Connectivity between IB and TWS was lost.", string.Empty);
+            scenario.Client.error(
+                -1, 0, 1102,
+                "Connectivity between IB and TWS was restored.", string.Empty);
+
+            Assert.IsTrue(
+                state.IsServiceOwnedRequestId(retiredRequestId),
+                "A logical reconnect must retain service request ownership.");
+
+            scenario.Client.connectionClosed();
+
+            Assert.IsTrue(
+                state.IsServiceOwnedRequestId(retiredRequestId),
+                "Late callbacks remain service-owned until reconnect is confirmed.");
+
+            scenario.Client.nextValidId(127);
+            var recovered = await WaitForReadyGenerationAsync(
+                state, ready.Generation);
+            var reconnectRequestIds = scenario.KeyedRequestIds
+                .Skip(firstConnectionRequestCount)
+                .ToArray();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(ready.Generation + 1, recovered.Generation);
+                Assert.IsFalse(state.IsServiceOwnedRequestId(retiredRequestId));
+                Assert.IsNotEmpty(reconnectRequestIds);
+                Assert.IsTrue(
+                    reconnectRequestIds.All(state.IsServiceOwnedRequestId));
+            });
+        }
+
+        [Test]
         public async Task QueuedScopeDuringUnkeyedTimeoutRemainsStaleTest()
         {
             using var scenario = Scenario.SingleAccount();
@@ -911,7 +958,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(1, positionScenario.CanceledPositionIds.Count);
                 Assert.AreEqual(positionScenario.KeyedRequestIds.Single(),
                     positionScenario.CanceledPositionIds.Single());
-                Assert.IsTrue(InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
+                Assert.IsTrue(positionState.IsServiceOwnedRequestId(
                     positionScenario.CanceledPositionIds.Single()));
                 Assert.IsEmpty(positionScenario.AccountRequestIds);
             });
@@ -952,7 +999,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(1, accountScenario.CanceledAccountIds.Count);
                 Assert.AreEqual(accountScenario.AccountRequestIds.Single(),
                     accountScenario.CanceledAccountIds.Single());
-                Assert.IsTrue(InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
+                Assert.IsTrue(accountState.IsServiceOwnedRequestId(
                     accountScenario.CanceledAccountIds.Single()));
             });
 

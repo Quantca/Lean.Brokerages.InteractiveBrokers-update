@@ -48,6 +48,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly CancellationTokenSource _disposeTokenSource = new();
         private readonly RateGate _requestRateGate = new(10, TimeSpan.FromSeconds(1));
         private readonly object _callbackStateLock = new();
+        private readonly HashSet<int> _serviceOwnedRequestIds = new();
 
         private volatile BrokerageAccountSnapshot _snapshot = BrokerageAccountSnapshot.Unavailable;
         private volatile BrokerageAccountGroupAssignment _groupAssignment =
@@ -167,6 +168,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     _unkeyedResponseMayStillArrive = false;
                 }
+                if (confirmedReconnect)
+                {
+                    _serviceOwnedRequestIds.Clear();
+                }
                 _connected = true;
                 if (confirmedReconnect && _hasRequestedRefresh)
                 {
@@ -210,7 +215,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 expectedRequestVersion: disconnectVersion);
         }
 
-        internal static bool IsServiceRequestId(int requestId) => requestId <= -2;
+        internal bool IsServiceOwnedRequestId(int requestId)
+        {
+            lock (_callbackStateLock)
+            {
+                return _serviceOwnedRequestIds.Contains(requestId);
+            }
+        }
+
+        private static bool IsServiceRequestIdInAllocatorRange(int requestId) =>
+            requestId <= -2;
 
         internal static string NormalizeFinancialAdvisorAllocationMethod(
             string allocationMethod) =>
@@ -1873,11 +1887,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private int NextRequestId()
         {
-            if (_nextRequestId >= -1)
+            lock (_callbackStateLock)
             {
-                throw new InvalidOperationException("The FA service request ID range is exhausted.");
+                if (!IsServiceRequestIdInAllocatorRange(_nextRequestId))
+                {
+                    throw new InvalidOperationException(
+                        "The FA service request ID range is exhausted.");
+                }
+                var requestId = _nextRequestId++;
+                _serviceOwnedRequestIds.Add(requestId);
+                return requestId;
             }
-            return _nextRequestId++;
         }
 
         private void AttachCallbacks()

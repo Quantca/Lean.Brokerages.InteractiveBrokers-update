@@ -2096,8 +2096,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             Log.Trace($"InteractiveBrokersBrokerage.HandleError(): RequestId: {requestId} ErrorCode: {errorCode} - {errorMsg}");
 
-            if (_financialAdvisorAccountState != null &&
-                InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(requestId))
+            if (_financialAdvisorAccountState?.IsServiceOwnedRequestId(requestId) == true)
             {
                 return;
             }

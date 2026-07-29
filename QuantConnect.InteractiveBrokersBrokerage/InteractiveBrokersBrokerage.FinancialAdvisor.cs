@@ -212,8 +212,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return _financialAdvisorUnifiedGroupsEnabled &&
                 IsFinancialAdvisor &&
                 eventArgs.AccountUpdatesMultiRequestId.HasValue &&
-                InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
-                    eventArgs.AccountUpdatesMultiRequestId.Value);
+                _financialAdvisorAccountState?.IsServiceOwnedRequestId(
+                    eventArgs.AccountUpdatesMultiRequestId.Value) == true;
         }
 
         private bool TryGetFinancialAdvisorPortfolioPosition(
@@ -226,8 +226,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return !_financialAdvisorUnifiedGroupsEnabled ||
                 !IsFinancialAdvisor ||
                 !eventArgs.PositionsMultiRequestId.HasValue ||
-                !InteractiveBrokersFinancialAdvisorAccountState.IsServiceRequestId(
-                    eventArgs.PositionsMultiRequestId.Value);
+                _financialAdvisorAccountState?.IsServiceOwnedRequestId(
+                    eventArgs.PositionsMultiRequestId.Value) != true;
         }
 
         private IOrderProperties CreateRecoveredOrderProperties(IBApi.Order order)
