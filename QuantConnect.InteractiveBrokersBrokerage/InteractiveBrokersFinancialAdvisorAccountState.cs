@@ -1390,6 +1390,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var allGroups = CanonicalizeGroups(
                 ParseGroups(groupsXml, validateAllocationConfiguration: false),
                 managedAccountIds);
+            var topologyMembershipHash = ComputeMembershipHash(
+                allGroups, managedAccountIds, aliases, familyCodes);
             var selectedGroups = scope.CompleteDiscovery
                 ? allGroups
                 : SelectGroups(allGroups, scope.GroupNames);
@@ -1502,14 +1504,31 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
 
+            var endingManagedAccountIds = ParseManagedAccounts(
+                await RequestManagedAccountsAsync(scope, useHandshakeCache: false)
+                    .ConfigureAwait(false));
             var endingGroupsXml = await RequestFinancialAdvisorXmlAsync(
                 scope, GroupsFaDataType)
                 .ConfigureAwait(false);
+            var endingAliases = ParseAliases(await RequestFinancialAdvisorXmlAsync(
+                scope, AliasesFaDataType).ConfigureAwait(false));
+            var endingFamilyCodes = ToFamilyCodeDictionary(
+                await RequestFamilyCodesAsync(scope).ConfigureAwait(false));
+            var endingGroups = CanonicalizeGroups(
+                ParseGroups(endingGroupsXml, validateAllocationConfiguration: false),
+                endingManagedAccountIds);
             if (!groupConfigurationVersion.Equals(
-                ComputeConfigurationHash(endingGroupsXml), StringComparison.Ordinal))
+                    ComputeConfigurationHash(endingGroupsXml), StringComparison.Ordinal) ||
+                !topologyMembershipHash.Equals(
+                    ComputeMembershipHash(
+                        endingGroups,
+                        endingManagedAccountIds,
+                        endingAliases,
+                        endingFamilyCodes),
+                    StringComparison.Ordinal))
             {
                 throw new InvalidOperationException(
-                    "FA group configuration changed while the account snapshot was collected.");
+                    "FA topology changed while the account snapshot was collected.");
             }
 
             var accountStates = builders.ToDictionary(

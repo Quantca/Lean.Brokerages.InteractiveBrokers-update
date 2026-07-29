@@ -57,7 +57,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         "account:ACC1",
                         "account:ACC2",
                         "account:ACC3",
-                        "fa:1"
+                        "managed",
+                        "fa:1",
+                        "fa:3",
+                        "family"
                     },
                     scenario.Requests);
                 CollectionAssert.AreEqual(
@@ -362,11 +365,19 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
 
             using var explicitRequestSent = new ManualResetEventSlim();
+            var explicitRequestCount = 0;
             scenario.Actions.RequestManagedAccounts = authorize =>
                 scenario.RunAuthorized(authorize, () =>
                 {
                     scenario.Requests.Add("managed-explicit");
-                    explicitRequestSent.Set();
+                    if (Interlocked.Increment(ref explicitRequestCount) == 1)
+                    {
+                        explicitRequestSent.Set();
+                    }
+                    else
+                    {
+                        scenario.Client.managedAccounts(scenario.ManagedAccounts);
+                    }
                 });
 
             scenario.Client.connectAck();
@@ -396,7 +407,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 CollectionAssert.DoesNotContain(
                     snapshot.ManagedAccountIds, "AUTO");
                 Assert.AreEqual(
-                    1,
+                    2,
                     scenario.Requests.Count(request => request == "managed-explicit"));
             });
         }
@@ -422,8 +433,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             scenario.Actions.RequestManagedAccounts = authorize =>
                 scenario.RunAuthorized(authorize, () =>
                 {
-                    scenario.Requests.Add("unexpected-managed-request");
-                    scenario.Client.managedAccounts("MASTER,EXPLICIT");
+                    scenario.Requests.Add("ending-managed-request");
+                    scenario.Client.managedAccounts(scenario.ManagedAccounts);
                 });
 
             scenario.Client.connectAck();
@@ -453,8 +464,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     snapshot.ManagedAccountIds, "DUPLICATE");
                 CollectionAssert.DoesNotContain(
                     snapshot.ManagedAccountIds, "EXPLICIT");
-                CollectionAssert.DoesNotContain(
-                    scenario.Requests, "unexpected-managed-request");
+                Assert.AreEqual(
+                    1,
+                    scenario.Requests.Count(request =>
+                        request == "ending-managed-request"));
             });
         }
 
@@ -500,7 +513,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     "family",
                     "positions:Alpha",
                     "account:ACC1",
-                    "fa:1"
+                    "managed",
+                    "fa:1",
+                    "fa:3",
+                    "family"
                 },
                 scenario.Requests);
             var requestCount = scenario.Requests.Count;
@@ -741,7 +757,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.Multiple(() =>
             {
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
-                Assert.AreEqual(1, scenario.Requests.Count(request => request == "managed"),
+                Assert.AreEqual(2, scenario.Requests.Count(request => request == "managed"),
                     "The pre-disconnect pending request must not write on the fresh connection.");
             });
         }
@@ -1323,13 +1339,66 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
-        [Test]
-        public async Task ReadySnapshotRequiresStableConfigurationTest()
+        [TestCase("ManagedAccounts")]
+        [TestCase("Aliases")]
+        [TestCase("FamilyCodes")]
+        [TestCase("GroupMembership")]
+        [TestCase("AllocationConfiguration")]
+        public async Task ReadySnapshotRequiresStableTopologyTest(string changedSource)
         {
-            using var scenario = new Scenario
+            const string ratioGroups = """
+                <ListOfGroups>
+                  <Group><name>Ratio</name><defaultMethod>Ratio</defaultMethod><ListOfAccts>
+                    <Account><acct>ACC1</acct><amount>1</amount></Account>
+                    <Account><acct>ACC2</acct><amount>2</amount></Account>
+                  </ListOfAccts></Group>
+                </ListOfGroups>
+                """;
+            const string changedRatioGroups = """
+                <ListOfGroups>
+                  <Group><name>Ratio</name><defaultMethod>Ratio</defaultMethod><ListOfAccts>
+                    <Account><acct>ACC1</acct><amount>1</amount></Account>
+                    <Account><acct>ACC2</acct><amount>3</amount></Account>
+                  </ListOfAccts></Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario();
+            switch (changedSource)
             {
-                EndingGroupsDocument = Scenario.EmptyGroupsXml
-            };
+                case "ManagedAccounts":
+                    scenario.EndingManagedAccounts = "MASTER,ACC1,ACC2,ACC3,ACC4";
+                    break;
+                case "Aliases":
+                    scenario.EndingAliasesDocument = """
+                        <ListOfAccountAliases>
+                          <AccountAlias><account>ACC1</account><alias>Changed Client</alias></AccountAlias>
+                          <AccountAlias><account>ACC2</account><alias>Beta Client</alias></AccountAlias>
+                          <AccountAlias><account>ACC3</account><alias>Unassigned Client</alias></AccountAlias>
+                        </ListOfAccountAliases>
+                        """;
+                    break;
+                case "FamilyCodes":
+                    scenario.EndingFamilyCodes =
+                    [
+                        new() { AccountID = "ACC1", FamilyCodeStr = "Changed-Family" },
+                        new() { AccountID = "ACC2", FamilyCodeStr = "Family-B" },
+                        new() { AccountID = "ACC3", FamilyCodeStr = "Family-C" }
+                    ];
+                    break;
+                case "GroupMembership":
+                    scenario.EndingGroupsDocument = Scenario.GroupsXml.Replace(
+                        "<String>ACC1</String>",
+                        "<String>ACC3</String>",
+                        StringComparison.Ordinal);
+                    break;
+                case "AllocationConfiguration":
+                    scenario.GroupsDocument = ratioGroups;
+                    scenario.EndingGroupsDocument = changedRatioGroups;
+                    break;
+                default:
+                    Assert.Fail($"Unexpected topology source '{changedSource}'.");
+                    break;
+            }
             using var state = scenario.CreateState();
 
             var snapshot = await RunRefreshAsync(
@@ -1342,8 +1411,94 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsFalse(snapshot.IsReady);
                 Assert.AreEqual(0, snapshot.Generation);
                 Assert.AreEqual(2, scenario.GroupsRequestCount);
-                StringAssert.Contains("changed while the account snapshot was collected",
+                StringAssert.Contains("topology changed while the account snapshot was collected",
                     snapshot.ErrorMessage);
+            });
+        }
+
+        [Test]
+        public async Task EquivalentTopologyFormattingDoesNotProduceFalseDriftTest()
+        {
+            using var scenario = new Scenario
+            {
+                EndingManagedAccounts = " acc3, ACC2,master,acc1 ",
+                EndingGroupsDocument = """
+                    <ListOfGroups>
+                      <Group>
+                        <name>Beta</name><defaultMethod>Equal</defaultMethod>
+                        <ListOfAccts><String>ACC2</String></ListOfAccts>
+                      </Group>
+                      <Group>
+                        <name>Alpha</name><defaultMethod>NetLiq</defaultMethod>
+                        <ListOfAccts><String>ACC1</String></ListOfAccts>
+                      </Group>
+                    </ListOfGroups>
+                    """,
+                EndingAliasesDocument = """
+                    <ListOfAccountAliases>
+                      <AccountAlias><account>acc3</account><alias> Unassigned Client </alias></AccountAlias>
+                      <AccountAlias><account>acc2</account><alias> Beta Client </alias></AccountAlias>
+                      <AccountAlias><account>acc1</account><alias> Alpha Client </alias></AccountAlias>
+                    </ListOfAccountAliases>
+                    """,
+                EndingFamilyCodes =
+                [
+                    new() { AccountID = "acc3", FamilyCodeStr = " Family-C " },
+                    new() { AccountID = "acc2", FamilyCodeStr = " Family-B " },
+                    new() { AccountID = "acc1", FamilyCodeStr = " Family-A " }
+                ]
+            };
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1, snapshot.Generation);
+                Assert.IsTrue(snapshot.IsComplete);
+            });
+        }
+
+        [Test]
+        public async Task TopologyDriftAfterReadyPreservesLastGoodSnapshotTest()
+        {
+            using var scenario = new Scenario();
+            using var state = scenario.CreateState();
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            scenario.EndingAliasesDocument = """
+                <ListOfAccountAliases>
+                  <AccountAlias><account>ACC1</account><alias>Changed Client</alias></AccountAlias>
+                  <AccountAlias><account>ACC2</account><alias>Beta Client</alias></AccountAlias>
+                  <AccountAlias><account>ACC3</account><alias>Unassigned Client</alias></AccountAlias>
+                </ListOfAccountAliases>
+                """;
+
+            var stale = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, ready.Status);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, stale.Status);
+                Assert.AreEqual(ready.Generation, stale.Generation);
+                Assert.AreEqual(
+                    ready.LastSuccessfulUpdateUtc,
+                    stale.LastSuccessfulUpdateUtc);
+                Assert.AreEqual(ready.MembershipHash, stale.MembershipHash);
+                Assert.AreEqual(
+                    ready.GroupConfigurationVersion,
+                    stale.GroupConfigurationVersion);
+                CollectionAssert.AreEquivalent(ready.Groups.Keys, stale.Groups.Keys);
+                CollectionAssert.AreEquivalent(ready.Accounts.Keys, stale.Accounts.Keys);
+                Assert.AreEqual(
+                    ready.Accounts["ACC1"].NetLiquidation,
+                    stale.Accounts["ACC1"].NetLiquidation);
             });
         }
 
@@ -1548,17 +1703,23 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             internal List<int> CanceledAccountIds { get; } = new();
             internal Action ExternalCallProbe { get; set; } = () => { };
             internal string ManagedAccounts { get; set; } = "MASTER,ACC1,ACC2,ACC3";
+            internal string EndingManagedAccounts { get; set; }
             internal string GroupsDocument { get; set; } = GroupsXml;
             internal string EndingGroupsDocument { get; set; } = GroupsXml;
             internal string AliasesDocument { get; set; } = AliasesXml;
+            internal string EndingAliasesDocument { get; set; }
             internal FamilyCode[] FamilyCodes { get; set; } =
             {
                 new() { AccountID = "ACC1", FamilyCodeStr = "Family-A" },
                 new() { AccountID = "ACC2", FamilyCodeStr = "Family-B" },
                 new() { AccountID = "ACC3", FamilyCodeStr = "Family-C" }
             };
+            internal FamilyCode[] EndingFamilyCodes { get; set; }
             internal int GroupsRequestCount { get; private set; }
             internal int MaximumConcurrentExternalCalls => _maximumConcurrentExternalCalls;
+            private int _managedAccountsRequestCount;
+            private int _aliasesRequestCount;
+            private int _familyCodesRequestCount;
             private int _activeExternalCalls;
             private int _maximumConcurrentExternalCalls;
 
@@ -1572,24 +1733,32 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             RunAuthorized(authorize, () =>
                             {
                                 Requests.Add("managed");
-                                Client.managedAccounts(ManagedAccounts);
+                                Client.managedAccounts(
+                                    ++_managedAccountsRequestCount % 2 == 1
+                                        ? ManagedAccounts
+                                        : EndingManagedAccounts ?? ManagedAccounts);
                             }),
                         RequestFinancialAdvisor = (faDataType, authorize) =>
                             RunAuthorized(authorize, () =>
                             {
                                 Requests.Add($"fa:{faDataType}");
                                 var document = faDataType == 1
-                                    ? ++GroupsRequestCount == 1
+                                    ? ++GroupsRequestCount % 2 == 1
                                         ? GroupsDocument
                                         : EndingGroupsDocument
-                                    : AliasesDocument;
+                                    : ++_aliasesRequestCount % 2 == 1
+                                        ? AliasesDocument
+                                        : EndingAliasesDocument ?? AliasesDocument;
                                 Client.receiveFA(faDataType, document);
                             }),
                         RequestFamilyCodes = authorize =>
                             RunAuthorized(authorize, () =>
                             {
                                 Requests.Add("family");
-                                Client.familyCodes(FamilyCodes);
+                                Client.familyCodes(
+                                    ++_familyCodesRequestCount % 2 == 1
+                                        ? FamilyCodes
+                                        : EndingFamilyCodes ?? FamilyCodes);
                             }),
                         RequestPositions = (requestId, accountOrGroup, authorize) =>
                             RunAuthorized(
