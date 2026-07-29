@@ -199,6 +199,21 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [Test]
+        public void ConfiguredGroupFilterRejectsAdditionalAccountRefreshWithoutThrowingTest()
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                GroupName,
+                unifiedGroupsEnabled: true);
+            var accepted = true;
+
+            Assert.DoesNotThrow(() =>
+                accepted = scenario.Brokerage.RequestAccountSnapshotRefresh(
+                    new[] { GroupName },
+                    new[] { AccountId }));
+            Assert.IsFalse(accepted);
+        }
+
         private static FieldInfo GetRequiredField(string name)
         {
             return typeof(InteractiveBrokersBrokerage).GetField(name, InstanceNonPublic)

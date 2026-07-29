@@ -68,6 +68,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             ArgumentNullException.ThrowIfNull(groupNames);
             if (!string.IsNullOrWhiteSpace(_financialAdvisorsGroupFilter))
             {
+                if (additionalAccountIds?.Count > 0)
+                {
+                    return false;
+                }
+
                 if (groupNames.Any(group => !string.Equals(
                     group?.Trim(), _financialAdvisorsGroupFilter, StringComparison.OrdinalIgnoreCase)))
                 {
