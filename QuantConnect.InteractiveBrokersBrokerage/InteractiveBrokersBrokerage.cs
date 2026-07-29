@@ -1023,8 +1023,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     // request account information for logging purposes
                     var group = string.IsNullOrEmpty(_financialAdvisorsGroupFilter) ? "All" : _financialAdvisorsGroupFilter;
                     _client.ClientSocket.reqAccountSummary(GetNextId(), group, "AccountType");
-                    _client.ClientSocket.reqManagedAccts();
-                    _client.ClientSocket.reqFamilyCodes();
+                    if (!FinancialAdvisorServiceOwnsStartupRequests)
+                    {
+                        _client.ClientSocket.reqManagedAccts();
+                        _client.ClientSocket.reqFamilyCodes();
+                    }
 
                     if (IsFinancialAdvisor)
                     {

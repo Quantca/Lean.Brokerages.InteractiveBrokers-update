@@ -121,6 +121,25 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase(false, false, false)]
+        [TestCase(false, true, false)]
+        [TestCase(true, false, false)]
+        [TestCase(true, true, true)]
+        public void FinancialAdvisorServiceOwnsOnlyUnifiedFinancialAdvisorStartupRequestsTest(
+            bool unifiedGroupsEnabled,
+            bool isFinancialAdvisor,
+            bool expected)
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                string.Empty,
+                unifiedGroupsEnabled,
+                isFinancialAdvisor);
+
+            Assert.AreEqual(
+                expected,
+                scenario.Brokerage.FinancialAdvisorServiceOwnsStartupRequests);
+        }
+
         [TestCase(false, false)]
         [TestCase(false, true)]
         [TestCase(true, false)]

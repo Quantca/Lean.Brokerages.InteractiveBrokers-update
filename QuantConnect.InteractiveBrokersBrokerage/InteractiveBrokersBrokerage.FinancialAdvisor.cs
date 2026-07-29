@@ -41,6 +41,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _financialAdvisorUnifiedGroupsEnabled;
         private InteractiveBrokersFinancialAdvisorAccountState _financialAdvisorAccountState;
 
+        internal bool FinancialAdvisorServiceOwnsStartupRequests =>
+            _financialAdvisorUnifiedGroupsEnabled && IsFinancialAdvisor;
+
         /// <inheritdoc/>
         public BrokerageAccountSnapshot GetAccountSnapshot()
         {
