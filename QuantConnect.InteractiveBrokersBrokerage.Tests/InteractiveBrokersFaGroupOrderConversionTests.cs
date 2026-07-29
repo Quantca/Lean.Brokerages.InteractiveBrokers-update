@@ -206,6 +206,40 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void UnknownSavedAllocationMethodIsRejectedOnlyWithReadyAuthorityTest()
+        {
+            var group = new BrokerageAccountGroup(
+                FaGroupName,
+                "FutureMethod",
+                new[] { "ManagedAccount" });
+            var order = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                FaMethod = "PctChange",
+                FaPercentage = "1"
+            };
+
+            foreach (var status in Enum.GetValues<BrokerageAccountSnapshotStatus>()
+                .Where(status => status != BrokerageAccountSnapshotStatus.Ready))
+            {
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        CreateSnapshot(status, group)));
+            }
+
+            var exception = Assert.Throws<NotSupportedException>(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    order,
+                    CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, group)));
+            Assert.Multiple(() =>
+            {
+                StringAssert.Contains("FutureMethod", exception.Message);
+                StringAssert.Contains("Supported saved allocation methods", exception.Message);
+            });
+        }
+
+        [Test]
         public void AdmissionValidationFailureLeavesBrokerageOrderStateUntouchedTest()
         {
             var brokerage = CreateOfflineBrokerage();
@@ -489,7 +523,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 new Dictionary<string, decimal> { ["ManagedAccount"] = 100m });
             pctChangeOrder.FaGroup = monetary.Name;
             StringAssert.Contains(
-                "unsupported MonetaryAmount",
+                "unsupported saved allocation method 'MonetaryAmount'",
                 Assert.Throws<NotSupportedException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         pctChangeOrder,

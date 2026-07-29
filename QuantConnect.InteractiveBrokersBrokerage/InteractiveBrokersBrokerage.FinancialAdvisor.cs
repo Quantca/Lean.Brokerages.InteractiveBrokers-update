@@ -320,10 +320,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var savedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(group.AllocationMethod);
             var requestedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
-            if (savedMethod.Equals("MonetaryAmount", StringComparison.OrdinalIgnoreCase))
+            if (savedMethod is not ("ContractsOrShares" or "Ratio" or "Percent" or
+                "NetLiq" or "AvailableEquity" or "Equal" or "PctChange"))
             {
                 throw new NotSupportedException(
-                    $"Financial Advisor group '{group.Name}' uses the unsupported MonetaryAmount allocation method.");
+                    $"Financial Advisor group '{group.Name}' uses unsupported saved allocation method " +
+                    $"'{group.AllocationMethod}'. Supported saved allocation methods are ContractsOrShares, " +
+                    "Ratio, Percent, NetLiq, AvailableEquity, Equal, and PctChange.");
             }
             if (requestedMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
             {
