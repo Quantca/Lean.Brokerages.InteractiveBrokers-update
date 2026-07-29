@@ -1605,12 +1605,25 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 faDataType == GroupsFaDataType ? "FA groups" : "FA aliases")
                 .ConfigureAwait(false)).Text;
 
-        private async Task<FamilyCode[]> RequestFamilyCodesAsync(SnapshotScope scope) =>
+        private static IReadOnlyDictionary<string, string> ToFamilyCodeDictionary(
+            IEnumerable<FamilyCodeRow> rows)
+        {
+            IEnumerable<FamilyCode> familyCodes =
+                (rows ?? Enumerable.Empty<FamilyCodeRow>())
+                    .Select(row => new FamilyCode
+                    {
+                        AccountID = row.AccountId,
+                        FamilyCodeStr = row.Code
+                    });
+            return ToFamilyCodeDictionary(familyCodes);
+        }
+
+        private async Task<FamilyCodeRow[]> RequestFamilyCodesAsync(SnapshotScope scope) =>
             (await SendUnkeyedAsync(
                 scope, PendingKind.FamilyCodes, 0, _requests.RequestFamilyCodes,
-                "family codes").ConfigureAwait(false)).FamilyCodes;
+                "family codes").ConfigureAwait(false)).FamilyCodeRows;
 
-        private async Task<IReadOnlyList<PositionMultiEventArgs>> RequestPositionsAsync(
+        private async Task<IReadOnlyList<PositionRow>> RequestPositionsAsync(
             SnapshotScope scope, string accountOrGroup)
         {
             var requestId = NextRequestId();
@@ -1992,13 +2005,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 PendingKind.FinancialAdvisor, args.FaDataType,
                 args.FaXmlData, null);
 
-        private void OnFamilyCodes(object sender, FamilyCodesEventArgs args) =>
+        private void OnFamilyCodes(object sender, FamilyCodesEventArgs args)
+        {
+            var familyCodeRows = (args.FamilyCodes ?? Array.Empty<FamilyCode>())
+                .Select(familyCode => new FamilyCodeRow(familyCode))
+                .ToArray();
             CompleteUnkeyed(
-                PendingKind.FamilyCodes, null, null,
-                args.FamilyCodes ?? Array.Empty<FamilyCode>());
+                PendingKind.FamilyCodes, null, null, familyCodeRows);
+        }
 
         private void CompleteUnkeyed(
-            PendingKind kind, int? faDataType, string text, FamilyCode[] familyCodes)
+            PendingKind kind, int? faDataType, string text, FamilyCodeRow[] familyCodeRows)
         {
             PendingRequest completed = null;
             lock (_callbackStateLock)
@@ -2013,9 +2030,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     {
                         completed.Text = text;
                     }
-                    if (familyCodes != null)
+                    if (familyCodeRows != null)
                     {
-                        completed.FamilyCodes = familyCodes;
+                        completed.FamilyCodeRows = familyCodeRows;
                     }
                     completed.Finished = true;
                 }
@@ -2045,7 +2062,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     if (position != null)
                     {
-                        pending.PositionRows.Add(position);
+                        pending.PositionRows.Add(new PositionRow(position));
                     }
                     if (account != null)
                     {
@@ -2121,7 +2138,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         private void AddPosition(
-            PositionMultiEventArgs row,
+            PositionRow row,
             IDictionary<string, Dictionary<(Symbol, string), BrokerageAccountPosition>> positions,
             IDictionary<string, Dictionary<string, BrokerageAccountUnmappedPosition>> unmapped)
         {
@@ -2129,16 +2146,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 return;
             }
+            var contract = row.CreateContract();
             BrokerageAccountPosition value;
             try
             {
                 value = new BrokerageAccountPosition(
-                    _mapSymbol(row.Contract), row.Position,
-                    NormalizeAveragePrice(row.Contract, row.AverageCost), row.ModelCode);
+                    _mapSymbol(contract), row.Position,
+                    NormalizeAveragePrice(contract, row.AverageCost), row.ModelCode);
             }
             catch (Exception exception)
             {
-                var unknownValue = CreateUnmappedPosition(row, exception.Message);
+                var unknownValue = CreateUnmappedPosition(
+                    row.CreateEventArgs(contract),
+                    exception.Message);
                 if (!unmapped.TryGetValue(row.Account, out var accountPositions))
                 {
                     unmapped[row.Account] = accountPositions =
@@ -2502,6 +2522,86 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             Replacement
         }
 
+        private sealed class PositionRow
+        {
+            internal string Account { get; }
+            internal string ModelCode { get; }
+            internal decimal Position { get; }
+            internal double AverageCost { get; }
+            internal bool HasContract { get; }
+            internal int ConId { get; }
+            internal string Symbol { get; }
+            internal string LocalSymbol { get; }
+            internal string SecurityType { get; }
+            internal string Currency { get; }
+            internal string Exchange { get; }
+            internal string PrimaryExchange { get; }
+            internal string TradingClass { get; }
+            internal string Expiration { get; }
+            internal double Strike { get; }
+            internal string Right { get; }
+            internal string Multiplier { get; }
+
+            internal PositionRow(PositionMultiEventArgs row)
+            {
+                Account = row.Account;
+                ModelCode = row.ModelCode;
+                Position = row.Position;
+                AverageCost = row.AverageCost;
+                var contract = row.Contract;
+                HasContract = contract != null;
+                if (!HasContract)
+                {
+                    return;
+                }
+                ConId = contract.ConId;
+                Symbol = contract.Symbol;
+                LocalSymbol = contract.LocalSymbol;
+                SecurityType = contract.SecType;
+                Currency = contract.Currency;
+                Exchange = contract.Exchange;
+                PrimaryExchange = contract.PrimaryExch;
+                TradingClass = contract.TradingClass;
+                Expiration = contract.LastTradeDateOrContractMonth;
+                Strike = contract.Strike;
+                Right = contract.Right;
+                Multiplier = contract.Multiplier;
+            }
+
+            internal Contract CreateContract() => !HasContract
+                ? null
+                : new Contract
+                {
+                    ConId = ConId,
+                    Symbol = Symbol,
+                    LocalSymbol = LocalSymbol,
+                    SecType = SecurityType,
+                    Currency = Currency,
+                    Exchange = Exchange,
+                    PrimaryExch = PrimaryExchange,
+                    TradingClass = TradingClass,
+                    LastTradeDateOrContractMonth = Expiration,
+                    Strike = Strike,
+                    Right = Right,
+                    Multiplier = Multiplier
+                };
+
+            internal PositionMultiEventArgs CreateEventArgs(Contract contract) =>
+                new(0, Account, ModelCode, contract, Position, AverageCost);
+        }
+
+        private sealed class FamilyCodeRow
+        {
+            internal string AccountId { get; }
+            internal string Code { get; }
+
+            internal FamilyCodeRow(FamilyCode familyCode)
+            {
+                AccountId = familyCode?.AccountID;
+                Code = familyCode?.FamilyCodeStr;
+            }
+        }
+
         private sealed class PendingRequest
         {
             internal SnapshotScope Scope { get; }
@@ -2510,9 +2610,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal int FaDataType { get; }
             internal TaskCompletionSource<PendingRequest> Completion { get; } =
                 new(TaskCreationOptions.RunContinuationsAsynchronously);
-            internal List<PositionMultiEventArgs> PositionRows { get; } = new();
+            internal List<PositionRow> PositionRows { get; } = new();
             internal List<AccountUpdateMultiEventArgs> AccountRows { get; } = new();
-            internal FamilyCode[] FamilyCodes { get; set; } = Array.Empty<FamilyCode>();
+            internal FamilyCodeRow[] FamilyCodeRows { get; set; } =
+                Array.Empty<FamilyCodeRow>();
             internal string Text { get; set; } = string.Empty;
             internal bool WireSent { get; set; }
             internal bool Finished { get; set; }

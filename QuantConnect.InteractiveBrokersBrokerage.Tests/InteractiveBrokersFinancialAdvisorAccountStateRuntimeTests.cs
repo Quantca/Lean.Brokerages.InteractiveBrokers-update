@@ -1668,6 +1668,80 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [Test]
+        public async Task PublicCallbackPayloadMutationCannotAffectSnapshotTest()
+        {
+            static FamilyCode[] CreateFamilyCodes() =>
+            [
+                new() { AccountID = "ACC1", FamilyCodeStr = "Family-A" },
+                new() { AccountID = "ACC2", FamilyCodeStr = "Family-B" },
+                new() { AccountID = "ACC3", FamilyCodeStr = "Family-C" }
+            ];
+            using var scenario = new Scenario
+            {
+                FamilyCodes = CreateFamilyCodes(),
+                EndingFamilyCodes = CreateFamilyCodes()
+            };
+            var positionCallbacks = 0;
+            var familyCodeCallbacks = 0;
+            scenario.Client.UpdatePortfolio += (_, args) =>
+            {
+                if (!args.PositionsMultiRequestId.HasValue || args.Contract == null)
+                {
+                    return;
+                }
+                positionCallbacks++;
+                args.Contract.ConId = -1;
+                args.Contract.Symbol = "PUBLIC_MUTATION";
+                args.Contract.LocalSymbol = "PUBLIC_MUTATION";
+                args.Contract.SecType = "FUT";
+                args.Contract.Currency = "EUR";
+                args.Contract.Exchange = "PUBLIC";
+                args.Contract.PrimaryExch = "PUBLIC";
+                args.Contract.TradingClass = "PUBLIC";
+                args.Contract.LastTradeDateOrContractMonth = "19000101";
+                args.Contract.Strike = 999d;
+                args.Contract.Right = "P";
+                args.Contract.Multiplier = "100";
+            };
+            scenario.Client.FamilyCodes += (_, args) =>
+            {
+                familyCodeCallbacks++;
+                foreach (var familyCode in args.FamilyCodes)
+                {
+                    familyCode.AccountID = "PUBLIC_MUTATION";
+                    familyCode.FamilyCodeStr = "PUBLIC_MUTATION";
+                }
+            };
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var mapped = snapshot.Accounts["ACC1"].Positions.Single();
+            var unmapped = snapshot.Accounts["ACC2"].UnmappedPositions.Single();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(2, positionCallbacks);
+                Assert.AreEqual(2, familyCodeCallbacks);
+                Assert.AreEqual("SPY", mapped.Symbol.Value);
+                Assert.AreEqual("202", unmapped.BrokerageContractId);
+                Assert.AreEqual("UNMAPPED", unmapped.BrokerageSymbol);
+                Assert.AreEqual("USD", unmapped.Currency);
+                Assert.AreEqual(
+                    "Family-A",
+                    snapshot.AccountDirectory["ACC1"].FamilyCode);
+                Assert.AreEqual(
+                    "Family-B",
+                    snapshot.AccountDirectory["ACC2"].FamilyCode);
+                CollectionAssert.DoesNotContain(
+                    snapshot.AccountDirectory.Keys,
+                    "PUBLIC_MUTATION");
+            });
+        }
+
         private static async Task<BrokerageAccountSnapshot> RunRefreshAsync(
             InteractiveBrokersFinancialAdvisorAccountState state,
             Func<bool> request)
