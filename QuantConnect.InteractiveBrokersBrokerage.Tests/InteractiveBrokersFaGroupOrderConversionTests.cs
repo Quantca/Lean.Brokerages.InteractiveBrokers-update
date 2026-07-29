@@ -532,64 +532,105 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             algorithm.AddEquity("SPY");
             var brokerage = CreateOfflineBrokerage(algorithm);
             UnifiedGroupsField.SetValue(brokerage, true);
-
-            foreach (var recoveryPass in new[] { "startup", "reconnect" })
+            using var client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
+            ClientField.SetValue(brokerage, client);
+            var contract = new Contract
             {
-                var groupOrder = RecoverOrder(brokerage, new IBApi.Order
+                Symbol = "SPY",
+                SecType = IB.SecurityType.Stock,
+                Exchange = "SMART",
+                Currency = "USD"
+            };
+            var orderState = new OrderState { Status = "Submitted" };
+            IBApi.Order groupIbOrder = null;
+            IBApi.Order directIbOrder = null;
+            var requestCount = 0;
+            client.Error += (_, _) =>
+            {
+                requestCount++;
+                if (requestCount % 2 == 0)
                 {
-                    Account = FaMasterAccount,
-                    FaGroup = FaGroupName,
-                    FaMethod = "NetLiq",
-                    FaPercentage = "12.5",
-                    TotalQuantity = 19.75m,
-                    Action = "BUY",
-                    OrderType = "LMT",
-                    LmtPrice = 100d,
-                    Tif = IB.TimeInForce.GoodTillCancel,
-                    OutsideRth = true,
-                    OrderId = recoveryPass == "startup" ? 10 : 20
-                });
-                var directOrder = RecoverOrder(brokerage, new IBApi.Order
-                {
-                    Account = "DU1234567",
-                    TotalQuantity = 0.5m,
-                    Action = "BUY",
-                    OrderType = "LMT",
-                    LmtPrice = 100d,
-                    Tif = IB.TimeInForce.Day,
-                    OrderId = recoveryPass == "startup" ? 11 : 21
-                });
+                    client.openOrder(
+                        groupIbOrder.OrderId, contract, groupIbOrder, orderState);
+                    client.openOrder(
+                        directIbOrder.OrderId, contract, directIbOrder, orderState);
+                }
+                client.openOrderEnd();
+            };
 
-                var groupProperties =
-                    (InteractiveBrokersOrderProperties)groupOrder.Properties;
-                var directProperties =
-                    (InteractiveBrokersOrderProperties)directOrder.Properties;
-                var orderProvider = new OrderProvider(
-                    new List<LeanOrder> { groupOrder, directOrder });
-                var mutationBlockingOrders = orderProvider.GetOpenOrders(order =>
-                    FAState.IsFinancialAdvisorGroupOrder(order, string.Empty));
-
-                Assert.Multiple(() =>
+            try
+            {
+                foreach (var recoveryPass in new[] { "startup", "reconnect" })
                 {
-                    Assert.AreEqual(19.75m, groupOrder.Quantity, recoveryPass);
-                    Assert.AreEqual(FaGroupName, groupProperties.FaGroup, recoveryPass);
-                    Assert.IsEmpty(groupProperties.Account, recoveryPass);
-                    Assert.AreEqual("NetLiq", groupProperties.FaMethod, recoveryPass);
-                    Assert.AreEqual(12.5m, groupProperties.ExactFaPercentage, recoveryPass);
-                    Assert.AreEqual(TimeInForce.GoodTilCanceled.GetType(),
-                        groupProperties.TimeInForce.GetType(), recoveryPass);
-                    Assert.IsTrue(
-                        groupProperties.OutsideRegularTradingHours, recoveryPass);
-                    Assert.AreEqual(0.5m, directOrder.Quantity, recoveryPass);
-                    Assert.AreEqual(
-                        "DU1234567", directProperties.Account, recoveryPass);
-                    Assert.IsEmpty(directProperties.FaGroup, recoveryPass);
-                    Assert.AreEqual(1, mutationBlockingOrders.Count, recoveryPass);
-                    Assert.AreEqual(
-                        groupOrder.BrokerId.Single(),
-                        mutationBlockingOrders[0].BrokerId.Single(),
-                        recoveryPass);
-                });
+                    groupIbOrder = new IBApi.Order
+                    {
+                        Account = FaMasterAccount,
+                        FaGroup = FaGroupName,
+                        FaMethod = "NetLiq",
+                        FaPercentage = "12.5",
+                        TotalQuantity = 19.75m,
+                        Action = "BUY",
+                        OrderType = "LMT",
+                        LmtPrice = 100d,
+                        Tif = IB.TimeInForce.GoodTillCancel,
+                        OutsideRth = true,
+                        OrderId = recoveryPass == "startup" ? 10 : 20
+                    };
+                    directIbOrder = new IBApi.Order
+                    {
+                        Account = "DU1234567",
+                        TotalQuantity = 0.5m,
+                        Action = "BUY",
+                        OrderType = "LMT",
+                        LmtPrice = 100d,
+                        Tif = IB.TimeInForce.Day,
+                        OrderId = recoveryPass == "startup" ? 11 : 21
+                    };
+
+                    var recoveredOrders = brokerage.GetOpenOrders();
+                    var groupOrder = recoveredOrders.Single(order =>
+                        ((InteractiveBrokersOrderProperties)order.Properties).FaGroup ==
+                        FaGroupName);
+                    var directOrder = recoveredOrders.Single(order =>
+                        ((InteractiveBrokersOrderProperties)order.Properties).Account ==
+                        "DU1234567");
+
+                    var groupProperties =
+                        (InteractiveBrokersOrderProperties)groupOrder.Properties;
+                    var directProperties =
+                        (InteractiveBrokersOrderProperties)directOrder.Properties;
+                    var orderProvider = new OrderProvider(recoveredOrders);
+                    var mutationBlockingOrders = orderProvider.GetOpenOrders(order =>
+                        FAState.IsFinancialAdvisorGroupOrder(order, string.Empty));
+
+                    Assert.Multiple(() =>
+                    {
+                        Assert.AreEqual(2, recoveredOrders.Count, recoveryPass);
+                        Assert.AreEqual(19.75m, groupOrder.Quantity, recoveryPass);
+                        Assert.AreEqual(FaGroupName, groupProperties.FaGroup, recoveryPass);
+                        Assert.IsEmpty(groupProperties.Account, recoveryPass);
+                        Assert.AreEqual("NetLiq", groupProperties.FaMethod, recoveryPass);
+                        Assert.AreEqual(12.5m, groupProperties.ExactFaPercentage, recoveryPass);
+                        Assert.AreEqual(TimeInForce.GoodTilCanceled.GetType(),
+                            groupProperties.TimeInForce.GetType(), recoveryPass);
+                        Assert.IsTrue(
+                            groupProperties.OutsideRegularTradingHours, recoveryPass);
+                        Assert.AreEqual(0.5m, directOrder.Quantity, recoveryPass);
+                        Assert.AreEqual(
+                            "DU1234567", directProperties.Account, recoveryPass);
+                        Assert.IsEmpty(directProperties.FaGroup, recoveryPass);
+                        Assert.AreEqual(1, mutationBlockingOrders.Count, recoveryPass);
+                        Assert.AreEqual(
+                            groupOrder.BrokerId.Single(),
+                            mutationBlockingOrders[0].BrokerId.Single(),
+                            recoveryPass);
+                    });
+                }
+                Assert.AreEqual(4, requestCount);
+            }
+            finally
+            {
+                ClientField.SetValue(brokerage, null);
             }
         }
 
