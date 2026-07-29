@@ -1196,14 +1196,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 var sent = PaceAndInvoke(
                     pending,
                     authorize => _requests.ReplaceFinancialAdvisor(
-                        requestId, GroupsFaDataType, xml, authorize),
+                        requestId, GroupsFaDataType, xml, () =>
+                        {
+                            if (!authorize())
+                            {
+                                return false;
+                            }
+                            pending.WireSent = true;
+                            return true;
+                        }),
                     cancellation: false);
                 if (!sent)
                 {
                     await pending.Completion.Task.ConfigureAwait(false);
                     return;
                 }
-                pending.WireSent = true;
                 item.ReplacementStarted = true;
                 await AwaitPendingAsync(
                     pending,
@@ -1212,6 +1219,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             catch
             {
+                item.ReplacementStarted = pending.WireSent;
                 item.ReplacementRejected = pending.ExplicitlyRejected;
                 throw;
             }

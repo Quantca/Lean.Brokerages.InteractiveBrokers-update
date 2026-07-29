@@ -108,7 +108,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             using (var preWireScenario = new MutationScenario
             {
-                Replacement = ReplacementBehavior.ThrowBeforeReturn
+                Replacement = ReplacementBehavior.ThrowBeforeAuthorization
             })
             using (var preWireState = preWireScenario.CreateState())
             {
@@ -127,6 +127,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         BrokerageAccountSnapshotStatus.Ready,
                         preWireState.Snapshot.Status);
                     Assert.IsFalse(preWireState.IsGroupTradingBlocked);
+                });
+            }
+
+            using (var authorizedScenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.ThrowAfterAuthorization
+            })
+            using (var authorizedState = authorizedScenario.CreateState())
+            {
+                var ready = await ReadyAsync(authorizedState);
+                Assert.IsTrue(RequestChangedAllocation(authorizedState, ready));
+                var failed = await AllocationTerminalAsync(authorizedState);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                        failed.Status);
+                    StringAssert.Contains(
+                        "replaceFA may have applied", failed.ErrorMessage);
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Stale,
+                        authorizedState.Snapshot.Status);
+                    Assert.IsTrue(authorizedState.IsGroupTradingBlocked);
                 });
             }
 
@@ -697,7 +721,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             using var scenario = new MutationScenario
             {
-                Replacement = ReplacementBehavior.ThrowBeforeReturn
+                Replacement = ReplacementBehavior.ThrowBeforeAuthorization
             };
             using var state = scenario.CreateState();
             var ready = await ReadyAsync(state);
@@ -749,7 +773,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             using var scenario = new MutationScenario
             {
-                Replacement = ReplacementBehavior.ThrowBeforeReturn
+                Replacement = ReplacementBehavior.ThrowBeforeAuthorization
             };
             using var state = scenario.CreateState();
             var ready = await ReadyAsync(state);
@@ -1013,7 +1037,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             Success,
             WrongIdsThenSuccess,
-            ThrowBeforeReturn,
+            ThrowBeforeAuthorization,
+            ThrowAfterAuthorization,
             ReturnWithoutCompletion,
             EndWithoutApplying,
             InvalidAccountsError,
@@ -1263,6 +1288,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 string xml,
                 Func<bool> authorize)
             {
+                if (Replacement == ReplacementBehavior.ThrowBeforeAuthorization)
+                {
+                    throw new InvalidOperationException(
+                        "replaceFA failed before authorization.");
+                }
                 return RunAuthorized(authorize, () =>
                 {
                     ObserveMonitor(ref _replaceObservedUnderMonitor);
@@ -1270,9 +1300,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Volatile.Write(ref _replacementRequestId, requestId);
                     switch (Replacement)
                     {
-                        case ReplacementBehavior.ThrowBeforeReturn:
+                        case ReplacementBehavior.ThrowAfterAuthorization:
                             throw new InvalidOperationException(
-                                "replaceFA failed before returning.");
+                                "replaceFA failed after authorization.");
 
                         case ReplacementBehavior.ReturnWithoutCompletion:
                             break;
