@@ -149,6 +149,8 @@ Snapshot discovery is read-only and publishes structurally valid groups even whe
 
 The C# and Python `FinancialAdvisorGroupAssignmentAlgorithm` samples demonstrate alias-driven group movement. Configure `fa-alias-pattern` with a case-insensitive regular expression, `fa-target-group` with an existing destination group, and `fa-cash-change-threshold` with the desired account-value threshold. Set `fa-allocation-value` to a non-negative value for `ContractsOrShares`, a positive value for `Ratio` or `Percent`, and no value for computed methods. An exact empty `fa-target-group` removes each matching managed account from all groups. The sample serializes assignments, polls their immutable results, and obtains a confirming snapshot generation before reevaluating membership after a cash or net-liquidation change.
 
+The C# and Python `FinancialAdvisorDemoAlgorithm` samples require `ib-financial-advisors-unified-groups-enabled=true` and expect a group saved with a computed method (`Equal`, `NetLiq`, or `AvailableEquity`) or with `Ratio`/`Percent`. A `ContractsOrShares` group instead requires updating its complete saved allocation vector, confirming the readback, and then submitting an aggregate parent whose exact quantity matches that vector's total. Use `FinancialAdvisorGroupAssignmentAlgorithm` as the mutation/readback workflow reference for this case.
+
 Identifiers in common account snapshots are compared case-insensitively. Mutation requests should reuse the account and group spelling supplied by the brokerage provider so the provider's canonical spelling reaches TWS.
 
 #### Snapshot Freshness
