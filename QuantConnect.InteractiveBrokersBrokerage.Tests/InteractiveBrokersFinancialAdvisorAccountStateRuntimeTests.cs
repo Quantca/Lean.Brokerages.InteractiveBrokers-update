@@ -238,6 +238,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     scenario.Client.managedAccounts(scenario.ManagedAccounts);
                 });
             scenario.Client.nextValidId(123);
+            Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+            scenario.Client.connectionClosed();
+            scenario.Client.nextValidId(124);
 
             var recovered = await RunRefreshAsync(
                 state,
@@ -322,6 +325,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     scenario.Client.managedAccounts(scenario.ManagedAccounts);
                 });
             scenario.Client.nextValidId(123);
+            Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+            scenario.Client.connectionClosed();
+            scenario.Client.nextValidId(124);
 
             var recovered = await RunRefreshAsync(
                 state,

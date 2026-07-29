@@ -64,6 +64,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _connected;
         private bool _unkeyedRequestsPoisoned;
         private bool _unkeyedResponseMayStillArrive;
+        private bool _physicalConnectionClosed;
         private bool _disposed;
         private int _nextRequestId = int.MinValue;
         private long _requestVersion;
@@ -143,13 +144,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         internal void MarkConnected() => RestoreConnectivity(clearUnkeyedAmbiguity: true);
 
-        private void RestoreConnectivity(bool clearUnkeyedAmbiguity)
+        private void RestoreConnectivity(
+            bool clearUnkeyedAmbiguity,
+            bool afterNextValidId = false)
         {
             lock (_callbackStateLock)
             {
                 if (_disposed)
                 {
                     return;
+                }
+                if (afterNextValidId)
+                {
+                    clearUnkeyedAmbiguity = _physicalConnectionClosed;
+                    _physicalConnectionClosed = false;
                 }
                 if (clearUnkeyedAmbiguity)
                 {
@@ -161,7 +169,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
-        internal void MarkDisconnected(string reason = null)
+        internal void MarkDisconnected(
+            string reason = null,
+            bool physicalConnectionClosed = false)
         {
             PendingRequest pending;
             long disconnectVersion;
@@ -172,6 +182,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return;
                 }
                 _connected = false;
+                _physicalConnectionClosed |= physicalConnectionClosed;
                 _unkeyedRequestsPoisoned = true;
                 _handshakeManagedAccounts = null;
                 ++_requestVersion;
@@ -1871,10 +1882,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.InternalError -= OnError;
         }
 
-        private void OnNextValidId(object sender, NextValidIdEventArgs args) => MarkConnected();
+        private void OnNextValidId(object sender, NextValidIdEventArgs args) =>
+            RestoreConnectivity(
+                clearUnkeyedAmbiguity: false,
+                afterNextValidId: true);
 
         private void OnConnectionClosed(object sender, EventArgs args) =>
-            MarkDisconnected("Interactive Brokers connection closed.");
+            MarkDisconnected(
+                "Interactive Brokers connection closed.",
+                physicalConnectionClosed: true);
 
         private void OnManagedAccounts(object sender, ManagedAccountsEventArgs args)
         {
