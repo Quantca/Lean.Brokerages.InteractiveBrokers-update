@@ -350,6 +350,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Config.Get("ib-password"),
                 Config.Get("ib-trading-mode"),
                 Config.GetValue("ib-agent-description", IB.AgentDescription.Individual),
+                loadExistingHoldings: true,
+                weeklyRestartUtcTime: null,
                 financialAdvisorsGroupFilter: Config.Get("ib-financial-advisors-group-filter"),
                 financialAdvisorGroupManagementEnabled: Config.GetBool("ib-financial-advisors-group-management-enabled"),
                 financialAdvisorUnifiedGroupsEnabled: Config.GetBool("ib-financial-advisors-unified-groups-enabled")
@@ -390,9 +392,66 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string agentDescription = IB.AgentDescription.Individual,
             bool loadExistingHoldings = true,
             TimeSpan? weeklyRestartUtcTime = null,
-            string financialAdvisorsGroupFilter = default,
-            bool financialAdvisorGroupManagementEnabled = false,
-            bool financialAdvisorUnifiedGroupsEnabled = false)
+            string financialAdvisorsGroupFilter = default)
+            : this(
+                algorithm,
+                orderProvider,
+                securityProvider,
+                account,
+                host,
+                port,
+                ibDirectory,
+                ibVersion,
+                userName,
+                password,
+                tradingMode,
+                agentDescription,
+                loadExistingHoldings,
+                weeklyRestartUtcTime,
+                financialAdvisorsGroupFilter,
+                false,
+                false)
+        {
+        }
+
+        /// <summary>
+        /// Creates a new InteractiveBrokersBrokerage with explicit Financial Advisor feature settings.
+        /// </summary>
+        /// <param name="algorithm">The algorithm instance</param>
+        /// <param name="orderProvider">An instance of IOrderProvider used to fetch Order objects by brokerage ID</param>
+        /// <param name="securityProvider">The security provider used to give access to algorithm securities</param>
+        /// <param name="account">The Interactive Brokers account name</param>
+        /// <param name="host">Host name or IP address of the machine where TWS is running.</param>
+        /// <param name="port">The port specified in the TWS API socket configuration.</param>
+        /// <param name="ibDirectory">The IB Gateway root directory</param>
+        /// <param name="ibVersion">The IB Gateway version</param>
+        /// <param name="userName">The login user name</param>
+        /// <param name="password">The login password</param>
+        /// <param name="tradingMode">The trading mode: 'live' or 'paper'</param>
+        /// <param name="agentDescription">Used for Rule 80A describes the type of trader.</param>
+        /// <param name="loadExistingHoldings">False will ignore existing security holdings from being loaded.</param>
+        /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted on Sundays.</param>
+        /// <param name="financialAdvisorsGroupFilter">The financial advisors group filter associated with this client.</param>
+        /// <param name="financialAdvisorGroupManagementEnabled">Whether unified-group configuration management is enabled.</param>
+        /// <param name="financialAdvisorUnifiedGroupsEnabled">Whether unified Financial Advisor groups are enabled.</param>
+        public InteractiveBrokersBrokerage(
+            IAlgorithm algorithm,
+            IOrderProvider orderProvider,
+            ISecurityProvider securityProvider,
+            string account,
+            string host,
+            int port,
+            string ibDirectory,
+            string ibVersion,
+            string userName,
+            string password,
+            string tradingMode,
+            string agentDescription,
+            bool loadExistingHoldings,
+            TimeSpan? weeklyRestartUtcTime,
+            string financialAdvisorsGroupFilter,
+            bool financialAdvisorGroupManagementEnabled,
+            bool financialAdvisorUnifiedGroupsEnabled)
             : base(BrokerageName)
         {
             Initialize(
