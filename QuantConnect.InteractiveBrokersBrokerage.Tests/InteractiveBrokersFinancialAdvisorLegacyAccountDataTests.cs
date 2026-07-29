@@ -93,6 +93,34 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
         }
 
+        [Test]
+        public void UnifiedGroupsAffectOnlyFinancialAdvisorAccountsTest()
+        {
+            using var upstream = LegacyAccountScenario.CreateUpstream(
+                string.Empty,
+                isFinancialAdvisor: false);
+            using var unified = LegacyAccountScenario.CreateConfigured(
+                string.Empty,
+                unifiedGroupsEnabled: true,
+                isFinancialAdvisor: false);
+
+            Assert.IsFalse(unified.Brokerage.IsFinancialAdvisor);
+            upstream.EmitLegacyRows();
+            unified.EmitLegacyRows();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(upstream.GetCashBalance(), unified.GetCashBalance());
+                Assert.AreEqual(
+                    upstream.GetHoldingQuantity(),
+                    unified.GetHoldingQuantity());
+                Assert.AreEqual(
+                    Convert.ToInt32(ExactPosition),
+                    unified.GetHoldingQuantity(),
+                    "Unified FA settings must preserve upstream holdings precision for a non-FA account.");
+            });
+        }
+
         [TestCase(false, false)]
         [TestCase(false, true)]
         [TestCase(true, false)]
@@ -194,12 +222,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             private LegacyAccountScenario(
                 string financialAdvisorGroupFilter,
                 bool unifiedGroupsEnabled,
-                bool configureFeatures)
+                bool configureFeatures,
+                bool isFinancialAdvisor)
             {
                 Brokerage = new InteractiveBrokersBrokerage();
                 Client = new ReorderableInteractiveBrokersClient();
 
-                AccountField.SetValue(Brokerage, "F-MASTER");
+                AccountField.SetValue(
+                    Brokerage,
+                    isFinancialAdvisor ? "F-MASTER" : AccountId);
                 AlgorithmField.SetValue(Brokerage, new QCAlgorithm());
                 ClientField.SetValue(Brokerage, Client);
                 LoadExistingHoldingsField.SetValue(Brokerage, true);
@@ -244,21 +275,25 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             public static LegacyAccountScenario CreateConfigured(
                 string financialAdvisorGroupFilter,
-                bool unifiedGroupsEnabled)
+                bool unifiedGroupsEnabled,
+                bool isFinancialAdvisor = true)
             {
                 return new LegacyAccountScenario(
                     financialAdvisorGroupFilter,
                     unifiedGroupsEnabled,
-                    configureFeatures: true);
+                    configureFeatures: true,
+                    isFinancialAdvisor: isFinancialAdvisor);
             }
 
             public static LegacyAccountScenario CreateUpstream(
-                string financialAdvisorGroupFilter)
+                string financialAdvisorGroupFilter,
+                bool isFinancialAdvisor = true)
             {
                 return new LegacyAccountScenario(
                     financialAdvisorGroupFilter,
                     unifiedGroupsEnabled: false,
-                    configureFeatures: false);
+                    configureFeatures: false,
+                    isFinancialAdvisor: isFinancialAdvisor);
             }
 
             public void EmitLegacyRows()

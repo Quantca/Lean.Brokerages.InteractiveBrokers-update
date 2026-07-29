@@ -218,7 +218,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             IB.UpdatePortfolioEventArgs eventArgs,
             out decimal position)
         {
-            position = _financialAdvisorUnifiedGroupsEnabled
+            position = _financialAdvisorUnifiedGroupsEnabled && IsFinancialAdvisor
                 ? eventArgs.PositionQuantity
                 : eventArgs.Position;
             return !_financialAdvisorUnifiedGroupsEnabled ||
