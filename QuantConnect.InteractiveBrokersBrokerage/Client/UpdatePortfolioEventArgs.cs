@@ -44,7 +44,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <summary>
         /// Gets the originating positions-multi request identifier, if any.
         /// </summary>
-        internal int? PositionsMultiRequestId { get; }
+        public int? PositionsMultiRequestId { get; }
 
         /// <summary>
         /// The unit price of the instrument.

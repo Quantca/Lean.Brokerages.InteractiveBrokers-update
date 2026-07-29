@@ -87,6 +87,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.Multiple(() =>
             {
+                Assert.IsNotNull(typeof(UpdateAccountValueEventArgs).GetProperty(
+                    nameof(UpdateAccountValueEventArgs.AccountUpdatesMultiRequestId)));
+                Assert.IsNotNull(typeof(UpdatePortfolioEventArgs).GetProperty(
+                    nameof(UpdatePortfolioEventArgs.PositionsMultiRequestId)));
                 Assert.AreEqual(17, accountUpdate.RequestId);
                 Assert.AreEqual("DU123", accountUpdate.Account);
                 Assert.AreEqual("ModelA", accountUpdate.ModelCode);

@@ -45,7 +45,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <summary>
         /// Gets the originating account-updates-multi request identifier, if any.
         /// </summary>
-        internal int? AccountUpdatesMultiRequestId { get; }
+        public int? AccountUpdatesMultiRequestId { get; }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="UpdateAccountValueEventArgs"/> class
