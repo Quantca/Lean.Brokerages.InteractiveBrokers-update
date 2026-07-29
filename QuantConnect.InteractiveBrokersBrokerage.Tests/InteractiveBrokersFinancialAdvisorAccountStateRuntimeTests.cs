@@ -8,6 +8,7 @@
  */
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -251,6 +252,114 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
             Assert.AreEqual(1, recovered.Generation);
+        }
+
+        [Test]
+        public async Task BlockingPublicSubscriberTimeoutRecoversAfterPhysicalReconnectTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var callbacks = new BlockingCollection<Action>();
+            using var subscriberEntered = new ManualResetEventSlim();
+            using var releaseSubscriber = new ManualResetEventSlim();
+            using var lateManagedAccountsDelivered = new ManualResetEventSlim();
+            using var reconnectDelivered = new ManualResetEventSlim();
+            Exception callbackPumpException = null;
+            var callbackPump = Task.Run(() =>
+            {
+                try
+                {
+                    foreach (var callback in callbacks.GetConsumingEnumerable())
+                    {
+                        callback();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    callbackPumpException = exception;
+                }
+            });
+            EventHandler<ReceiveFaEventArgs> blockingSubscriber = (_, _) =>
+            {
+                subscriberEntered.Set();
+                if (!releaseSubscriber.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    throw new TimeoutException("The blocking public subscriber was not released.");
+                }
+            };
+            scenario.Client.ReceiveFa += blockingSubscriber;
+            using var state = scenario.CreateState(
+                requestTimeout: TimeSpan.FromMilliseconds(100));
+            try
+            {
+                callbacks.Add(() =>
+                    scenario.Client.receiveFA(1, Scenario.EmptyGroupsXml));
+                Assert.IsTrue(subscriberEntered.Wait(TimeSpan.FromSeconds(5)));
+
+                scenario.Actions.RequestManagedAccounts = authorize =>
+                    scenario.RunAuthorized(authorize, () =>
+                    {
+                        scenario.Requests.Add("managed-behind-blocked-subscriber");
+                        callbacks.Add(() =>
+                        {
+                            scenario.Client.managedAccounts(scenario.ManagedAccounts);
+                            lateManagedAccountsDelivered.Set();
+                        });
+                    });
+
+                var timeout = await RunRefreshAsync(
+                    state,
+                    () => state.RequestRefresh(Array.Empty<string>()));
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, timeout.Status);
+                    StringAssert.Contains(
+                        "Timed out waiting for IB managed accounts", timeout.ErrorMessage);
+                    Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+                    Assert.IsFalse(lateManagedAccountsDelivered.IsSet);
+                });
+
+                releaseSubscriber.Set();
+                Assert.IsTrue(lateManagedAccountsDelivered.Wait(TimeSpan.FromSeconds(5)));
+                Assert.IsFalse(state.RequestRefresh(Array.Empty<string>()));
+
+                scenario.Actions.RequestManagedAccounts = authorize =>
+                    scenario.RunAuthorized(authorize, () =>
+                    {
+                        scenario.Requests.Add("managed-after-physical-reconnect");
+                        scenario.Client.managedAccounts(scenario.ManagedAccounts);
+                    });
+                callbacks.Add(() =>
+                {
+                    scenario.Client.connectionClosed();
+                    scenario.Client.nextValidId(124);
+                    reconnectDelivered.Set();
+                });
+                Assert.IsTrue(reconnectDelivered.Wait(TimeSpan.FromSeconds(5)));
+
+                var recovered = await WaitForReadyGenerationAsync(state, timeout.Generation);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+                    Assert.AreEqual(timeout.Generation + 1, recovered.Generation);
+                    CollectionAssert.Contains(
+                        scenario.Requests, "managed-after-physical-reconnect");
+                });
+            }
+            finally
+            {
+                scenario.Client.ReceiveFa -= blockingSubscriber;
+                releaseSubscriber.Set();
+                callbacks.CompleteAdding();
+                await Task.WhenAny(
+                    callbackPump, Task.Delay(TimeSpan.FromSeconds(5)));
+            }
+            Assert.Multiple(() =>
+            {
+                Assert.IsTrue(callbackPump.IsCompleted, "The callback pump did not stop.");
+                Assert.IsNull(callbackPumpException);
+            });
         }
 
         [TestCase(1101)]

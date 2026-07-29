@@ -483,6 +483,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Provides public access to the underlying IBClient instance
         /// </summary>
+        /// <remarks>
+        /// Public subscribers share IB's single-threaded message pump and must not block. A blocking subscriber can starve message delivery, including callbacks awaited by the FA service; an unkeyed FA timeout can poison that service until a physical reconnect.
+        /// </remarks>
         public IB.InteractiveBrokersClient Client => _client;
 
         /// <summary>

@@ -161,6 +161,8 @@ A disconnect publishes `Stale`. After a confirmed reconnect, the brokerage issue
 
 If an unkeyed FA request times out, or its socket write fails after authorization, the unkeyed channel remains poisoned until a physical `ConnectionClosed`/`NextValidId` reconnect boundary. Logical connectivity-restored notifications do not clear that ambiguity.
 
+Public subscribers to events exposed through `InteractiveBrokersBrokerage.Client` share IB's single-threaded message pump and must not block. A blocking subscriber can starve IB message delivery for the process, including callbacks awaited by the FA service's own pending requests; for an unkeyed FA request, the resulting timeout can poison the service until a physical reconnect.
+
 During collection, LEAN reads managed accounts, FA groups, account aliases, and family codes before collecting per-account data, then re-reads all four topology sources afterward. It compares canonical group-configuration and complete-membership hashes and aborts publication if any semantic topology value changed. Equivalent callback ordering, managed-account/alias/family-code identifier casing, recognized group/account ordering, XML whitespace, and numeric formatting do not cause false drift.
 
 IB does not provide an atomic operation that checks open orders and replaces FA configuration. Operate one configuration/order writer for each TWS user/session. While a `replaceFA` operation or its reconciliation is in progress, do not submit manual group orders or make manual group edits from TWS, Client Portal, or another API client. LEAN blocks its own conflicting group operations, but it cannot prevent an external client from racing the replacement.
