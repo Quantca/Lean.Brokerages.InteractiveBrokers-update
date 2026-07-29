@@ -169,12 +169,24 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             BrokerageMessageType.ActionRequired,
                             "UnsupportedFinancialAdvisorConfiguration",
                             message)));
+            Message += HandleFinancialAdvisorBrokerageMessage;
             _cancellationTokenSource.Token.Register(DisposeFinancialAdvisorAccountState);
         }
 
         private void DisposeFinancialAdvisorAccountState()
         {
+            Message -= HandleFinancialAdvisorBrokerageMessage;
             _financialAdvisorAccountState?.Dispose();
+        }
+
+        private void HandleFinancialAdvisorBrokerageMessage(
+            object sender,
+            BrokerageMessageEvent message)
+        {
+            if (message.Type == BrokerageMessageType.Reconnect && IsConnected)
+            {
+                _financialAdvisorAccountState?.NotifyBrokerageConnected();
+            }
         }
 
         private void ConfigureFinancialAdvisorFeatures(

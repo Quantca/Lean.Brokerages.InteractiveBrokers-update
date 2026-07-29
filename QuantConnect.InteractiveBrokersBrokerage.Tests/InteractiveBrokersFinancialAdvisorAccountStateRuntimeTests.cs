@@ -333,6 +333,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 {
                     scenario.Client.connectionClosed();
                     scenario.Client.nextValidId(124);
+                    state.NotifyBrokerageConnected();
                     reconnectDelivered.Set();
                 });
                 Assert.IsTrue(reconnectDelivered.Wait(TimeSpan.FromSeconds(5)));
@@ -494,6 +495,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             if (reconnect)
             {
                 scenario.Client.nextValidId(321);
+                state.NotifyBrokerageConnected();
                 refresh = WaitForReadyGenerationAsync(state, previousGeneration);
             }
             else
@@ -554,6 +556,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             if (reconnect)
             {
                 scenario.Client.nextValidId(654);
+                state.NotifyBrokerageConnected();
                 snapshot = await WaitForReadyGenerationAsync(
                     state, previousGeneration);
             }
@@ -588,7 +591,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 unusedScenario.Client.connectionClosed();
                 unusedScenario.Client.nextValidId(123);
+                unusedState.NotifyBrokerageConnected();
                 unusedScenario.Client.nextValidId(124);
+                unusedState.NotifyBrokerageConnected();
 
                 Assert.Multiple(() =>
                 {
@@ -600,16 +605,27 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
 
             using var scenario = new Scenario();
-            using var state = scenario.CreateState();
+            var brokerageConnected = true;
+            using var state = scenario.CreateState(
+                isConnected: () => brokerageConnected);
             var alpha = await RunRefreshAsync(
                 state,
                 () => state.RequestRefresh(new[] { "Alpha" }));
 
             scenario.Client.connectionClosed();
+            brokerageConnected = false;
             Assert.IsFalse(state.RequestRefresh(
                 new[] { "Beta" }, new[] { "ACC3" }));
             scenario.Requests.Clear();
             scenario.Client.nextValidId(125);
+
+            await Task.Delay(50);
+            CollectionAssert.IsEmpty(
+                scenario.Requests,
+                "NextValidId occurs while Connect() still reports IsConnecting.");
+
+            brokerageConnected = true;
+            state.NotifyBrokerageConnected();
             var recovered = await WaitForReadyGenerationAsync(
                 state, alpha.Generation);
 
@@ -632,6 +648,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var requestVersion = GetRequestVersion(state);
 
             scenario.Client.nextValidId(126);
+            state.NotifyBrokerageConnected();
             await Task.Delay(50);
 
             Assert.Multiple(() =>
@@ -678,6 +695,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "Late callbacks remain service-owned until reconnect is confirmed.");
 
             scenario.Client.nextValidId(127);
+            state.NotifyBrokerageConnected();
             var recovered = await WaitForReadyGenerationAsync(
                 state, ready.Generation);
             var reconnectRequestIds = scenario.KeyedRequestIds
@@ -807,6 +825,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsTrue(reconnected.Wait(TimeSpan.FromSeconds(5)));
                 scenario.Actions.RequestManagedAccounts = requestManagedAccounts;
                 releaseOldAction.Set();
+                state.NotifyBrokerageConnected();
                 var recovered = await WaitForReadyGenerationAsync(state, 0);
 
                 Assert.Multiple(() =>
@@ -855,6 +874,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
             Assert.IsTrue(boundaryReturned.Wait(TimeSpan.FromSeconds(5)));
+            state.NotifyBrokerageConnected();
             var recovered = await WaitForReadyGenerationAsync(state, 0);
 
             Assert.Multiple(() =>
@@ -898,6 +918,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 releasePacing.Set();
             }
 
+            state.NotifyBrokerageConnected();
             var recovered = await WaitForReadyGenerationAsync(state, 0);
 
             Assert.Multiple(() =>
@@ -943,6 +964,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 releaseCancelPacing.Set();
             }
 
+            state.NotifyBrokerageConnected();
             var recovered = await WaitForReadyGenerationAsync(state, 0);
 
             Assert.Multiple(() =>
@@ -2116,12 +2138,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 TimeSpan? requestTimeout = null,
                 Action paceRequest = null,
                 Func<Contract, Symbol> mapSymbol = null,
-                Action<string> reportUnsupported = null)
+                Action<string> reportUnsupported = null,
+                Func<bool> isConnected = null)
             {
                 return new InteractiveBrokersFinancialAdvisorAccountState(
                     Client,
                     paceRequest ?? (() => { }),
-                    () => true,
+                    isConnected ?? (() => true),
                     mapSymbol ?? (contract => contract.Symbol == "UNMAPPED"
                             ? throw new InvalidOperationException("No LEAN symbol mapping.")
                             : Symbol.Create(contract.Symbol, SecurityType.Equity, Market.USA)),

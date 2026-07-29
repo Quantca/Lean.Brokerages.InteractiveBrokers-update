@@ -68,6 +68,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _unkeyedResponseMayStillArrive;
         private bool _physicalConnectionClosed;
         private bool _hasRequestedRefresh;
+        private bool _reconnectRefreshPending;
         private bool _disposed;
         private int _nextRequestId = int.MinValue;
         private long _serviceOwnedRequestIdEpochStart = int.MinValue;
@@ -177,8 +178,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _connected = true;
                 if (confirmedReconnect && _hasRequestedRefresh)
                 {
-                    QueueRefresh(_lastRequestedRefreshScope, algorithmRequested: false);
+                    _reconnectRefreshPending = true;
                 }
+            }
+        }
+
+        internal void NotifyBrokerageConnected()
+        {
+            var brokerageConnected = _isConnected();
+            lock (_callbackStateLock)
+            {
+                if (_disposed || !_reconnectRefreshPending || !_connected || !brokerageConnected)
+                {
+                    return;
+                }
+                _reconnectRefreshPending = false;
+                QueueRefresh(_lastRequestedRefreshScope, algorithmRequested: false);
             }
         }
 
@@ -196,6 +211,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 _connected = false;
                 _physicalConnectionClosed |= physicalConnectionClosed;
+                _reconnectRefreshPending = false;
                 _expectingHandshakeManagedAccounts = false;
                 _handshakeManagedAccounts = null;
                 ++_requestVersion;
@@ -465,6 +481,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 _disposed = true;
                 _connected = false;
+                _reconnectRefreshPending = false;
                 pending = _pendingRequest;
                 _pendingRequest = null;
                 worker = _worker;
