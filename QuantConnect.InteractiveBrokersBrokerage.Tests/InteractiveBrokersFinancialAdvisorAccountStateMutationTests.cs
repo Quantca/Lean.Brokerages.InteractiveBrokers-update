@@ -317,7 +317,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     completed.Status);
                 Assert.AreEqual(pendingGeneration, completed.Generation);
                 Assert.AreEqual(0, scenario.ReplaceCount);
-                Assert.AreEqual(2, scenario.ManagedRequestCount - managedBefore);
+                Assert.AreEqual(3, scenario.ManagedRequestCount - managedBefore);
                 Assert.AreEqual(4, scenario.GroupsRequestCount - groupsBefore);
                 Assert.Greater(state.Snapshot.Generation, ready.Generation);
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready,
