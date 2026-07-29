@@ -139,9 +139,15 @@ LEAN supports IB's current unified Allocation Groups model, configured in TWS as
 | `ib-financial-advisors-unified-groups-enabled` | Set to `true` only after confirming that TWS uses unified Allocation Groups. This enables unified-group account discovery, validation, configuration management, and account-state reconciliation. Legacy separate Profiles are not supported by these features. |
 | `ib-financial-advisors-group-management-enabled` | Enables algorithm-initiated membership and saved-allocation updates for existing groups. This setting requires `ib-financial-advisors-unified-groups-enabled=true`. Group creation and deletion are not supported. |
 
+**Account-group movement requires `ib-financial-advisors-group-filter` to be empty and `ib-financial-advisors-group-management-enabled=true`, which implies unified groups. A configured filter rejects movement to any other destination group.**
+
 The supported saved user-specified allocation methods are `ContractsOrShares`, `Ratio`, and `Percent`. TWS may display `Equal` as “Equal Quantity”; LEAN uses IB's `Equal` wire value and normalizes the legacy `EqualQuantity` spelling to it. `MonetaryAmount` group management and execution are not supported.
 
 Group-order validation uses the latest authoritative brokerage snapshot. It deliberately fails open when that snapshot is unavailable, stale, reconnecting, or does not contain the requested group, preserving existing order behavior while IB remains the final authority. A configuration known to use an unsupported Profile or allocation method is rejected. Group configuration writes are stricter: they require ready, version-matched state and readback verification.
+
+The C# and Python `FinancialAdvisorGroupAssignmentAlgorithm` samples demonstrate alias-driven group movement. Configure `fa-alias-pattern` with a case-insensitive regular expression, `fa-target-group` with an existing destination group, `fa-allocation-value` with a positive value for `ContractsOrShares`, `Ratio`, or `Percent`, `fa-cash-change-threshold` with the desired account-value threshold, and `fa-snapshot-refresh-seconds` with the algorithm-owned refresh cadence. An exact empty `fa-target-group` removes each matching managed account from all groups. The sample serializes assignments, polls their immutable results, and obtains a confirming snapshot generation before reevaluating membership after a cash or net-liquidation change.
+
+Identifiers in common account snapshots are compared case-insensitively. Mutation requests should reuse the account and group spelling supplied by the brokerage provider so the provider's canonical spelling reaches TWS.
 
 #### Snapshot Freshness
 
