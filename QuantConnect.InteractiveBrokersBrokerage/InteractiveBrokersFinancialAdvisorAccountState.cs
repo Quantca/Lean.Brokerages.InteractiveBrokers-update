@@ -31,6 +31,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     {
         private const int GroupsFaDataType = 1;
         private const int AliasesFaDataType = 3;
+        private const int FinancialAdvisorUnsavedChangesErrorCode = 10230;
         private const int FinancialAdvisorInvalidAccountsErrorCode = 10231;
         private const int QueueCapacity = 8;
 
@@ -1299,26 +1300,42 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             var deadline = Environment.TickCount64 +
                 Math.Max(1L, (long)_requestTimeout.TotalMilliseconds);
-            while (true)
+            var receivedXml = false;
+            var receivedUnsavedChanges = false;
+            long remainingMilliseconds;
+            while ((remainingMilliseconds =
+                deadline - Environment.TickCount64) > 0)
             {
                 var xml = await RequestFinancialAdvisorXmlAsync(
-                    scope, GroupsFaDataType).ConfigureAwait(false);
-                if (string.Equals(
+                    scope, GroupsFaDataType, retryOnUnsavedChanges: true,
+                    timeout: TimeSpan.FromMilliseconds(remainingMilliseconds))
+                    .ConfigureAwait(false);
+                receivedUnsavedChanges |= xml == null;
+                receivedXml |= xml != null;
+                if (xml != null && string.Equals(
                     ComputeConfigurationHash(xml),
                     expectedConfigurationVersion,
                     StringComparison.Ordinal))
                 {
                     return xml;
                 }
-                var remainingMilliseconds = deadline - Environment.TickCount64;
+                remainingMilliseconds = deadline - Environment.TickCount64;
                 if (remainingMilliseconds <= 0)
                 {
                     break;
                 }
                 await Task.Delay(
                     TimeSpan.FromMilliseconds(
-                        Math.Min(50, remainingMilliseconds)),
+                        Math.Min(xml == null ? 250 : 50, remainingMilliseconds)),
                     _disposeTokenSource.Token).ConfigureAwait(false);
+            }
+            if (receivedUnsavedChanges && !receivedXml)
+            {
+                lock (_callbackStateLock)
+                {
+                    PoisonUnkeyedChannelLocked(
+                        "IB repeatedly reported unsaved Financial Advisor changes.");
+                }
             }
             throw new InvalidOperationException(
                 "IB did not confirm the requested Financial Advisor configuration " +
@@ -1615,12 +1632,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         private async Task<string> RequestFinancialAdvisorXmlAsync(
-            SnapshotScope scope, int faDataType) =>
-            (await SendUnkeyedAsync(
-                scope, PendingKind.FinancialAdvisor, faDataType,
+            SnapshotScope scope,
+            int faDataType,
+            bool retryOnUnsavedChanges = false,
+            TimeSpan? timeout = null)
+        {
+            var pending = await SendUnkeyedAsync(
+                scope, retryOnUnsavedChanges
+                    ? PendingKind.FinancialAdvisorReadback
+                    : PendingKind.FinancialAdvisor, faDataType,
                 authorize => _requests.RequestFinancialAdvisor(faDataType, authorize),
-                faDataType == GroupsFaDataType ? "FA groups" : "FA aliases")
-                .ConfigureAwait(false)).Text;
+                faDataType == GroupsFaDataType ? "FA groups" : "FA aliases",
+                timeout).ConfigureAwait(false);
+            return pending.Text;
+        }
 
         private static IReadOnlyDictionary<string, string> ToFamilyCodeDictionary(
             IEnumerable<FamilyCodeRow> rows)
@@ -1671,7 +1696,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             PendingKind kind,
             int faDataType,
             WireAction send,
-            string description)
+            string description,
+            TimeSpan? timeout = null)
         {
             var pending = InstallPending(
                 scope, kind, 0, faDataType, unkeyed: true);
@@ -1694,7 +1720,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     return await pending.Completion.Task.ConfigureAwait(false);
                 }
-                return await AwaitPendingAsync(pending, description, poisonOnTimeout: true)
+                return await AwaitPendingAsync(
+                    pending, description, poisonOnTimeout: true, timeout: timeout)
                     .ConfigureAwait(false);
             }
             catch (TimeoutException exception) when (sent)
@@ -1797,12 +1824,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             scope.RequestVersion == _requestVersion;
 
         private async Task<PendingRequest> AwaitPendingAsync(
-            PendingRequest pending, string description, bool poisonOnTimeout)
+            PendingRequest pending,
+            string description,
+            bool poisonOnTimeout,
+            TimeSpan? timeout = null)
         {
             try
             {
                 return await pending.Completion.Task
-                    .WaitAsync(_requestTimeout, _disposeTokenSource.Token)
+                    .WaitAsync(timeout ?? _requestTimeout, _disposeTokenSource.Token)
                     .ConfigureAwait(false);
             }
             catch (TimeoutException exception)
@@ -1820,12 +1850,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             _pendingRequest = null;
                             if (pending.WireSent)
                             {
-                                _unkeyedResponseMayStillArrive = true;
-                                _handshakeManagedAccounts = null;
-                                _snapshot = CreateStatusSnapshot(
-                                    _snapshot,
-                                    BrokerageAccountSnapshotStatus.Stale,
-                                    timeoutMessage);
+                                PoisonUnkeyedChannelLocked(timeoutMessage);
                             }
                         }
                         else
@@ -1852,16 +1877,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     if (pending.RequestId == 0 && pending.WireSent && !pending.Finished)
                     {
-                        _unkeyedResponseMayStillArrive = true;
-                        _handshakeManagedAccounts = null;
-                        _snapshot = CreateStatusSnapshot(
-                            _snapshot,
-                            BrokerageAccountSnapshotStatus.Stale,
+                        PoisonUnkeyedChannelLocked(
                             "An authorized unkeyed IB request may have reached TWS; reconnect before retrying.");
                     }
                     _pendingRequest = null;
                 }
             }
+        }
+
+        private void PoisonUnkeyedChannelLocked(string error)
+        {
+            _unkeyedResponseMayStillArrive = true;
+            _handshakeManagedAccounts = null;
+            _snapshot = CreateStatusSnapshot(
+                _snapshot, BrokerageAccountSnapshotStatus.Stale, error);
         }
 
         private bool PaceAndInvoke(
@@ -2039,7 +2068,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 if (!_disposed && !_unkeyedResponseMayStillArrive &&
                     _pendingRequest is { Finished: false } pending &&
-                    pending.Kind == kind &&
+                    (pending.Kind == kind ||
+                     kind == PendingKind.FinancialAdvisor &&
+                     pending.Kind == PendingKind.FinancialAdvisorReadback) &&
                     (!faDataType.HasValue || pending.FaDataType == faDataType.Value))
                 {
                     completed = pending;
@@ -2123,7 +2154,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 RestoreConnectivity(afterNextValidId: false);
                 return;
             }
-            if (args.Id is -1 or 0)
+            var retryUnsavedChanges =
+                args.Code == FinancialAdvisorUnsavedChangesErrorCode &&
+                args.Id is -1 or 0;
+            if (args.Id is -1 or 0 && !retryUnsavedChanges)
             {
                 return;
             }
@@ -2132,25 +2166,39 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             lock (_callbackStateLock)
             {
                 if (_pendingRequest is { Finished: false } pending &&
-                    pending.RequestId == args.Id)
+                    (args.Id is not (-1 or 0) && pending.RequestId == args.Id ||
+                     retryUnsavedChanges &&
+                     pending.Kind == PendingKind.FinancialAdvisorReadback &&
+                     pending.FaDataType == GroupsFaDataType &&
+                     pending.WireSent))
                 {
                     completed = pending;
                     completed.Finished = true;
-                    completed.ExplicitlyRejected =
-                        pending.Kind == PendingKind.Replacement &&
-                        args.Code == FinancialAdvisorInvalidAccountsErrorCode;
-                    failure = pending.Kind == PendingKind.Replacement
-                        ? new InvalidOperationException(
-                            $"IB rejected the Financial Advisor configuration replacement " +
-                            $"({args.Code}): {args.Message}")
-                        : new InvalidOperationException(
-                            $"IB rejected the account-state request " +
-                            $"({args.Code}): {args.Message}");
+                    if (retryUnsavedChanges)
+                    {
+                        completed.Text = null;
+                    }
+                    else
+                    {
+                        completed.ExplicitlyRejected =
+                            pending.Kind == PendingKind.Replacement &&
+                            args.Code == FinancialAdvisorInvalidAccountsErrorCode;
+                        failure = pending.Kind == PendingKind.Replacement
+                            ? new InvalidOperationException(
+                                $"IB rejected the Financial Advisor configuration replacement " +
+                                $"({args.Code}): {args.Message}")
+                            : new InvalidOperationException(
+                                $"IB rejected the account-state request " +
+                                $"({args.Code}): {args.Message}");
+                    }
                 }
             }
             if (completed != null)
             {
-                completed.Completion.TrySetException(failure);
+                if (failure == null)
+                    completed.Completion.TrySetResult(completed);
+                else
+                    completed.Completion.TrySetException(failure);
             }
         }
 
@@ -2533,6 +2581,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             ManagedAccounts,
             FinancialAdvisor,
+            FinancialAdvisorReadback,
             FamilyCodes,
             Positions,
             AccountUpdates,
