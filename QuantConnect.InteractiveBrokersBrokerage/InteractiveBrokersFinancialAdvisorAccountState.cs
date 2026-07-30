@@ -508,6 +508,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 "The Financial Advisor account-state service was disposed.";
             PendingRequest pending;
             Task worker;
+            string mutationError = null;
             lock (_callbackStateLock)
             {
                 if (_disposed)
@@ -520,7 +521,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _deferredCancellation = null;
                 if (_pendingMutation != null)
                 {
-                    CompleteMutationLocked(
+                    mutationError = CompleteMutationLocked(
                         _pendingMutation,
                         new InvalidOperationException(disposalError));
                     _pendingMutation = null;
@@ -536,6 +537,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 pending = _pendingRequest;
                 _pendingRequest = null;
                 worker = _worker;
+            }
+            if (mutationError != null)
+            {
+                Log.Error(
+                    "InteractiveBrokersFinancialAdvisorAccountState: " +
+                    "configuration mutation failed: " + mutationError);
             }
             DetachCallbacks();
             _work.Writer.TryComplete();
@@ -617,11 +624,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     try
                     {
-                    if (item.Kind == WorkKind.CancellationRetry)
-                    {
-                        RetryDeferredCancellation(item.PhysicalConnectionEpoch);
-                        continue;
-                    }
+                        if (item.Kind == WorkKind.CancellationRetry)
+                        {
+                            RetryDeferredCancellation(item.PhysicalConnectionEpoch);
+                            continue;
+                        }
                     SnapshotScope scope;
                     var rejected = false;
                     lock (_callbackStateLock)
