@@ -239,6 +239,48 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 orderEvent.Message);
         }
 
+        [TestCase(
+            "PctChange",
+            9926d,
+            TestName = "UnifiedPctChangeGroupFillUsesLegacyQuantityPath")]
+        [TestCase(
+            "Percent",
+            9925.5d,
+            TestName = "UnifiedPercentGroupFillUsesExactQuantityPath")]
+        [TestCase(
+            "Ratio",
+            9925.5d,
+            TestName = "UnifiedRatioGroupFillUsesExactQuantityPath")]
+        [TestCase(
+            "",
+            9925.5d,
+            TestName = "UnifiedContractsOrSharesGroupFillUsesExactQuantityPath")]
+        public void UnifiedFinancialAdvisorGroupFillUsesAllocationMethodQuantityPathTest(
+            string allocationMethod,
+            double expectedFillQuantity)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var order = CreateFractionalFillOrder(
+                9925.5m,
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = allocationMethod
+                });
+
+            var orderEvent = EmitOrderFill(
+                brokerage,
+                order,
+                9925.5m,
+                9925.5m);
+
+            Assert.AreEqual(
+                Convert.ToDecimal(expectedFillQuantity),
+                orderEvent.FillQuantity);
+            Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
+        }
+
         [TestCase(false, true)]
         [TestCase(true, false)]
         public void LegacyFillAccountingRemainsUnchangedTest(

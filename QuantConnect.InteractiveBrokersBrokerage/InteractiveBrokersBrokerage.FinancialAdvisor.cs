@@ -460,17 +460,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             ibOrder.FaGroup = hasExplicitGroup
                 ? properties.FaGroup.Trim()
                 : _financialAdvisorsGroupFilter;
-            ibOrder.FaMethod = hasExplicitGroup
-                ? properties.FaMethod
-                : string.Empty;
+            ibOrder.FaMethod = ResolveFinancialAdvisorAllocationMethod(leanOrder);
             if (string.IsNullOrWhiteSpace(ibOrder.FaGroup))
             {
                 return;
             }
 
             ibOrder.FaGroup = ibOrder.FaGroup.Trim();
-            ibOrder.FaMethod =
-                FAState.NormalizeFinancialAdvisorAllocationMethod(ibOrder.FaMethod);
             ibOrder.TotalQuantity = Math.Abs(
                 leanOrder.GroupOrderManager?.Quantity ?? leanOrder.Quantity);
             if (ibOrder.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
@@ -480,6 +476,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     (properties.ExactFaPercentage ?? properties.FaPercentage).ToStringInvariant();
                 ibOrder.TotalQuantity = 0m;
             }
+        }
+
+        private static string ResolveFinancialAdvisorAllocationMethod(Order order)
+        {
+            var properties =
+                order?.Properties as InteractiveBrokersOrderProperties;
+            return FAState.NormalizeFinancialAdvisorAllocationMethod(
+                !string.IsNullOrWhiteSpace(properties?.FaGroup)
+                    ? properties.FaMethod
+                    : string.Empty);
         }
 
         internal static void ValidateFinancialAdvisorAllocationMethod(
@@ -576,12 +582,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             var properties = order?.Properties as InteractiveBrokersOrderProperties;
-            return order?.Type != OrderType.OptionExercise &&
-                (!string.IsNullOrWhiteSpace(properties?.Account) ||
-                    string.IsNullOrWhiteSpace(properties?.Account) &&
-                    (!string.IsNullOrWhiteSpace(properties?.FaGroup) ||
-                        !string.IsNullOrWhiteSpace(
-                            _financialAdvisorsGroupFilter)));
+            if (order?.Type == OrderType.OptionExercise)
+            {
+                return false;
+            }
+            if (!string.IsNullOrWhiteSpace(properties?.Account))
+            {
+                return true;
+            }
+            return (!string.IsNullOrWhiteSpace(properties?.FaGroup) ||
+                    !string.IsNullOrWhiteSpace(_financialAdvisorsGroupFilter)) &&
+                !ResolveFinancialAdvisorAllocationMethod(order).Equals(
+                    "PctChange", StringComparison.OrdinalIgnoreCase);
         }
 
     }
