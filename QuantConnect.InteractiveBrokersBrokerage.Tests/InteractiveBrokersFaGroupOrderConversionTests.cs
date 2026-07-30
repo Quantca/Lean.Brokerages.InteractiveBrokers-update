@@ -778,6 +778,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             AccountStateField.SetValue(brokerage, state);
             var savedMethodOrder =
                 CreateOrder(new InteractiveBrokersOrderProperties());
+            var methodOnlyOrder =
+                CreateOrder(new InteractiveBrokersOrderProperties
+                {
+                    FaMethod = "PctChange",
+                    ExactFaPercentage = -25.5m
+                });
             var explicitMethodOrder =
                 CreateOrder(new InteractiveBrokersOrderProperties
                 {
@@ -787,10 +793,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 });
 
             StringAssert.Contains(
-                "Set FaMethod = \"PctChange\" explicitly",
+                $"Set FaGroup = \"{FaGroupName}\" and FaMethod = \"PctChange\" explicitly",
                 Assert.Throws<InvalidOperationException>(() =>
                     brokerage.ValidateFinancialAdvisorOrderAdmission(
                         savedMethodOrder)).Message);
+            StringAssert.Contains(
+                $"Set FaGroup = \"{FaGroupName}\" and FaMethod = \"PctChange\" explicitly",
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        methodOnlyOrder)).Message);
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(
                     explicitMethodOrder));

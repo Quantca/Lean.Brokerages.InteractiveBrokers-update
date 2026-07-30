@@ -513,7 +513,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 throw new InvalidOperationException(
                     $"Financial Advisor group '{group.Name}' uses saved PctChange allocation. " +
-                    "Set FaMethod = \"PctChange\" explicitly so LEAN uses the upstream " +
+                    $"Set FaGroup = \"{group.Name}\" and FaMethod = \"PctChange\" explicitly " +
+                    "so LEAN uses the upstream " +
                     "placeholder-quantity fill accounting path.");
             }
             if (savedMethod is not ("ContractsOrShares" or "Ratio" or "Percent" or
