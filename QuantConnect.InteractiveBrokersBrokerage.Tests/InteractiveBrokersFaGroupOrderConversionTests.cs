@@ -64,6 +64,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             typeof(InteractiveBrokersBrokerage).GetField("_account", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo AlgorithmField =
             typeof(InteractiveBrokersBrokerage).GetField("_algorithm", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo OrderProviderField =
+            typeof(InteractiveBrokersBrokerage).GetField("_orderProvider", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo SymbolMapperField =
             typeof(InteractiveBrokersBrokerage).GetField("_symbolMapper", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo AgentDescriptionField =
@@ -175,6 +177,80 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.AreEqual(9925.25m, ConvertOrder(brokerage, fractionalOrder).TotalQuantity);
             Assert.AreEqual(9m, ConvertOrder(brokerage, integerOrder).TotalQuantity);
+        }
+
+        [Test]
+        public void CoherentComboLegRoutingIsAcceptedWithoutChangingWireRoutingTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var properties = new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName,
+                FaMethod = "PctChange",
+                ExactFaPercentage = 12.5m
+            };
+            var orders = CreateComboOrders(brokerage, properties, properties);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
+            var converted = ConvertOrder(brokerage, orders[0]);
+            Assert.AreEqual(FaGroupName, converted.FaGroup);
+            Assert.AreEqual("PctChange", converted.FaMethod);
+            Assert.AreEqual("12.5", converted.FaPercentage);
+        }
+
+        [TestCase("Account")]
+        [TestCase("FaGroup")]
+        [TestCase("FaMethod")]
+        [TestCase("Percentage")]
+        public void DivergentComboLegRoutingIsRejectedTest(string divergence)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var first = new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName,
+                FaMethod = "PctChange",
+                ExactFaPercentage = 12.5m
+            };
+            var second = new InteractiveBrokersOrderProperties
+            {
+                FaGroup = divergence == "FaGroup" ? "AnotherGroup" : FaGroupName,
+                FaMethod = divergence == "FaMethod" ? "Equal" : "PctChange",
+                ExactFaPercentage = divergence == "Percentage" ? 11m : 12.5m,
+                Account = divergence == "Account" ? "ManagedAccount" : string.Empty
+            };
+            var orders = CreateComboOrders(brokerage, first, second);
+
+            StringAssert.Contains(
+                "All combo legs",
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0])).Message);
+        }
+
+        [Test]
+        public void IncompleteComboLegGroupDefersCoherenceValidationTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var group = new GroupOrderManager(1, 2, 1m);
+            var order = new ComboMarketOrder(
+                Symbols.SPY,
+                1m,
+                DateTime.UtcNow,
+                group,
+                properties: new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                });
+            var provider = new OrderProvider();
+            provider.Add(order);
+            group.OrderIds.Add(order.Id);
+            OrderProviderField.SetValue(brokerage, provider);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(order));
         }
 
         [Test]
@@ -1039,6 +1115,28 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 100m,
                 new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
                 properties: properties);
+        }
+
+        private static List<ComboMarketOrder> CreateComboOrders(
+            InteractiveBrokersBrokerage brokerage,
+            InteractiveBrokersOrderProperties firstProperties,
+            InteractiveBrokersOrderProperties secondProperties)
+        {
+            var group = new GroupOrderManager(1, 2, 1m);
+            var time = new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc);
+            var orders = new List<ComboMarketOrder>
+            {
+                new(Symbols.SPY, 1m, time, group, properties: firstProperties),
+                new(Symbols.AAPL, -1m, time, group, properties: secondProperties)
+            };
+            var provider = new OrderProvider();
+            foreach (var order in orders)
+            {
+                provider.Add(order);
+                group.OrderIds.Add(order.Id);
+            }
+            OrderProviderField.SetValue(brokerage, provider);
+            return orders;
         }
 
         private static IBApi.Order ConvertOrder(

@@ -294,8 +294,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
-            var ibOrder = new IBApi.Order();
+            var ibOrder = new IBApi.Order { Account = _account };
             ConfigureFinancialAdvisorOrder(ibOrder, order);
+            if (!isUpdate && order.GroupOrderManager != null && _orderProvider != null &&
+                order.TryGetGroupOrders(_orderProvider.GetOrderById, out var legs))
+            {
+                var routes = legs.Select(leg =>
+                {
+                    var route = new IBApi.Order { Account = _account };
+                    ConfigureFinancialAdvisorOrder(route, leg);
+                    decimal.TryParse(route.FaPercentage, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out var percentage);
+                    return (route.Account ?? string.Empty,
+                        route.FaGroup ?? string.Empty,
+                        route.FaMethod ?? string.Empty, percentage);
+                }).Distinct().Take(2).Count();
+                if (routes != 1)
+                {
+                    throw new InvalidOperationException(
+                        "All combo legs must use the same effective Financial Advisor Account, FaGroup, FaMethod, and percentage.");
+                }
+            }
             var properties = order.Properties as InteractiveBrokersOrderProperties;
             if (!string.IsNullOrWhiteSpace(properties?.Account))
             {
