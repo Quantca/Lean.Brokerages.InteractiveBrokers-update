@@ -15,6 +15,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Xml.Linq;
 using IBApi;
@@ -628,25 +629,39 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             StringAssert.Contains("final account", moveException.Message);
         }
 
-        [Test]
-        public void AssignmentPreservesExistingTargetAllocationAndRemovesDuplicateMemberships()
+        [TestCase("Percent", "40", "60")]
+        [TestCase("Ratio", "7.5", "2.5")]
+        [TestCase("ContractsOrShares", "19.75", "10.25")]
+        public void AssignmentPreservesExistingTargetAllocationAndRemovesDuplicateMemberships(
+            string allocationMethod,
+            string accountAAllocation,
+            string accountBAllocation)
         {
-            const string xml = """
+            var xml = $"""
                 <ListOfGroups>
                   <Group><name>Computed</name><defaultMethod>NetLiq</defaultMethod>
                     <ListOfAccts><String>PaperA</String><String>PaperC</String></ListOfAccts></Group>
-                  <Group><name>ValueBasedTarget</name><defaultMethod>Ratio</defaultMethod>
-                    <ListOfAccts><Account><acct>PaperA</acct><amount>7.5</amount></Account></ListOfAccts></Group>
+                  <Group><name>ValueBasedTarget</name><defaultMethod>{allocationMethod}</defaultMethod>
+                    <ListOfAccts>
+                      <Account><acct>PaperA</acct><amount>{accountAAllocation}</amount></Account>
+                      <Account><acct>PaperB</acct><amount>{accountBAllocation}</amount></Account>
+                    </ListOfAccts></Group>
                 </ListOfGroups>
                 """;
 
             var updatedXml = InteractiveBrokersFinancialAdvisorAccountState.UpdateAccountGroupAssignmentXml(
                 xml, "PaperA", "ValueBasedTarget");
             var groups = InteractiveBrokersFinancialAdvisorAccountState.ParseGroups(updatedXml);
+            var target = groups["ValueBasedTarget"];
 
             CollectionAssert.AreEqual(new[] { "ValueBasedTarget" },
                 InteractiveBrokersFinancialAdvisorAccountState.GetAccountGroupNames(groups, "PaperA"));
-            StringAssert.Contains("7.5", updatedXml);
+            Assert.AreEqual(
+                decimal.Parse(accountAAllocation, CultureInfo.InvariantCulture),
+                target.AccountAllocationValues["PaperA"]);
+            Assert.AreEqual(
+                decimal.Parse(accountBAllocation, CultureInfo.InvariantCulture),
+                target.AccountAllocationValues["PaperB"]);
         }
 
         [TestCase("ContractsOrShares")]
