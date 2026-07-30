@@ -177,10 +177,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.DoesNotThrow(() => ConvertOrder(brokerage, directOrder));
             StringAssert.Contains(
                 "FA configuration mutation is active",
-                AssertAdmissionAndConversionRejectSame(
+                AssertAdmissionRejectsAndConversionConfigures(
                     brokerage,
                     groupOrder).Message);
-            AssertAdmissionAndConversionRejectSame(
+            AssertAdmissionRejectsAndConversionConfigures(
                 brokerage,
                 implicitFilterOrder);
         }
@@ -219,12 +219,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.DoesNotThrow(() => ConvertOrder(brokerage, directOrder));
             Assert.AreEqual(
                 unsupportedReason,
-                AssertAdmissionAndConversionRejectSame(
+                AssertAdmissionRejectsAndConversionConfigures(
                     brokerage,
                     groupOrder).Message);
             Assert.AreEqual(
                 unsupportedReason,
-                AssertAdmissionAndConversionRejectSame(
+                AssertAdmissionRejectsAndConversionConfigures(
                     brokerage,
                     implicitFilterOrder).Message);
 
@@ -235,6 +235,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(implicitFilterOrder));
             Assert.DoesNotThrow(() => ConvertOrder(brokerage, implicitFilterOrder));
+        }
+
+        [Test]
+        public void StateChangeAfterAdmissionCannotThrowDuringConversionTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            AccountStateField.SetValue(brokerage, state);
+            var order = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName
+            });
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+            UnsupportedConfigurationErrorField.SetValue(
+                state, "Topology changed after admission.");
+            GroupTradingBlockedField.SetValue(state, true);
+
+            Assert.DoesNotThrow(() => ConvertOrder(brokerage, order));
         }
 
         [Test]
@@ -387,11 +411,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             StringAssert.Contains(
                 "does not match the configured",
-                AssertAdmissionAndConversionRejectSame(
+                AssertAdmissionRejectsAndConversionConfigures(
                     brokerage,
                     outsideGroupOrder).Message);
             Assert.IsInstanceOf<NotSupportedException>(
-                AssertAdmissionAndConversionRejectSame(
+                AssertAdmissionRejectsAndConversionConfigures(
                     brokerage,
                     profileOrder));
             Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(matchingGroupOrder));
@@ -694,7 +718,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             StringAssert.Contains(
                 "allocation keys must exactly match",
-                AssertAdmissionAndConversionRejectSame(
+                AssertAdmissionRejectsAndConversionConfigures(
                     brokerage,
                     order).Message);
         }
@@ -977,26 +1001,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 new object[] { order, contract, orderState })).Single();
         }
 
-        private static Exception AssertAdmissionAndConversionRejectSame(
+        private static Exception AssertAdmissionRejectsAndConversionConfigures(
             InteractiveBrokersBrokerage brokerage,
             LeanOrder order)
         {
             var admissionException = Assert.Catch(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(order));
-            var conversionException = Assert.Throws<TargetInvocationException>(() =>
-                ConvertOrder(brokerage, order)).InnerException;
-
-            Assert.Multiple(() =>
-            {
-                Assert.IsNotNull(admissionException);
-                Assert.IsNotNull(conversionException);
-                Assert.AreEqual(
-                    admissionException.GetType(),
-                    conversionException.GetType());
-                Assert.AreEqual(
-                    admissionException.Message,
-                    conversionException.Message);
-            });
+            Assert.IsNotNull(admissionException);
+            Assert.DoesNotThrow(() => ConvertOrder(brokerage, order));
             return admissionException;
         }
 

@@ -5750,6 +5750,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return false;
         }
 
+        /// <summary>
+        /// Determines whether the specified financial advisor group is allowed
+        /// based on the current group filter. If no filter is set, all groups are allowed.
+        /// </summary>
+        /// <param name="groupName">The name of the financial advisor group to check.</param>
+        /// <returns><c>true</c> if the group is allowed; otherwise, <c>false</c>.</returns>
+        private bool IsFaGroupFlitterSet(string groupName)
+        {
+            return !string.IsNullOrEmpty(_financialAdvisorsGroupFilter)
+                && !string.IsNullOrEmpty(groupName)
+                && !groupName.Equals(_financialAdvisorsGroupFilter, StringComparison.InvariantCultureIgnoreCase);
+        }
+
         private class SubscriptionEntry
         {
             public Symbol Symbol { get; set; }

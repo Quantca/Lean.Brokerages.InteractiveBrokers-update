@@ -292,7 +292,52 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
-            ConfigureFinancialAdvisorOrder(new IBApi.Order(), order);
+            var ibOrder = new IBApi.Order();
+            ConfigureFinancialAdvisorOrder(ibOrder, order);
+            var properties = order.Properties as InteractiveBrokersOrderProperties;
+            if (!string.IsNullOrWhiteSpace(properties?.Account))
+            {
+                return;
+            }
+            var unsupportedConfigurationError =
+                _financialAdvisorAccountState?.UnsupportedConfigurationError;
+            if (!string.IsNullOrEmpty(unsupportedConfigurationError) &&
+                FAState.IsFinancialAdvisorGroupOrder(
+                    order, _financialAdvisorsGroupFilter))
+            {
+                throw new InvalidOperationException(unsupportedConfigurationError);
+            }
+            if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
+            {
+                throw new NotSupportedException(
+                    "Legacy Financial Advisor profiles are not supported when unified groups are enabled. Use FaGroup instead.");
+            }
+            if (!string.IsNullOrWhiteSpace(properties?.FaGroup) &&
+                FAState.IsOutsideFinancialAdvisorGroupFilter(
+                    _financialAdvisorsGroupFilter, properties.FaGroup))
+            {
+                throw new InvalidOperationException(
+                    $"Order FA group '{properties.FaGroup}' does not match the configured " +
+                    $"Financial Advisor group filter '{_financialAdvisorsGroupFilter}'.");
+            }
+            if (_financialAdvisorAccountState?.IsGroupTradingBlocked == true &&
+                FAState.IsFinancialAdvisorGroupOrder(
+                    order, _financialAdvisorsGroupFilter))
+            {
+                throw new InvalidOperationException(
+                    "FA group orders are blocked while an FA configuration mutation is active or its broker outcome requires reconciliation.");
+            }
+            if (string.IsNullOrWhiteSpace(ibOrder.FaGroup))
+            {
+                return;
+            }
+            ValidateFinancialAdvisorAllocationMethod(
+                ibOrder,
+                GetAccountSnapshot(),
+                order.Symbol,
+                _algorithm?.Securities.TryGetValue(order.Symbol, out var security) == true
+                    ? security.SymbolProperties.LotSize
+                    : GetSymbolProperties(order.Symbol).LotSize);
         }
 
         private void ConfigureFinancialAdvisorOrder(
@@ -313,36 +358,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ibOrder.FaGroup = string.Empty;
                 ibOrder.FaMethod = string.Empty;
                 return;
-            }
-            var unsupportedConfigurationError =
-                _financialAdvisorAccountState?.UnsupportedConfigurationError;
-            if (!string.IsNullOrEmpty(unsupportedConfigurationError) &&
-                FAState.IsFinancialAdvisorGroupOrder(
-                    leanOrder,
-                    _financialAdvisorsGroupFilter))
-            {
-                throw new InvalidOperationException(unsupportedConfigurationError);
-            }
-            if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
-            {
-                throw new NotSupportedException(
-                    "Legacy Financial Advisor profiles are not supported when unified groups are enabled. Use FaGroup instead.");
-            }
-            if (!string.IsNullOrWhiteSpace(properties?.FaGroup) &&
-                FAState.IsOutsideFinancialAdvisorGroupFilter(
-                    _financialAdvisorsGroupFilter, properties.FaGroup))
-            {
-                throw new InvalidOperationException(
-                    $"Order FA group '{properties.FaGroup}' does not match the configured " +
-                    $"Financial Advisor group filter '{_financialAdvisorsGroupFilter}'.");
-            }
-            if (_financialAdvisorAccountState?.IsGroupTradingBlocked == true &&
-                FAState.IsFinancialAdvisorGroupOrder(
-                    leanOrder,
-                    _financialAdvisorsGroupFilter))
-            {
-                throw new InvalidOperationException(
-                    "FA group orders are blocked while an FA configuration mutation is active or its broker outcome requires reconciliation.");
             }
 
             var hasExplicitGroup = !string.IsNullOrWhiteSpace(properties?.FaGroup);
@@ -369,13 +384,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     (properties.ExactFaPercentage ?? properties.FaPercentage).ToStringInvariant();
                 ibOrder.TotalQuantity = 0m;
             }
-            ValidateFinancialAdvisorAllocationMethod(
-                ibOrder,
-                GetAccountSnapshot(),
-                leanOrder.Symbol,
-                _algorithm?.Securities.TryGetValue(leanOrder.Symbol, out var security) == true
-                    ? security.SymbolProperties.LotSize
-                    : GetSymbolProperties(leanOrder.Symbol).LotSize);
         }
 
         internal static void ValidateFinancialAdvisorAllocationMethod(
@@ -459,16 +467,5 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
-        /// <summary>
-        /// Determines whether the specified financial advisor group is allowed
-        /// based on the current group filter. If no filter is set, all groups are allowed.
-        /// </summary>
-        /// <param name="groupName">The name of the financial advisor group to check.</param>
-        /// <returns><c>true</c> if the group is allowed; otherwise, <c>false</c>.</returns>
-        private bool IsFaGroupFlitterSet(string groupName)
-        {
-            return FAState.IsFinancialAdvisorGroupFilteredOut(
-                _financialAdvisorsGroupFilter, groupName);
-        }
     }
 }
