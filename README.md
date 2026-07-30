@@ -173,6 +173,8 @@ During collection, LEAN reads managed accounts, FA groups, account aliases, and 
 
 IB does not provide an atomic operation that checks open orders and replaces FA configuration. Operate one configuration/order writer for each TWS user/session. While a `replaceFA` operation or its reconciliation is in progress, do not submit manual group orders or make manual group edits from TWS, Client Portal, or another API client. LEAN blocks its own conflicting group operations, but it cannot prevent an external client from racing the replacement.
 
+While a Financial Advisor configuration mutation or its reconciliation is active, LEAN rejects every update to an FA group order as well as new FA group orders. An update can change the aggregate parent quantity while its saved allocation vector is being rewritten, so algorithms should cancel rather than update during this interval.
+
 Before a configuration mutation, LEAN's open-order precondition examines only Financial Advisor group orders already known to LEAN through `IOrderProvider`. It does not discover orders or quiesce configuration and order writers in TWS, Client Portal, or other API clients. Operators are responsible for ensuring those external sources remain quiescent throughout the mutation and reconciliation window.
 
 TWS rejects a group configuration that removes its final member. Add another managed account before moving the original final member, or manage group creation/deletion manually in TWS.

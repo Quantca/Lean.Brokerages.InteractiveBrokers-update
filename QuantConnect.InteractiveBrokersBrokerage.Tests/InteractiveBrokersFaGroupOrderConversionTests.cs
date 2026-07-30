@@ -669,7 +669,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void UpdateAdmissionRejectsOnlyStateIndependentRoutingErrorsTest()
+        public void UpdateAdmissionStillRejectsStateIndependentRoutingErrorsTest()
         {
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
@@ -678,22 +678,19 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 RuntimeHelpers.GetUninitializedObject(
                     typeof(InteractiveBrokersFinancialAdvisorAccountState));
             UnsupportedConfigurationErrorField.SetValue(
-                state, "Unsupported current topology.");
-            GroupTradingBlockedField.SetValue(state, true);
+                state,
+                "Placement-only unsupported topology.");
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
-                    BrokerageAccountSnapshotStatus.Ready,
-                    new BrokerageAccountGroup(
-                        FaGroupName, "NetLiq", new[] { "ManagedAccount" })));
+                    BrokerageAccountSnapshotStatus.Stale));
             AccountStateField.SetValue(brokerage, state);
 
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(
                     CreateOrder(new InteractiveBrokersOrderProperties
                     {
-                        FaGroup = FaGroupName,
-                        FaMethod = "Equal"
+                        FaGroup = FaGroupName
                     }),
                     isUpdate: true));
             Assert.IsInstanceOf<NotSupportedException>(
@@ -713,6 +710,224 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             FaGroup = "OutsideGroup"
                         }),
                         isUpdate: true)).Message);
+        }
+
+        [Test]
+        public void QuantityUpdateViolatingSavedContractsOrSharesTotalIsRejectedTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 4m,
+                    ["B"] = 6m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+            var updatedOrder = CreateOrder(
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                },
+                quantity: 12m);
+
+            StringAssert.Contains(
+                "saved allocation total 10",
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        updatedOrder,
+                        isUpdate: true)).Message);
+        }
+
+        [Test]
+        public void QuantityUpdateMatchingSavedContractsOrSharesTotalIsAcceptedTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 4m,
+                    ["B"] = 6m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    CreateOrder(
+                        new InteractiveBrokersOrderProperties
+                        {
+                            FaGroup = FaGroupName
+                        },
+                        quantity: 10m),
+                    isUpdate: true));
+        }
+
+        [Test]
+        public void PriceOnlyUpdateIsAcceptedWithReadyUnblockedStateTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 4m,
+                    ["B"] = 6m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    CreateOrder(
+                        new InteractiveBrokersOrderProperties
+                        {
+                            FaGroup = FaGroupName
+                        },
+                        quantity: 10m,
+                        limitPrice: 101m),
+                    isUpdate: true));
+        }
+
+        [Test]
+        public void AnyGroupOrderUpdateIsRejectedWhileGroupTradingIsBlockedTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 4m,
+                    ["B"] = 6m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            GroupTradingBlockedField.SetValue(state, true);
+            AccountStateField.SetValue(brokerage, state);
+
+            StringAssert.Contains(
+                "FA configuration mutation is active",
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        CreateOrder(
+                            new InteractiveBrokersOrderProperties
+                            {
+                                FaGroup = FaGroupName
+                            },
+                            quantity: 10m),
+                        isUpdate: true)).Message);
+        }
+
+        [TestCase(BrokerageAccountSnapshotStatus.Unavailable)]
+        [TestCase(BrokerageAccountSnapshotStatus.Refreshing)]
+        [TestCase(BrokerageAccountSnapshotStatus.Failed)]
+        [TestCase(BrokerageAccountSnapshotStatus.Stale)]
+        public void GroupOrderUpdatesFailOpenWithoutReadyAuthorityTest(
+            BrokerageAccountSnapshotStatus status)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 4m,
+                    ["B"] = 6m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            UnsupportedConfigurationErrorField.SetValue(
+                state,
+                "Placement-only unsupported topology.");
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(status, savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    CreateOrder(
+                        new InteractiveBrokersOrderProperties
+                        {
+                            FaGroup = FaGroupName
+                        },
+                        quantity: 12m),
+                    isUpdate: true));
+        }
+
+        [Test]
+        public void DirectAccountOrderUpdateReturnsBeforeGroupStateValidationTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            GroupTradingBlockedField.SetValue(state, true);
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    new BrokerageAccountGroup(
+                        FaGroupName,
+                        "UnsupportedMethod",
+                        new[] { "ManagedAccount" })));
+            AccountStateField.SetValue(brokerage, state);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    CreateOrder(
+                        new InteractiveBrokersOrderProperties
+                        {
+                            Account = "ManagedAccount",
+                            FaGroup = FaGroupName
+                        },
+                        quantity: 12m),
+                    isUpdate: true));
         }
 
         [Test]
@@ -1494,7 +1709,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             pctChangeOrder.FaGroup = savedPctChange.Name;
             pctChangeOrder.FaMethod = string.Empty;
             StringAssert.Contains(
-                "Set FaMethod = \"PctChange\" explicitly",
+                "Set FaGroup = \"SavedPctChange\" and FaMethod = \"PctChange\" explicitly",
                 Assert.Throws<InvalidOperationException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         pctChangeOrder,
@@ -1550,12 +1765,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
         }
 
-        private static LimitOrder CreateOrder(InteractiveBrokersOrderProperties properties)
+        private static LimitOrder CreateOrder(
+            InteractiveBrokersOrderProperties properties,
+            decimal quantity = 10m,
+            decimal limitPrice = 100m)
         {
             return new LimitOrder(
                 Symbols.SPY,
-                10m,
-                100m,
+                quantity,
+                limitPrice,
                 new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
                 properties: properties);
         }

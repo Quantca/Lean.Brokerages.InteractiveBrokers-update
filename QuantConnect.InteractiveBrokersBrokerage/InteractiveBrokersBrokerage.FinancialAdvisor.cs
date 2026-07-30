@@ -313,7 +313,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 PreflightFinancialAdvisorComboLegs(order, ibOrder);
             }
-            if (isDirectAccountOrder || isUpdate)
+            if (isDirectAccountOrder)
             {
                 return;
             }
