@@ -108,6 +108,89 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task DisposeAfterReadyPublishesStaleSnapshotTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            state.Dispose();
+            var stale = state.Snapshot;
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, stale.Status);
+                Assert.AreEqual(ready.Generation, stale.Generation);
+                Assert.AreEqual(
+                    ready.LastSuccessfulUpdateUtc,
+                    stale.LastSuccessfulUpdateUtc);
+                CollectionAssert.AreEquivalent(
+                    ready.Groups.Keys,
+                    stale.Groups.Keys);
+                CollectionAssert.AreEquivalent(
+                    ready.Accounts.Keys,
+                    stale.Accounts.Keys);
+                Assert.AreEqual(
+                    ready.Accounts["ACC1"].NetLiquidation,
+                    stale.Accounts["ACC1"].NetLiquidation);
+                StringAssert.Contains("disposed", stale.ErrorMessage);
+            });
+        }
+
+        [Test]
+        public async Task DisposeDuringFirstRefreshPublishesFailedSnapshotTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var requestEntered = new ManualResetEventSlim();
+            using var releaseRequest = new ManualResetEventSlim();
+            var requestManagedAccounts = scenario.Actions.RequestManagedAccounts;
+            scenario.Actions.RequestManagedAccounts = authorize =>
+                requestManagedAccounts(() =>
+                {
+                    var authorized = authorize();
+                    if (authorized)
+                    {
+                        requestEntered.Set();
+                        if (!releaseRequest.Wait(TimeSpan.FromSeconds(5)))
+                        {
+                            throw new TimeoutException(
+                                "Test managed-account request was not released.");
+                        }
+                    }
+                    return authorized;
+                });
+            using var state = scenario.CreateState();
+
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(requestEntered.Wait(TimeSpan.FromSeconds(5)));
+            var worker = GetPrivateField<Task>(state, "_worker");
+            try
+            {
+                state.Dispose();
+                var failed = state.Snapshot;
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Failed,
+                        failed.Status);
+                    Assert.AreEqual(0, failed.Generation);
+                    Assert.AreEqual(default(DateTime), failed.LastSuccessfulUpdateUtc);
+                    StringAssert.Contains("disposed", failed.ErrorMessage);
+                });
+            }
+            finally
+            {
+                releaseRequest.Set();
+            }
+            await worker.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.AreEqual(
+                BrokerageAccountSnapshotStatus.Failed,
+                state.Snapshot.Status);
+        }
+
+        [Test]
         public async Task OrdinaryRefreshFailureDoesNotBlockGroupTradingTest()
         {
             using var scenario = Scenario.SingleAccount();
@@ -258,6 +341,55 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 state,
                 () => state.RequestRefresh(Array.Empty<string>()));
             Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public async Task AuthorizedKeyedWriteFailureStillCancelsSubscriptionTest(
+            bool positions)
+        {
+            using var scenario = Scenario.SingleAccount();
+            var attemptedRequestId = 0;
+            if (positions)
+            {
+                scenario.Actions.RequestPositions =
+                    (requestId, accountOrGroup, authorize) =>
+                        scenario.RunAuthorized(authorize, () =>
+                        {
+                            attemptedRequestId = requestId;
+                            throw new System.Net.Sockets.SocketException(
+                                (int)System.Net.Sockets.SocketError.ConnectionReset);
+                        });
+            }
+            else
+            {
+                scenario.Actions.RequestAccountUpdates =
+                    (requestId, accountId, authorize) =>
+                        scenario.RunAuthorized(authorize, () =>
+                        {
+                            attemptedRequestId = requestId;
+                            throw new System.Net.Sockets.SocketException(
+                                (int)System.Net.Sockets.SocketError.ConnectionReset);
+                        });
+            }
+            using var state = scenario.CreateState();
+
+            var failed = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var canceledRequestIds = positions
+                ? scenario.CanceledPositionIds
+                : scenario.CanceledAccountIds;
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, failed.Status);
+                Assert.AreNotEqual(0, attemptedRequestId);
+                Assert.AreEqual(
+                    1,
+                    canceledRequestIds.Count(
+                        requestId => requestId == attemptedRequestId));
+            });
         }
 
         [Test]
@@ -1348,22 +1480,56 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
-        [Test]
-        public async Task LogicalReconnectRetriesFailedCancellationOnSameConnectionTest()
+        [TestCase(true)]
+        [TestCase(false)]
+        public async Task LogicalReconnectRetriesFailedCancellationOnceBeforeRefreshTest(
+            bool recoveryBeforeRetention)
         {
             using var scenario = Scenario.SingleAccount();
-            using var cancelPaceEntered = new ManualResetEventSlim();
-            using var releaseCancelPacing = new ManualResetEventSlim();
+            using var paceEntered = new ManualResetEventSlim();
+            using var releasePacing = new ManualResetEventSlim();
+            var sequence = new ConcurrentQueue<string>();
+            var originalCancel = scenario.Actions.CancelPositions;
+            var cancelInvocations = 0;
+            var staleRequestId = 0;
+            scenario.Actions.CancelPositions = (requestId, authorize) =>
+            {
+                if (staleRequestId == 0)
+                {
+                    staleRequestId = requestId;
+                }
+                if (requestId != staleRequestId)
+                {
+                    return originalCancel(requestId, authorize);
+                }
+                if (Interlocked.Increment(ref cancelInvocations) == 1)
+                {
+                    return scenario.RunAuthorized(
+                        authorize,
+                        () => throw new InvalidOperationException(
+                            "simulated first cancellation failure"));
+                }
+                return originalCancel(requestId, () =>
+                {
+                    var authorized = authorize();
+                    if (authorized)
+                    {
+                        sequence.Enqueue("cancellation-retry");
+                    }
+                    return authorized;
+                });
+            };
             var paceCalls = 0;
             using var state = scenario.CreateState(paceRequest: () =>
             {
-                if (Interlocked.Increment(ref paceCalls) == 6)
+                var call = Interlocked.Increment(ref paceCalls);
+                if (call == (recoveryBeforeRetention ? 6 : 7))
                 {
-                    cancelPaceEntered.Set();
-                    if (!releaseCancelPacing.Wait(TimeSpan.FromSeconds(5)))
+                    paceEntered.Set();
+                    if (!releasePacing.Wait(TimeSpan.FromSeconds(5)))
                     {
                         throw new TimeoutException(
-                            "Test cancellation pacing was not released.");
+                            "Test request pacing was not released.");
                     }
                 }
             });
@@ -1373,7 +1539,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 () => state.RequestRefresh(Array.Empty<string>()));
             try
             {
-                Assert.IsTrue(cancelPaceEntered.Wait(TimeSpan.FromSeconds(5)));
+                Assert.IsTrue(paceEntered.Wait(TimeSpan.FromSeconds(5)));
                 scenario.Client.error(
                     -1,
                     0,
@@ -1386,14 +1552,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     1102,
                     "Connectivity between IB and TWS was restored.",
                     string.Empty);
+                scenario.Client.error(
+                    -1,
+                    0,
+                    1102,
+                    "Duplicate connectivity-restored notification.",
+                    string.Empty);
             }
             finally
             {
-                releaseCancelPacing.Set();
+                releasePacing.Set();
             }
 
-            var staleRequestId = scenario.KeyedRequestIds.Single();
             await interrupted;
+            var requestManagedAccounts = scenario.Actions.RequestManagedAccounts;
+            scenario.Actions.RequestManagedAccounts = authorize =>
+                requestManagedAccounts(() =>
+                {
+                    var authorized = authorize();
+                    if (authorized)
+                    {
+                        sequence.Enqueue("recovered-refresh");
+                    }
+                    return authorized;
+                });
             var recovered = await RunRefreshAsync(
                 state,
                 () => state.RequestRefresh(Array.Empty<string>()));
@@ -1401,10 +1583,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.Multiple(() =>
             {
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+                Assert.AreEqual(2, cancelInvocations);
                 Assert.AreEqual(
                     1,
                     scenario.CanceledPositionIds.Count(
                         requestId => requestId == staleRequestId));
+                CollectionAssert.AreEqual(
+                    new[] { "cancellation-retry", "recovered-refresh" },
+                    sequence.Take(2));
                 Assert.IsTrue(state.IsServiceOwnedRequestId(staleRequestId));
             });
         }
@@ -1816,7 +2002,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             unsupportedOrder,
                             snapshot)).Message);
                 StringAssert.Contains(
-                    "Set FaMethod = \"PctChange\" explicitly",
+                    "Set FaGroup = \"SavedPctChange\" and FaMethod = \"PctChange\" explicitly",
                     Assert.Throws<InvalidOperationException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             savedPctChangeOrder,
@@ -1883,7 +2069,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         new IBApi.Order { FaGroup = "Monetary" },
                         snapshot));
                 StringAssert.Contains(
-                    "Set FaMethod = \"PctChange\" explicitly",
+                    "Set FaGroup = \"SavedPctChange\" and FaMethod = \"PctChange\" explicitly",
                     Assert.Throws<InvalidOperationException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             new IBApi.Order { FaGroup = "SavedPctChange" },

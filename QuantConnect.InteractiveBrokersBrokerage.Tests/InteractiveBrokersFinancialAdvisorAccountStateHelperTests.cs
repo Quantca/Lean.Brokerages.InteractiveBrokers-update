@@ -913,6 +913,33 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void ConfigurationHashKeepsMixedContentAccountValuesPairedWhenSortingAccounts()
+        {
+            const string first = """
+                <ListOfGroups><Group><ListOfAccts>
+                <Account>A<amount>1</amount></Account><Account>B<amount>2</amount></Account>
+                </ListOfAccts></Group></ListOfGroups>
+                """;
+            const string reordered = """
+                <ListOfGroups><Group><ListOfAccts>
+                <Account>B<amount>2.0</amount></Account><Account>A<amount>1.000</amount></Account>
+                </ListOfAccts></Group></ListOfGroups>
+                """;
+            const string swappedAmounts = """
+                <ListOfGroups><Group><ListOfAccts>
+                <Account>A<amount>2</amount></Account><Account>B<amount>1</amount></Account>
+                </ListOfAccts></Group></ListOfGroups>
+                """;
+
+            Assert.AreEqual(
+                InteractiveBrokersFinancialAdvisorAccountState.ComputeConfigurationHash(first),
+                InteractiveBrokersFinancialAdvisorAccountState.ComputeConfigurationHash(reordered));
+            Assert.AreNotEqual(
+                InteractiveBrokersFinancialAdvisorAccountState.ComputeConfigurationHash(first),
+                InteractiveBrokersFinancialAdvisorAccountState.ComputeConfigurationHash(swappedAmounts));
+        }
+
+        [Test]
         public void ConfigurationHashIncludesNamespacesAndUnknownElementOrder()
         {
             const string namespaceA =

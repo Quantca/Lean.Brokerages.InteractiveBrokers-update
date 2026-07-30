@@ -584,6 +584,140 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task DisposeTerminalizesPendingMutationWithoutChangingInputs()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.BlockNextManagedRequest();
+            var requested = new Dictionary<string, decimal>
+            {
+                ["ACC1"] = 3m,
+                ["ACC2"] = 4m
+            };
+
+            Assert.IsTrue(state.RequestGroupAllocationUpdate(
+                "Alpha",
+                requested,
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            Assert.IsTrue(
+                scenario.ManagedRequestEntered.Wait(TimeSpan.FromSeconds(10)));
+            var pending = state.GroupAllocationUpdate;
+            Assert.AreEqual(
+                BrokerageAccountGroupAllocationUpdateStatus.Pending,
+                pending.Status);
+            var worker = GetWorker(state);
+            try
+            {
+                state.Dispose();
+                var failed = state.GroupAllocationUpdate;
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                        failed.Status);
+                    Assert.AreEqual(pending.Generation, failed.Generation);
+                    Assert.AreEqual(pending.GroupName, failed.GroupName);
+                    Assert.AreEqual(
+                        pending.AllocationMethod,
+                        failed.AllocationMethod);
+                    CollectionAssert.AreEquivalent(
+                        pending.RequestedAccountAllocationValues,
+                        failed.RequestedAccountAllocationValues);
+                    Assert.AreEqual(
+                        pending.ExpectedMembershipHash,
+                        failed.ExpectedMembershipHash);
+                    Assert.AreEqual(
+                        pending.ExpectedGroupConfigurationVersion,
+                        failed.ExpectedGroupConfigurationVersion);
+                    StringAssert.Contains("disposed", failed.ErrorMessage);
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Stale,
+                        state.Snapshot.Status);
+                    StringAssert.Contains(
+                        "disposed",
+                        state.Snapshot.ErrorMessage);
+                    Assert.IsNull(GetPendingMutation(state));
+                });
+            }
+            finally
+            {
+                scenario.ReleaseManagedRequest();
+            }
+            await worker.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.AreEqual(
+                BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                state.GroupAllocationUpdate.Status);
+        }
+
+        [Test]
+        public async Task DisposeTerminalizesPendingAssignmentWithoutChangingInputs()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.BlockNextManagedRequest();
+
+            Assert.IsTrue(state.RequestGroupAssignment(
+                "ACC1",
+                string.Empty,
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            Assert.IsTrue(
+                scenario.ManagedRequestEntered.Wait(TimeSpan.FromSeconds(10)));
+            var pending = state.GroupAssignment;
+            Assert.AreEqual(
+                BrokerageAccountGroupAssignmentStatus.Pending,
+                pending.Status);
+            var worker = GetWorker(state);
+            try
+            {
+                state.Dispose();
+                var failed = state.GroupAssignment;
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAssignmentStatus.Failed,
+                        failed.Status);
+                    Assert.AreEqual(pending.Generation, failed.Generation);
+                    Assert.AreEqual(pending.AccountId, failed.AccountId);
+                    Assert.AreEqual(
+                        pending.TargetGroupName,
+                        failed.TargetGroupName);
+                    CollectionAssert.AreEquivalent(
+                        pending.PreviousGroupNames,
+                        failed.PreviousGroupNames);
+                    Assert.AreEqual(
+                        pending.ExpectedMembershipHash,
+                        failed.ExpectedMembershipHash);
+                    Assert.AreEqual(
+                        pending.ExpectedGroupConfigurationVersion,
+                        failed.ExpectedGroupConfigurationVersion);
+                    Assert.AreEqual(
+                        pending.TargetAllocationValue,
+                        failed.TargetAllocationValue);
+                    StringAssert.Contains("disposed", failed.ErrorMessage);
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Stale,
+                        state.Snapshot.Status);
+                    StringAssert.Contains(
+                        "disposed",
+                        state.Snapshot.ErrorMessage);
+                    Assert.IsNull(GetPendingMutation(state));
+                });
+            }
+            finally
+            {
+                scenario.ReleaseManagedRequest();
+            }
+            await worker.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.AreEqual(
+                BrokerageAccountGroupAssignmentStatus.Failed,
+                state.GroupAssignment.Status);
+        }
+
+        [Test]
         public async Task AllocationPreservesCallerOrderWithCanonicalAccountCasing()
         {
             using var scenario = new MutationScenario
@@ -1055,6 +1189,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             InteractiveBrokersFinancialAdvisorAccountState state) =>
             typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
                 "_pendingMutation",
+                BindingFlags.Instance | BindingFlags.NonPublic).GetValue(state);
+
+        private static Task GetWorker(
+            InteractiveBrokersFinancialAdvisorAccountState state) =>
+            (Task)typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_worker",
                 BindingFlags.Instance | BindingFlags.NonPublic).GetValue(state);
 
         private static object GetPendingRequest(

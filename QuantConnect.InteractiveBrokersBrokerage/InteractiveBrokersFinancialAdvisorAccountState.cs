@@ -186,6 +186,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
         }
+
+        private void QueueDeferredCancellationRetry()
+        {
+            lock (_callbackStateLock)
+            {
+                if (_disposed || !_connected)
+                {
+                    return;
+                }
+                if (_work.Writer.TryWrite(new WorkItem(_physicalConnectionEpoch)))
+                {
+                    StartWorkerLocked();
+                }
+            }
+        }
+
         internal void NotifyBrokerageConnected()
         {
             var brokerageConnected = _isConnected();
@@ -229,7 +245,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 WorkItem retainedMutation = null;
                 while (_work.Reader.TryRead(out var item))
                 {
-                    if (item.Kind != WorkKind.Refresh)
+                    if (item.Kind is WorkKind.Assignment or WorkKind.Allocation)
                     {
                         retainedMutation = item;
                     }
@@ -488,6 +504,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         public void Dispose()
         {
+            const string disposalError =
+                "The Financial Advisor account-state service was disposed.";
             PendingRequest pending;
             Task worker;
             lock (_callbackStateLock)
@@ -500,6 +518,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _connected = false;
                 _reconnectRefreshPending = false;
                 _deferredCancellation = null;
+                if (_pendingMutation != null)
+                {
+                    CompleteMutationLocked(
+                        _pendingMutation,
+                        new InvalidOperationException(disposalError));
+                    _pendingMutation = null;
+                }
+                _snapshot = CreateStatusSnapshot(
+                    _snapshot,
+                    _snapshot.LastSuccessfulUpdateUtc == default
+                        ? BrokerageAccountSnapshotStatus.Failed
+                        : BrokerageAccountSnapshotStatus.Stale,
+                    disposalError);
+                _activeRefresh = null;
+                _queuedRefresh = null;
                 pending = _pendingRequest;
                 _pendingRequest = null;
                 worker = _worker;
@@ -584,6 +617,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     try
                     {
+                    if (item.Kind == WorkKind.CancellationRetry)
+                    {
+                        RetryDeferredCancellation(item.PhysicalConnectionEpoch);
+                        continue;
+                    }
                     SnapshotScope scope;
                     var rejected = false;
                     lock (_callbackStateLock)
@@ -696,7 +734,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                         "Advisor mutation result could be published.");
                                 }
                             }
-                            if (item.Kind != WorkKind.Refresh && !successPublished)
+                            if (item.Kind != WorkKind.Refresh && !successPublished &&
+                                !_disposed)
                             {
                                 mutationError = CompleteMutationLocked(item, failure);
                             }
@@ -801,6 +840,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal bool ReplacementStarted;
             internal bool ReplacementRejected;
             internal bool BrokerStateInvalidated;
+            internal long PhysicalConnectionEpoch;
 
             internal WorkItem(SnapshotScope scope)
             {
@@ -835,13 +875,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ExpectedMembershipHash = expectedMembershipHash;
                 ExpectedConfigurationVersion = expectedConfigurationVersion;
             }
+
+            internal WorkItem(long physicalConnectionEpoch)
+            {
+                Kind = WorkKind.CancellationRetry;
+                PhysicalConnectionEpoch = physicalConnectionEpoch;
+            }
         }
 
         private enum WorkKind
         {
             Refresh,
             Assignment,
-            Allocation
+            Allocation,
+            CancellationRetry
         }
 
         private sealed class MutationTopology
@@ -1832,7 +1879,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 try
                 {
-                    if (sent)
+                    if (pending.WireSent)
                     {
                         TryCancel(pending, cancel, description, requestId);
                     }
@@ -2061,11 +2108,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     : " The request will not be retried."));
         }
 
-        private void RetryDeferredCancellation()
+        private void RetryDeferredCancellation(
+            long? expectedPhysicalConnectionEpoch = null)
         {
             DeferredCancellation retry;
             lock (_callbackStateLock)
             {
+                if (expectedPhysicalConnectionEpoch.HasValue &&
+                    expectedPhysicalConnectionEpoch.Value != _physicalConnectionEpoch)
+                {
+                    return;
+                }
                 retry = _deferredCancellation;
                 if (retry == null || _disposed || !_connected)
                 {
@@ -2343,6 +2396,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             if (args.Code is 1101 or 1102)
             {
                 RestoreConnectivity(afterNextValidId: false);
+                QueueDeferredCancellationRetry();
                 return;
             }
             var retryUnsavedChanges =

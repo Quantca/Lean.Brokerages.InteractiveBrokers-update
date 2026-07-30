@@ -659,9 +659,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 Array.Sort(children, StringComparer.Ordinal);
             }
+            var directText = element.Nodes()
+                .OfType<XText>()
+                .Select(text => CanonicalizeConfigurationValue(element.Name.LocalName, text.Value))
+                .Where(text => text.Length != 0)
+                .ToArray();
             var value = children.Length == 0
                 ? CanonicalizeConfigurationValue(element.Name.LocalName, element.Value)
-                : string.Empty;
+                : directText.Length == 0
+                    ? string.Empty
+                    : CanonicalizeSequence(directText);
             return CanonicalizeSequence(
                 element.Name.ToString(),
                 CanonicalizeSequence(attributes),
