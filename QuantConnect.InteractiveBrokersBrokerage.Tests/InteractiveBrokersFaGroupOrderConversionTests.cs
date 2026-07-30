@@ -184,20 +184,47 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
-            var properties = new InteractiveBrokersOrderProperties
-            {
-                FaGroup = FaGroupName,
-                FaMethod = "PctChange",
-                ExactFaPercentage = 12.5m
-            };
-            var orders = CreateComboOrders(brokerage, properties, properties);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var orders = CreateComboOrders(
+                brokerage,
+                new InteractiveBrokersOrderProperties(),
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                });
 
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
             var converted = ConvertOrder(brokerage, orders[0]);
             Assert.AreEqual(FaGroupName, converted.FaGroup);
-            Assert.AreEqual("PctChange", converted.FaMethod);
-            Assert.AreEqual("12.5", converted.FaPercentage);
+            Assert.AreEqual(string.Empty, converted.FaMethod);
+        }
+
+        [TestCase("NormalizedMethod")]
+        [TestCase("NumericPercentage")]
+        [TestCase("IgnoredDirectFields")]
+        public void EquivalentComboLegRoutingFormsAreAcceptedTest(string equivalence)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var first = new InteractiveBrokersOrderProperties
+            {
+                FaGroup = equivalence == "IgnoredDirectFields" ? "FirstIgnoredGroup" : FaGroupName,
+                FaMethod = equivalence == "NumericPercentage" ? "PctChange" : "EqualQuantity",
+                FaPercentage = 12,
+                Account = equivalence == "IgnoredDirectFields" ? "ManagedAccount" : string.Empty
+            };
+            var second = new InteractiveBrokersOrderProperties
+            {
+                FaGroup = equivalence == "IgnoredDirectFields" ? "SecondIgnoredGroup" : FaGroupName,
+                FaMethod = equivalence == "NumericPercentage" ? "PctChange" : "Equal",
+                ExactFaPercentage = 12m,
+                Account = equivalence == "IgnoredDirectFields" ? "ManagedAccount" : string.Empty
+            };
+            var orders = CreateComboOrders(brokerage, first, second);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
         }
 
         [TestCase("Account")]
@@ -227,6 +254,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "All combo legs",
                 Assert.Throws<InvalidOperationException>(() =>
                     brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0])).Message);
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    orders[0],
+                    isUpdate: true));
         }
 
         [Test]
@@ -450,6 +481,80 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         conflictingOrder,
                         CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup))).Message);
+        }
+
+        [TestCase(BrokerageAccountRelationship.Primary)]
+        [TestCase(BrokerageAccountRelationship.Aggregate)]
+        [TestCase(BrokerageAccountRelationship.Unknown)]
+        [TestCase(null)]
+        public void RelationshipInvalidTargetGroupIsRejectedWithReadyAuthorityTest(
+            BrokerageAccountRelationship? relationship)
+        {
+            var group = new BrokerageAccountGroup(
+                FaGroupName,
+                "Equal",
+                new[] { "Account" });
+            var directory = relationship.HasValue
+                ? new Dictionary<string, BrokerageAccountDirectoryEntry>
+                {
+                    ["Account"] = new BrokerageAccountDirectoryEntry(
+                        "Account",
+                        relationship.Value,
+                        new[] { FaGroupName })
+                }
+                : new Dictionary<string, BrokerageAccountDirectoryEntry>();
+            var order = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                TotalQuantity = 1m
+            };
+
+            StringAssert.Contains(
+                "not classified as managed",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        CreateSnapshotWithDirectory(
+                            BrokerageAccountSnapshotStatus.Ready,
+                            directory,
+                            group))).Message);
+        }
+
+        [Test]
+        public void RelationshipValidationExaminesOnlyTargetedGroupTest()
+        {
+            var target = new BrokerageAccountGroup(
+                FaGroupName,
+                "Equal",
+                new[] { "ManagedAccount" });
+            var unsafeGroup = new BrokerageAccountGroup(
+                "UnsafeGroup",
+                "Equal",
+                new[] { "PrimaryAccount" });
+            var directory = new Dictionary<string, BrokerageAccountDirectoryEntry>
+            {
+                ["ManagedAccount"] = new BrokerageAccountDirectoryEntry(
+                    "ManagedAccount",
+                    BrokerageAccountRelationship.Managed,
+                    new[] { FaGroupName }),
+                ["PrimaryAccount"] = new BrokerageAccountDirectoryEntry(
+                    "PrimaryAccount",
+                    BrokerageAccountRelationship.Primary,
+                    new[] { "UnsafeGroup" })
+            };
+
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    new IBApi.Order
+                    {
+                        FaGroup = FaGroupName,
+                        TotalQuantity = 1m
+                    },
+                    CreateSnapshotWithDirectory(
+                        BrokerageAccountSnapshotStatus.Ready,
+                        directory,
+                        target,
+                        unsafeGroup)));
         }
 
         [Test]
@@ -1187,6 +1292,28 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             BrokerageAccountSnapshotStatus status,
             params BrokerageAccountGroup[] groups)
         {
+            var groupNamesByAccount = groups
+                .SelectMany(group => group.AccountIds)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    accountId => accountId,
+                    accountId => new BrokerageAccountDirectoryEntry(
+                        accountId,
+                        BrokerageAccountRelationship.Managed,
+                        groups
+                            .Where(group => group.AccountIds.Contains(
+                                accountId,
+                                StringComparer.OrdinalIgnoreCase))
+                            .Select(group => group.Name)),
+                    StringComparer.OrdinalIgnoreCase);
+            return CreateSnapshotWithDirectory(status, groupNamesByAccount, groups);
+        }
+
+        private static BrokerageAccountSnapshot CreateSnapshotWithDirectory(
+            BrokerageAccountSnapshotStatus status,
+            IReadOnlyDictionary<string, BrokerageAccountDirectoryEntry> accountDirectory,
+            params BrokerageAccountGroup[] groups)
+        {
             var allGroups = groups.ToDictionary(group => group.Name, StringComparer.OrdinalIgnoreCase);
             var now = DateTime.UtcNow;
             return new BrokerageAccountSnapshot(
@@ -1200,7 +1327,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "membership",
                 "configuration",
                 string.Empty,
-                allGroups: allGroups);
+                allGroups: allGroups,
+                accountDirectory: accountDirectory);
         }
 
         private static int GetCollectionCount(object collection)

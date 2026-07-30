@@ -303,16 +303,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     var route = new IBApi.Order { Account = _account };
                     ConfigureFinancialAdvisorOrder(route, leg);
-                    decimal.TryParse(route.FaPercentage, NumberStyles.Float,
-                        CultureInfo.InvariantCulture, out var percentage);
-                    return (route.Account ?? string.Empty,
-                        route.FaGroup ?? string.Empty,
-                        route.FaMethod ?? string.Empty, percentage);
+                    decimal.TryParse(route.FaPercentage, NumberStyles.Float, CultureInfo.InvariantCulture, out var percentage);
+                    return (route.Account ?? string.Empty, route.FaGroup ?? string.Empty, route.FaMethod ?? string.Empty, percentage);
                 }).Distinct().Take(2).Count();
                 if (routes != 1)
                 {
-                    throw new InvalidOperationException(
-                        "All combo legs must use the same effective Financial Advisor Account, FaGroup, FaMethod, and percentage.");
+                    throw new InvalidOperationException("All combo legs must use the same effective Financial Advisor Account, FaGroup, FaMethod, and percentage.");
                 }
             }
             var properties = order.Properties as InteractiveBrokersOrderProperties;
@@ -427,6 +423,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
+            if (group.AccountIds.Any(accountId => !snapshot.AccountDirectory.TryGetValue(
+                accountId, out var entry) || entry.Relationship != BrokerageAccountRelationship.Managed))
+            {
+                throw new InvalidOperationException($"Financial Advisor group '{group.Name}' contains an account that is not classified as managed; refresh after correcting the group membership in TWS.");
+            }
             var savedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(group.AllocationMethod);
             var requestedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
             if (savedMethod is not ("ContractsOrShares" or "Ratio" or "Percent" or

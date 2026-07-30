@@ -525,7 +525,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         [TestCase(false)]
         [TestCase(true)]
-        public async Task DuplicateAutomaticManagedAccountsKeepsFirstHandshakeTest(
+        public async Task HandshakeCacheRequiresPriorRefreshDemandTest(
             bool reconnect)
         {
             using var scenario = Scenario.SingleAccount();
@@ -577,9 +577,52 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 CollectionAssert.DoesNotContain(
                     snapshot.ManagedAccountIds, "EXPLICIT");
                 Assert.AreEqual(
-                    1,
+                    reconnect ? 1 : 2,
                     scenario.Requests.Count(request =>
                         request == "ending-managed-request"));
+            });
+        }
+
+        [Test]
+        public async Task HandshakeCacheIsBoundToPhysicalConnectionGenerationTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var state = scenario.CreateState();
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            scenario.Client.connectionClosed();
+            scenario.Requests.Clear();
+            scenario.Client.connectAck();
+            scenario.Client.managedAccounts("MASTER,STALE");
+            scenario.Client.connectAck();
+            var explicitRequests = 0;
+            scenario.Actions.RequestManagedAccounts = authorize =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.Requests.Add("managed-current-generation");
+                    scenario.Client.managedAccounts(scenario.ManagedAccounts);
+                    if (Interlocked.Increment(ref explicitRequests) == 1)
+                    {
+                        scenario.Client.managedAccounts(scenario.ManagedAccounts);
+                    }
+                });
+
+            scenario.Client.nextValidId(655);
+            state.NotifyBrokerageConnected();
+            var recovered = await WaitForReadyGenerationAsync(
+                state, ready.Generation);
+
+            Assert.Multiple(() =>
+            {
+                CollectionAssert.AreEquivalent(
+                    new[] { "MASTER", "ACC1" }, recovered.ManagedAccountIds);
+                CollectionAssert.DoesNotContain(recovered.ManagedAccountIds, "STALE");
+                Assert.AreEqual(
+                    2,
+                    scenario.Requests.Count(request =>
+                        request == "managed-current-generation"));
             });
         }
 
@@ -661,6 +704,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     new[] { "ACC1" }, recovered.Accounts.Keys);
                 Assert.AreEqual(requestCount, scenario.Requests.Count);
                 Assert.AreEqual(requestVersion, GetRequestVersion(state));
+            });
+        }
+
+        [Test]
+        public async Task FullObsoleteChannelRetainsReconnectRefreshDemandTest()
+        {
+            using var scenario = new Scenario();
+            using var paceEntered = new ManualResetEventSlim();
+            using var releasePacing = new ManualResetEventSlim();
+            var blockPacing = false;
+            var blockedPaceCalls = 0;
+            using var state = scenario.CreateState(paceRequest: () =>
+            {
+                if (blockPacing &&
+                    Interlocked.Increment(ref blockedPaceCalls) == 1)
+                {
+                    paceEntered.Set();
+                    releasePacing.Wait();
+                }
+            });
+            var ready = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(new[] { "Alpha" }));
+
+            blockPacing = true;
+            var interrupted = RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(new[] { "Beta" }));
+            Assert.IsTrue(paceEntered.Wait(TimeSpan.FromSeconds(5)));
+            FillRefreshQueue(state);
+            scenario.Client.connectionClosed();
+            FillRefreshQueue(state);
+            scenario.Client.nextValidId(656);
+            state.NotifyBrokerageConnected();
+            Assert.AreEqual(
+                BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
+
+            releasePacing.Set();
+            await interrupted;
+            Assert.IsTrue(SpinWait.SpinUntil(() =>
+            {
+                state.NotifyBrokerageConnected();
+                return state.Snapshot.Status ==
+                    BrokerageAccountSnapshotStatus.Refreshing;
+            }, TimeSpan.FromSeconds(5)));
+            var recovered = await WaitForReadyGenerationAsync(
+                state, ready.Generation);
+
+            Assert.Multiple(() =>
+            {
+                CollectionAssert.AreEqual(new[] { "Beta" }, recovered.Groups.Keys);
+                Assert.AreEqual(ready.Generation + 1, recovered.Generation);
             });
         }
 

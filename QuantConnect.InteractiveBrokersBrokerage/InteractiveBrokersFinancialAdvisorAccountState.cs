@@ -72,6 +72,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _reconnectRefreshPending;
         private bool _disposed;
         private int _nextRequestId = int.MinValue;
+        private long _connectionGeneration, _handshakeManagedAccountsGeneration = -1;
         private long _serviceOwnedRequestIdEpochStart = int.MinValue;
         private long _serviceOwnedRequestIdCurrentMax = (long)int.MinValue - 1;
         private long _requestVersion;
@@ -109,7 +110,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _requests = requestActions ?? new RequestActions(client);
             _work = Channel.CreateBounded<WorkItem>(new BoundedChannelOptions(QueueCapacity)
             {
-                SingleReader = true,
+                SingleReader = false,
                 SingleWriter = false,
                 FullMode = BoundedChannelFullMode.Wait
             });
@@ -183,7 +184,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
         }
-
         internal void NotifyBrokerageConnected()
         {
             var brokerageConnected = _isConnected();
@@ -193,11 +193,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     return;
                 }
-                _reconnectRefreshPending = false;
-                QueueRefresh(_lastRequestedRefreshScope, algorithmRequested: false);
+                _reconnectRefreshPending = !QueueRefresh(
+                    _lastRequestedRefreshScope, algorithmRequested: false);
             }
         }
-
         internal void MarkDisconnected(
             string reason = null,
             bool physicalConnectionClosed = false)
@@ -215,10 +214,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _reconnectRefreshPending = false;
                 _expectingHandshakeManagedAccounts = false;
                 _handshakeManagedAccounts = null;
+                _handshakeManagedAccountsGeneration = -1;
                 ++_requestVersion;
                 disconnectVersion = _requestVersion;
                 _activeRefresh = null;
                 _queuedRefresh = null;
+                WorkItem retainedMutation = null;
+                while (_work.Reader.TryRead(out var item))
+                {
+                    if (item.Kind != WorkKind.Refresh)
+                    {
+                        retainedMutation = item;
+                    }
+                }
+                if (retainedMutation != null) _work.Writer.TryWrite(retainedMutation);
                 pending = _pendingRequest;
                 if (pending is { RequestId: 0, Finished: false, WireSent: true })
                 {
@@ -558,7 +567,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private void StartWorkerLocked() =>
             _worker ??= Task.Run(WorkerLoopAsync);
-
         private async Task WorkerLoopAsync()
         {
             try
@@ -566,6 +574,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 await foreach (var item in _work.Reader.ReadAllAsync(_disposeTokenSource.Token)
                     .ConfigureAwait(false))
                 {
+                    try
+                    {
                     SnapshotScope scope;
                     var rejected = false;
                     lock (_callbackStateLock)
@@ -601,11 +611,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     string mutationError = null;
                     try
                     {
-                        if (!rejected)
+                        try
                         {
-                            // The single-consumer worker loop is the serialization point for every brokerage operation.
-                            try
+                            if (!rejected)
                             {
+                                // The single-consumer worker loop is the serialization point for every brokerage operation.
                                 if (item.Kind == WorkKind.Refresh)
                                 {
                                     await RefreshAsync(scope).ConfigureAwait(false);
@@ -621,15 +631,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                         .ConfigureAwait(false);
                                 }
                             }
-                            catch (Exception exception) when (
-                                exception is not OperationCanceledException)
-                            {
-                                failure = exception;
-                            }
+                        }
+                        catch (Exception exception) when (!_disposeTokenSource.IsCancellationRequested)
+                        {
+                            failure = exception;
                         }
                         if (item.Kind != WorkKind.Refresh)
                         {
-                            _requests.BeforeMutationPublication();
+                            try { _requests.BeforeMutationPublication(); }
+                            catch (Exception exception) when (
+                                !_disposeTokenSource.IsCancellationRequested) { failure ??= exception; }
                         }
                     }
                     finally
@@ -714,20 +725,35 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             ReportUnsupported(failure.Message);
                         }
                     }
+                    }
+                    catch (Exception exception) when (!_disposeTokenSource.IsCancellationRequested)
+                    {
+                        Log.Error("InteractiveBrokersFinancialAdvisorAccountState: unexpected worker item failure: " + exception);
+                    }
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (_disposeTokenSource.IsCancellationRequested)
             {
             }
+            finally
+            {
+                lock (_callbackStateLock)
+                {
+                    _worker = null;
+                    if (!_disposed &&
+                        (_queuedRefresh != null || _pendingMutation != null))
+                    {
+                        StartWorkerLocked();
+                    }
+                }
+            }
         }
-
         private static bool ScopesEqual(SnapshotScope left, SnapshotScope right) =>
             left.CompleteDiscovery == right.CompleteDiscovery &&
             left.GroupNames.ToHashSet(StringComparer.OrdinalIgnoreCase)
                 .SetEquals(right.GroupNames) &&
             left.AdditionalAccountIds.ToHashSet(StringComparer.OrdinalIgnoreCase)
                 .SetEquals(right.AdditionalAccountIds);
-
         private static SnapshotScope MergeScopes(
             SnapshotScope first, SnapshotScope second, long requestVersion) =>
             new(
@@ -924,6 +950,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             WorkItem item)
         {
             EnsureNoOpenFinancialAdvisorOrders("account-group assignment");
+            item.BrokerStateInvalidated = true;
             var topology = await ReadMutationTopologyAsync(item.Scope).ConfigureAwait(false);
             VerifyMutationVersions(item, topology);
             var accountId = GetCanonicalManagedAccountId(
@@ -996,8 +1023,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 expectedMembershipHash = ComputeMembershipHash(
                     expectedSelectedGroups, topology.ManagedAccountIds,
                     topology.Aliases, topology.FamilyCodes);
+                item.BrokerStateInvalidated = false;
                 EnsureNoOpenFinancialAdvisorOrders("account-group assignment");
                 await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
+                item.BrokerStateInvalidated = true;
             }
             var confirmedXml = changed
                 ? await RequestExpectedGroupsXmlAsync(
@@ -1076,6 +1105,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             RunGroupAllocationUpdateAsync(WorkItem item)
         {
             EnsureNoOpenFinancialAdvisorOrders("group allocation update");
+            item.BrokerStateInvalidated = true;
             var topology = await ReadMutationTopologyAsync(item.Scope).ConfigureAwait(false);
             VerifyMutationVersions(item, topology);
             ValidateMutationScope(
@@ -1108,8 +1138,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 updatedXml = UpdateAccountGroupAllocationsXml(
                     topology.GroupsXml, item.GroupName, item.Allocations);
                 expectedConfigurationVersion = ComputeConfigurationHash(updatedXml);
+                item.BrokerStateInvalidated = false;
                 EnsureNoOpenFinancialAdvisorOrders("group allocation update");
                 await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
+                item.BrokerStateInvalidated = true;
             }
             var confirmedXml = changed
                 ? await RequestExpectedGroupsXmlAsync(
@@ -1618,6 +1650,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         "The account-state refresh became obsolete before managed-account discovery.");
                 }
                 if (useHandshakeCache && !_unkeyedResponseMayStillArrive &&
+                    _handshakeManagedAccountsGeneration == Volatile.Read(ref _connectionGeneration) &&
                     !string.IsNullOrWhiteSpace(_handshakeManagedAccounts))
                 {
                     var cached = _handshakeManagedAccounts;
@@ -1630,7 +1663,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _requests.RequestManagedAccounts,
                 "managed accounts").ConfigureAwait(false)).Text;
         }
-
         private async Task<string> RequestFinancialAdvisorXmlAsync(
             SnapshotScope scope,
             int faDataType,
@@ -2006,8 +2038,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.InternalError -= OnError;
         }
 
-        private void OnConnectAck(object sender, EventArgs args) =>
+        private void OnConnectAck(object sender, EventArgs args)
+        {
+            Interlocked.Increment(ref _connectionGeneration);
             _expectingHandshakeManagedAccounts = true;
+        }
 
         private void OnNextValidId(object sender, NextValidIdEventArgs args) =>
             RestoreConnectivity(afterNextValidId: true);
@@ -2028,7 +2063,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 if (_expectingHandshakeManagedAccounts)
                 {
-                    _handshakeManagedAccounts = args.AccountList;
+                    (_handshakeManagedAccounts, _handshakeManagedAccountsGeneration) =
+                        _hasRequestedRefresh ? (args.AccountList,
+                            Volatile.Read(ref _connectionGeneration)) : (null, -1);
                     _expectingHandshakeManagedAccounts = false;
                 }
                 else if (!_connected || _unkeyedResponseMayStillArrive)

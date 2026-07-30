@@ -465,6 +465,43 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task MalformedFreshMutationTopologyInvalidatesAuthority()
+        {
+            const string malformedGroups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <ListOfAccts>
+                      <Account><acct>ACC1</acct><amount>1</amount></Account>
+                      <Account><acct>ACC2</acct><amount>2</amount></Account>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.SetCurrentGroupsXml(malformedGroups);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                StringAssert.Contains("contained no allocation method", failed.ErrorMessage);
+                StringAssert.Contains("reconciliation", failed.ErrorMessage);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
         public async Task DisconnectAfterFinalRefreshCannotPublishSuccess()
         {
             using var scenario = new MutationScenario();
@@ -818,6 +855,45 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Assert.IsFalse(state.IsGroupTradingBlocked);
                 });
             }
+        }
+
+        [Test]
+        public async Task WorkerRecoversFromUnexpectedPublicationFailure()
+        {
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            var failPublication = 1;
+            scenario.Actions.BeforeMutationPublication = () =>
+            {
+                if (Interlocked.Exchange(ref failPublication, 0) == 1)
+                {
+                    throw new InvalidOperationException(
+                        "simulated unexpected publication failure");
+                }
+            };
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var failed = await AllocationTerminalAsync(state);
+            var failedSnapshot = state.Snapshot;
+            scenario.Actions.BeforeMutationPublication = () => { };
+            var recovered = await ReadyAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                StringAssert.Contains(
+                    "simulated unexpected publication failure",
+                    failed.ErrorMessage);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    failedSnapshot.Status);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+                Assert.Greater(recovered.Generation, ready.Generation);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
         }
 
         [Test]
