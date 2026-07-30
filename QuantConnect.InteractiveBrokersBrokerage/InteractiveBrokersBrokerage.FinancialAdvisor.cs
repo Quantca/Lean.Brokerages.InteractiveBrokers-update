@@ -179,9 +179,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _financialAdvisorAccountState?.Dispose();
         }
 
-        private void HandleFinancialAdvisorBrokerageMessage(
-            object sender,
-            BrokerageMessageEvent message)
+        private void HandleFinancialAdvisorBrokerageMessage(object sender, BrokerageMessageEvent message)
         {
             if (message.Type == BrokerageMessageType.Reconnect && IsConnected)
             {
@@ -283,9 +281,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return properties;
         }
 
-        internal void ValidateFinancialAdvisorOrderAdmission(
-            Order order,
-            bool isUpdate = false)
+        internal void ValidateFinancialAdvisorOrderAdmission(Order order, bool isUpdate = false)
         {
             if (!_financialAdvisorUnifiedGroupsEnabled ||
                 !IsFinancialAdvisor ||
@@ -296,8 +292,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var ibOrder = new IBApi.Order { Account = _account };
             ConfigureFinancialAdvisorOrder(ibOrder, order);
-            if (!isUpdate && order.GroupOrderManager != null && _orderProvider != null &&
-                order.TryGetGroupOrders(_orderProvider.GetOrderById, out var legs))
+            var group = order.GroupOrderManager;
+            var legs = !isUpdate && group != null && _orderProvider != null
+                ? _orderProvider.GetOrders(leg => leg.GroupOrderManager?.Id == group.Id &&
+                    (group.Id != 0 || ReferenceEquals(leg.GroupOrderManager, group))).ToList()
+                : null;
+            if (legs != null && legs.Count == group.Count)
             {
                 var routes = legs.Select(leg =>
                 {

@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using IBApi;
 using NUnit.Framework;
 using QuantConnect.Algorithm;
@@ -28,6 +29,7 @@ using QuantConnect.Data.Market;
 using QuantConnect.Interfaces;
 using QuantConnect.Lean.Engine.TransactionHandlers;
 using QuantConnect.Orders;
+using QuantConnect.Securities;
 using QuantConnect.Tests.Brokerages;
 using QuantConnect.Tests.Engine;
 using QuantConnect.Tests.Engine.DataFeeds;
@@ -282,6 +284,26 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+        }
+
+        [Test]
+        public void ComboRoutingDoesNotHoldGroupLockAcrossOrderProviderCallsTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var properties = new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName
+            };
+            var orders = CreateComboOrders(brokerage, properties, properties);
+            var provider = new GroupLockObservingOrderProvider(
+                orders.Cast<LeanOrder>().ToList(),
+                orders[0].GroupOrderManager);
+            OrderProviderField.SetValue(brokerage, provider);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
+            Assert.IsFalse(provider.ObservedGroupOrderIdsLock);
         }
 
         [Test]
@@ -1395,6 +1417,41 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 });
 
             return brokerage;
+        }
+
+        private sealed class GroupLockObservingOrderProvider :
+            OrderProvider,
+            IOrderProvider
+        {
+            private readonly object _groupOrderIds;
+
+            public bool ObservedGroupOrderIdsLock { get; private set; }
+
+            public GroupLockObservingOrderProvider(
+                IList<LeanOrder> orders,
+                GroupOrderManager group)
+                : base(orders)
+            {
+                _groupOrderIds = group.OrderIds;
+            }
+
+            LeanOrder IOrderProvider.GetOrderById(int orderId)
+            {
+                ObserveGroupOrderIdsLock();
+                return base.GetOrderById(orderId);
+            }
+
+            IEnumerable<LeanOrder> IOrderProvider.GetOrders(
+                Func<LeanOrder, bool> filter)
+            {
+                ObserveGroupOrderIdsLock();
+                return base.GetOrders(filter);
+            }
+
+            private void ObserveGroupOrderIdsLock()
+            {
+                ObservedGroupOrderIdsLock |= Monitor.IsEntered(_groupOrderIds);
+            }
         }
 
         private sealed class FinancialAdvisorOrderBrokerage : BacktestingBrokerage
