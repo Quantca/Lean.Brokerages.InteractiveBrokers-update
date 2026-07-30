@@ -1422,6 +1422,32 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void AccountValueBuilderExcludesBaseCashBalanceRowsTest()
+        {
+            var builder =
+                new InteractiveBrokersFinancialAdvisorAccountState.AccountValueBuilder(
+                    "PaperA",
+                    Array.Empty<string>());
+            builder.Apply("AccountReady", "true", string.Empty);
+            builder.Apply("NetLiquidation", "1000", "USD");
+            builder.Apply("TotalCashBalance", "250", "BASE");
+            builder.Apply("CashBalance", "999", "base");
+            builder.Apply("$LEDGER:CashBalance", "998", "BASE");
+            builder.Apply("$LEDGER-BASE:CashBalance", "997", string.Empty);
+            builder.Apply("CashBalance", "250", "USD");
+
+            var account = builder.Build(Array.Empty<BrokerageAccountPosition>());
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(250m, account.TotalCashValue);
+                Assert.AreEqual(1, account.CashBalances.Count);
+                Assert.AreEqual(250m, account.CashBalances["USD"]);
+                Assert.IsFalse(account.CashBalances.ContainsKey("BASE"));
+            });
+        }
+
+        [Test]
         public void AccountValueBuilderAcceptsLedgerCashAndDiscardsLedgerNonCashTest()
         {
             var builder =

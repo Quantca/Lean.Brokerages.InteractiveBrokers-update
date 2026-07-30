@@ -2615,7 +2615,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         throw new InvalidOperationException(
                             $"IB returned a cash balance without a currency for '{AccountId}'.");
                     }
-                    _cash[currency.Trim()] = parsed;
+                    var cashCurrency = currency.Trim();
+                    if (!cashCurrency.Equals(
+                            "BASE",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        _cash[cashCurrency] = parsed;
+                    }
                 }
                 else if (normalizedTag.Equals(
                     "NetLiquidation", StringComparison.OrdinalIgnoreCase))
