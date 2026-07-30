@@ -1887,7 +1887,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     if (_disposed || !_connected || !socketConnected ||
                         !ReferenceEquals(_pendingRequest, pending) ||
-                        !IsCurrentScopeLocked(pending.Scope) ||
+                        (!cancellation && !IsCurrentScopeLocked(pending.Scope)) ||
                         pending.RequestId == 0 && _unkeyedResponseMayStillArrive)
                     {
                         throw new RequestInvalidatedException(

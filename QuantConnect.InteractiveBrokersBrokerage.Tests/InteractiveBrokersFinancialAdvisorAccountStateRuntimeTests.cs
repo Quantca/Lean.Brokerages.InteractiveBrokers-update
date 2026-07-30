@@ -977,6 +977,48 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task SupersededRefreshCancelsItsLivePositionsSubscriptionTest()
+        {
+            using var scenario = new Scenario();
+            using var cancelEntered = new ManualResetEventSlim();
+            using var releaseCancel = new ManualResetEventSlim();
+            var canceledRequestId = 0;
+            scenario.Actions.CancelPositions = (requestId, authorize) =>
+            {
+                canceledRequestId = requestId;
+                cancelEntered.Set();
+                if (!releaseCancel.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    throw new TimeoutException("Test cancellation was not released.");
+                }
+                return scenario.RunAuthorized(
+                    authorize,
+                    () => scenario.CanceledPositionIds.Add(requestId));
+            };
+            using var state = scenario.CreateState();
+
+            Assert.IsTrue(state.RequestRefresh(new[] { "Alpha" }));
+            try
+            {
+                Assert.IsTrue(cancelEntered.Wait(TimeSpan.FromSeconds(5)));
+                Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            }
+            finally
+            {
+                releaseCancel.Set();
+            }
+
+            var snapshot = await WaitForReadyGenerationAsync(state, 0);
+            Assert.Multiple(() =>
+            {
+                Assert.IsTrue(snapshot.IsComplete);
+                Assert.AreNotEqual(0, canceledRequestId);
+                CollectionAssert.Contains(
+                    scenario.CanceledPositionIds, canceledRequestId);
+            });
+        }
+
+        [Test]
         public async Task QueuedScopesAreMergedAndCompleteDiscoveryDominatesTest()
         {
             using var scenario = new Scenario();
