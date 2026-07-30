@@ -508,7 +508,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return false;
                 }
 
-                ValidateFinancialAdvisorOrderAdmission(order);
+                ValidateFinancialAdvisorOrderAdmission(order, isUpdate: false);
                 IBPlaceOrder(order, true);
                 return true;
             }
@@ -540,7 +540,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return false;
                 }
 
-                ValidateFinancialAdvisorOrderAdmission(order);
+                ValidateFinancialAdvisorOrderAdmission(order, isUpdate: true);
                 _orderUpdates[order.Id] = order.Id;
                 IBPlaceOrder(order, false);
             }

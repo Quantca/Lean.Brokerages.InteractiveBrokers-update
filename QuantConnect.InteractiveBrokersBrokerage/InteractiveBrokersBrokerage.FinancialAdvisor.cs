@@ -283,7 +283,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return properties;
         }
 
-        internal void ValidateFinancialAdvisorOrderAdmission(Order order)
+        internal void ValidateFinancialAdvisorOrderAdmission(
+            Order order,
+            bool isUpdate = false)
         {
             if (!_financialAdvisorUnifiedGroupsEnabled ||
                 !IsFinancialAdvisor ||
@@ -301,7 +303,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             var unsupportedConfigurationError =
                 _financialAdvisorAccountState?.UnsupportedConfigurationError;
-            if (!string.IsNullOrEmpty(unsupportedConfigurationError) &&
+            if (!isUpdate &&
+                !string.IsNullOrEmpty(unsupportedConfigurationError) &&
                 FAState.IsFinancialAdvisorGroupOrder(
                     order, _financialAdvisorsGroupFilter))
             {
@@ -319,6 +322,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 throw new InvalidOperationException(
                     $"Order FA group '{properties.FaGroup}' does not match the configured " +
                     $"Financial Advisor group filter '{_financialAdvisorsGroupFilter}'.");
+            }
+            if (isUpdate)
+            {
+                return;
             }
             if (_financialAdvisorAccountState?.IsGroupTradingBlocked == true &&
                 FAState.IsFinancialAdvisorGroupOrder(

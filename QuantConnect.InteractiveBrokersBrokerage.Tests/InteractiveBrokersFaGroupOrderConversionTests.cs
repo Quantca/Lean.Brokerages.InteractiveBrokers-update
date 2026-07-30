@@ -262,6 +262,53 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void UpdateAdmissionRejectsOnlyStateIndependentRoutingErrorsTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            UnsupportedConfigurationErrorField.SetValue(
+                state, "Unsupported current topology.");
+            GroupTradingBlockedField.SetValue(state, true);
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    new BrokerageAccountGroup(
+                        FaGroupName, "NetLiq", new[] { "ManagedAccount" })));
+            AccountStateField.SetValue(brokerage, state);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    CreateOrder(new InteractiveBrokersOrderProperties
+                    {
+                        FaGroup = FaGroupName,
+                        FaMethod = "Equal"
+                    }),
+                    isUpdate: true));
+            Assert.IsInstanceOf<NotSupportedException>(
+                Assert.Catch(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        CreateOrder(new InteractiveBrokersOrderProperties
+                        {
+                            FaProfile = "LegacyProfile"
+                        }),
+                        isUpdate: true)));
+            StringAssert.Contains(
+                "does not match the configured",
+                Assert.Catch(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        CreateOrder(new InteractiveBrokersOrderProperties
+                        {
+                            FaGroup = "OutsideGroup"
+                        }),
+                        isUpdate: true)).Message);
+        }
+
+        [Test]
         public void AllocationMethodValidationFailsOpenWithoutAuthorityTest()
         {
             var savedGroup = new BrokerageAccountGroup(
