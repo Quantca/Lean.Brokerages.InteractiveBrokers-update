@@ -152,6 +152,32 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void DirectAccountOrderPreservesExactQuantityForFractionalAndIntegerLotsTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var properties = new InteractiveBrokersOrderProperties
+            {
+                Account = "TestSubAccount"
+            };
+            var fractionalOrder = new LimitOrder(
+                Symbol.Create("AUDUSD", SecurityType.Cfd, Market.InteractiveBrokers),
+                -9925.25m,
+                1m,
+                new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
+                properties: properties);
+            var integerOrder = new LimitOrder(
+                Symbols.SPY,
+                -9m,
+                100m,
+                fractionalOrder.Time,
+                properties: properties);
+
+            Assert.AreEqual(9925.25m, ConvertOrder(brokerage, fractionalOrder).TotalQuantity);
+            Assert.AreEqual(9m, ConvertOrder(brokerage, integerOrder).TotalQuantity);
+        }
+
+        [Test]
         public void ConfigurationWriteGateBlocksOnlyGroupOrdersTest()
         {
             var brokerage = CreateOfflineBrokerage();

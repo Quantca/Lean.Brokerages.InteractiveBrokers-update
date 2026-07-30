@@ -364,6 +364,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ibOrder.Account = properties.Account;
                 ibOrder.FaGroup = string.Empty;
                 ibOrder.FaMethod = string.Empty;
+                ibOrder.TotalQuantity = Math.Abs(
+                    leanOrder.GroupOrderManager?.Quantity ?? leanOrder.Quantity);
                 return;
             }
 
