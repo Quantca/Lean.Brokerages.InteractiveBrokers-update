@@ -135,6 +135,72 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase("managed")]
+        [TestCase("fa:1")]
+        [TestCase("fa:3")]
+        [TestCase("family")]
+        public async Task UnkeyedCallbackBeforeWireAuthorizationIsDiscardedTest(
+            string request)
+        {
+            using var scenario = new Scenario();
+            var managedAccounts = scenario.Actions.RequestManagedAccounts;
+            var financialAdvisor = scenario.Actions.RequestFinancialAdvisor;
+            var familyCodes = scenario.Actions.RequestFamilyCodes;
+            var foreignCallbackInjected = false;
+            void InjectForeignCallback(string currentRequest)
+            {
+                if (foreignCallbackInjected || currentRequest != request)
+                {
+                    return;
+                }
+                foreignCallbackInjected = true;
+                switch (currentRequest)
+                {
+                    case "managed":
+                        scenario.Client.managedAccounts("MASTER,FOREIGN");
+                        break;
+                    case "fa:1":
+                        scenario.Client.receiveFA(1, Scenario.EmptyGroupsXml);
+                        break;
+                    case "fa:3":
+                        scenario.Client.receiveFA(3, "<ListOfAccountAliases />");
+                        break;
+                    case "family":
+                        scenario.Client.familyCodes(Array.Empty<FamilyCode>());
+                        break;
+                }
+            }
+            scenario.Actions.RequestManagedAccounts = authorize =>
+            {
+                InjectForeignCallback("managed");
+                return managedAccounts(authorize);
+            };
+            scenario.Actions.RequestFinancialAdvisor = (faDataType, authorize) =>
+            {
+                InjectForeignCallback($"fa:{faDataType}");
+                return financialAdvisor(faDataType, authorize);
+            };
+            scenario.Actions.RequestFamilyCodes = authorize =>
+            {
+                InjectForeignCallback("family");
+                return familyCodes(authorize);
+            };
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsTrue(foreignCallbackInjected);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(
+                    2,
+                    scenario.Requests.Count(actualRequest => actualRequest == request));
+            });
+        }
+
         [TestCase("managed", false)]
         [TestCase("managed", true)]
         [TestCase("fa:1", false)]
@@ -1822,6 +1888,45 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(0, snapshot.Generation);
                 Assert.AreEqual(2, scenario.GroupsRequestCount);
                 StringAssert.Contains("topology changed while the account snapshot was collected",
+                    snapshot.ErrorMessage);
+            });
+        }
+
+        [Test]
+        public async Task EndingGroupsRereadDiscardsPreWireCallbackTest()
+        {
+            using var scenario = new Scenario
+            {
+                EndingGroupsDocument = Scenario.GroupsXml.Replace(
+                    "<String>ACC1</String>",
+                    "<String>ACC3</String>",
+                    StringComparison.Ordinal)
+            };
+            var financialAdvisor = scenario.Actions.RequestFinancialAdvisor;
+            var groupsActionCount = 0;
+            scenario.Actions.RequestFinancialAdvisor = (faDataType, authorize) =>
+            {
+                if (faDataType == 1 && ++groupsActionCount == 2)
+                {
+                    scenario.Client.receiveFA(1, Scenario.GroupsXml);
+                }
+                return financialAdvisor(faDataType, authorize);
+            };
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
+                Assert.IsFalse(snapshot.IsReady);
+                Assert.AreEqual(0, snapshot.Generation);
+                Assert.AreEqual(2, groupsActionCount);
+                Assert.AreEqual(2, scenario.GroupsRequestCount);
+                StringAssert.Contains(
+                    "topology changed while the account snapshot was collected",
                     snapshot.ErrorMessage);
             });
         }

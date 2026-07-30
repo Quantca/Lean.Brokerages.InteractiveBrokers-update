@@ -2073,7 +2073,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return;
                 }
                 else if (_pendingRequest is
-                    { Kind: PendingKind.ManagedAccounts, Finished: false })
+                    {
+                        Kind: PendingKind.ManagedAccounts,
+                        Finished: false,
+                        WireSent: true
+                    })
                 {
                     completed = _pendingRequest;
                     completed.Text = args.AccountList;
@@ -2104,7 +2108,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             lock (_callbackStateLock)
             {
                 if (!_disposed && !_unkeyedResponseMayStillArrive &&
-                    _pendingRequest is { Finished: false } pending &&
+                    _pendingRequest is { Finished: false, WireSent: true } pending &&
                     (pending.Kind == kind ||
                      kind == PendingKind.FinancialAdvisor &&
                      pending.Kind == PendingKind.FinancialAdvisorReadback) &&
