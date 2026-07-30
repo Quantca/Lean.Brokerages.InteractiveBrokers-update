@@ -155,7 +155,7 @@ Identifiers in common account snapshots are compared case-insensitively. Mutatio
 
 #### Snapshot Freshness
 
-The Financial Advisor service has no brokerage-owned periodic refresh cadence by design. The algorithm owns freshness policy and schedules `RequestBrokerageAccountSnapshotRefresh` calls. A practical starting point is a group-scoped topology refresh about every 60 seconds and a complete account-state refresh about every 180 seconds, adjusted for the strategy and IB pacing budget.
+The Financial Advisor service has no brokerage-owned periodic refresh cadence by design. The algorithm owns freshness policy and schedules `RequestBrokerageAccountSnapshotRefresh` calls. A practical starting point is a group-scoped topology refresh about every 60 seconds and a complete account-state refresh about every 180 seconds, adjusted for the strategy and IB pacing budget. The included samples use a 90-second scoped cadence and complete discovery every third tick (about 270 seconds) so minute-resolution data and scheduled refreshes do not remain phase-aligned.
 
 A disconnect publishes `Stale`. After a confirmed reconnect, the brokerage issues one coalesced refresh using the most recently accepted or coalesced algorithm-requested scope, but only if the service session has prior accepted snapshot demand. A request that returned `false` is not remembered. This reconnect recovery is one request, not a cadence; an algorithm that never uses snapshots causes no automatic snapshot traffic. Before acting, check status and completeness and enforce the strategy's maximum age using `AsOfUtc` (snapshot publication), `CollectionStartedUtc` (collection start), and `LastSuccessfulUpdateUtc` (last successful refresh, preserved by later status and `Stale` publications).
 
