@@ -107,6 +107,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             typeof(InteractiveBrokersBrokerage).GetMethod(
                 "ConvertOrders",
                 BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly MethodInfo EmitOrderFillMethod =
+            typeof(InteractiveBrokersBrokerage).GetMethod(
+                "EmitOrderFill",
+                BindingFlags.Instance | BindingFlags.NonPublic);
 
         /// <summary>
         /// When the FA group filter is configured and the order carries a per-order
@@ -179,6 +183,118 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.AreEqual(9925.25m, ConvertOrder(brokerage, fractionalOrder).TotalQuantity);
             Assert.AreEqual(9m, ConvertOrder(brokerage, integerOrder).TotalQuantity);
+        }
+
+        [TestCase(9925.25)]
+        [TestCase(9925.5)]
+        public void UnifiedFinancialAdvisorDirectAccountFillPreservesExactQuantityTest(
+            double quantity)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var order = CreateFractionalFillOrder(
+                Convert.ToDecimal(quantity),
+                new InteractiveBrokersOrderProperties
+                {
+                    Account = "TestSubAccount"
+                });
+
+            var orderEvent = EmitOrderFill(
+                brokerage,
+                order,
+                Convert.ToDecimal(quantity),
+                Convert.ToDecimal(quantity));
+
+            Assert.AreEqual(Convert.ToDecimal(quantity), orderEvent.FillQuantity);
+            Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
+            Assert.AreEqual(
+                "Interactive Brokers Order Fill Event",
+                orderEvent.Message);
+        }
+
+        [TestCase(9925.25)]
+        [TestCase(9925.5)]
+        public void UnifiedFinancialAdvisorGroupFillPreservesExactQuantityTest(
+            double quantity)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var order = CreateFractionalFillOrder(
+                Convert.ToDecimal(quantity),
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                });
+
+            var orderEvent = EmitOrderFill(
+                brokerage,
+                order,
+                Convert.ToDecimal(quantity),
+                Convert.ToDecimal(quantity));
+
+            Assert.AreEqual(Convert.ToDecimal(quantity), orderEvent.FillQuantity);
+            Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
+            Assert.AreEqual(
+                "Interactive Brokers Order Fill Event",
+                orderEvent.Message);
+        }
+
+        [TestCase(false, true)]
+        [TestCase(true, false)]
+        public void LegacyFillAccountingRemainsUnchangedTest(
+            bool unifiedGroupsEnabled,
+            bool financialAdvisorAccount)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, unifiedGroupsEnabled);
+            AccountField.SetValue(
+                brokerage,
+                financialAdvisorAccount ? FaMasterAccount : "DU1234567");
+            var order = CreateFractionalFillOrder(
+                9925.5m,
+                new InteractiveBrokersOrderProperties
+                {
+                    Account = "TestSubAccount"
+                },
+                Symbols.SPY);
+
+            var orderEvent = EmitOrderFill(
+                brokerage,
+                order,
+                9925.5m,
+                9925.5m);
+
+            Assert.AreEqual(9926m, orderEvent.FillQuantity);
+            Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
+            Assert.AreEqual(
+                "Interactive Brokers Order Fill Event",
+                orderEvent.Message);
+        }
+
+        [Test]
+        public void ExactFillTreatsSubPrecisionResidualAsFilledTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var order = CreateFractionalFillOrder(
+                9925.5m,
+                new InteractiveBrokersOrderProperties
+                {
+                    Account = "TestSubAccount"
+                },
+                Symbols.SPY);
+
+            var orderEvent = EmitOrderFill(
+                brokerage,
+                order,
+                9925.4999999m,
+                9925.4999999m);
+
+            Assert.AreEqual(9925.4999999m, orderEvent.FillQuantity);
+            Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
+            Assert.AreEqual(
+                "Interactive Brokers Order Fill Event",
+                orderEvent.Message);
         }
 
         [Test]
@@ -1356,6 +1472,63 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private static int GetCollectionCount(object collection)
         {
             return (int)collection.GetType().GetProperty("Count").GetValue(collection);
+        }
+
+        private static LimitOrder CreateFractionalFillOrder(
+            decimal quantity,
+            InteractiveBrokersOrderProperties properties,
+            Symbol symbol = null)
+        {
+            return new LimitOrder(
+                symbol ?? Symbol.Create(
+                    "AUDUSD",
+                    SecurityType.Cfd,
+                    Market.InteractiveBrokers),
+                quantity,
+                1m,
+                new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
+                properties: properties);
+        }
+
+        private static OrderEvent EmitOrderFill(
+            InteractiveBrokersBrokerage brokerage,
+            LeanOrder order,
+            decimal shares,
+            decimal cumulativeQuantity)
+        {
+            OrderEvent orderEvent = null;
+            brokerage.OrdersStatusChanged += (_, orderEvents) =>
+                orderEvent = orderEvents.Single();
+            var execution = new Execution
+            {
+                OrderId = 1,
+                ExecId = "exact-fill",
+                Shares = shares,
+                CumQty = cumulativeQuantity,
+                Price = 1d
+            };
+            var commissionReport = new CommissionAndFeesReport
+            {
+                ExecId = execution.ExecId,
+                CommissionAndFees = 0d,
+                Currency = Currencies.USD
+            };
+
+            EmitOrderFillMethod.Invoke(
+                brokerage,
+                new object[]
+                {
+                    order,
+                    new IB.ExecutionDetailsEventArgs(
+                        1,
+                        new Contract(),
+                        execution),
+                    commissionReport,
+                    false
+                });
+
+            Assert.IsNotNull(orderEvent);
+            return orderEvent;
         }
 
         private static FieldInfo FindSocketConnectedField(EClientSocket socket)

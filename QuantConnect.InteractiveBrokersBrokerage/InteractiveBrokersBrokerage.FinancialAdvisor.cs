@@ -496,5 +496,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
+        private bool UsesExactFinancialAdvisorFillQuantity(Order order)
+        {
+            if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor)
+            {
+                return false;
+            }
+
+            var properties = order?.Properties as InteractiveBrokersOrderProperties;
+            return order?.Type != OrderType.OptionExercise &&
+                (!string.IsNullOrWhiteSpace(properties?.Account) ||
+                    string.IsNullOrWhiteSpace(properties?.Account) &&
+                    (!string.IsNullOrWhiteSpace(properties?.FaGroup) ||
+                        !string.IsNullOrWhiteSpace(
+                            _financialAdvisorsGroupFilter)));
+        }
+
     }
 }

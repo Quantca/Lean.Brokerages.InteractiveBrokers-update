@@ -2863,6 +2863,62 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 var targetOrderCommissionReport = fillDetails.CommissionReport;
 
                 var absoluteQuantity = targetOrder.AbsoluteQuantity;
+                var useExactFillQuantity =
+                    UsesExactFinancialAdvisorFillQuantity(targetOrder);
+                if (useExactFillQuantity)
+                {
+                    var exactCurrentQuantityFilled =
+                        targetOrderExecutionDetails.Execution.Shares;
+                    var exactTotalQuantityFilled =
+                        targetOrderExecutionDetails.Execution.CumQty;
+                    var exactRemainingQuantity =
+                        absoluteQuantity - exactTotalQuantityFilled;
+                    var lotSize = _algorithm?.Securities.TryGetValue(
+                            targetOrder.Symbol,
+                            out var security) == true
+                        ? security.SymbolProperties.LotSize
+                        : GetSymbolProperties(targetOrder.Symbol).LotSize;
+                    var residualTolerance = Math.Abs(lotSize) / 1000000m;
+                    if (Math.Abs(exactRemainingQuantity) < residualTolerance)
+                    {
+                        exactRemainingQuantity = 0m;
+                    }
+
+                    var exactPrice = NormalizePriceToLean(
+                        targetOrderExecutionDetails.Execution.Price,
+                        targetOrder.Symbol);
+                    var exactOrderFee = new OrderFee(new CashAmount(
+                        Convert.ToDecimal(
+                            targetOrderCommissionReport.CommissionAndFees),
+                        targetOrderCommissionReport.Currency.ToUpperInvariant()));
+
+                    var exactStatus = exactRemainingQuantity > 0
+                        ? OrderStatus.PartiallyFilled
+                        : OrderStatus.Filled;
+                    var exactFillQuantity =
+                        targetOrder.Direction == OrderDirection.Buy
+                            ? exactCurrentQuantityFilled
+                            : -exactCurrentQuantityFilled;
+                    var exactOrderEvent = new OrderEvent(
+                        targetOrder,
+                        DateTime.UtcNow,
+                        exactOrderFee,
+                        "Interactive Brokers Order Fill Event")
+                    {
+                        Status = exactStatus,
+                        FillPrice = exactPrice,
+                        FillQuantity = exactFillQuantity
+                    };
+                    if (exactRemainingQuantity != 0)
+                    {
+                        exactOrderEvent.Message +=
+                            " - " + exactRemainingQuantity + " remaining";
+                    }
+
+                    fillEvents.Add(exactOrderEvent);
+                    continue;
+                }
+
                 var currentQuantityFilled = Convert.ToInt32(targetOrderExecutionDetails.Execution.Shares);
                 var totalQuantityFilled = Convert.ToInt32(targetOrderExecutionDetails.Execution.CumQty);
                 var remainingQuantity = Convert.ToInt32(absoluteQuantity - totalQuantityFilled);
