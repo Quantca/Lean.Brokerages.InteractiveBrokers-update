@@ -2548,7 +2548,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             private readonly Dictionary<string, decimal> _cash =
                 new(StringComparer.OrdinalIgnoreCase);
             private bool? _accountReady;
-            private bool _hasLedgerPrefix;
 
             internal string AccountId { get; }
             internal IReadOnlyCollection<string> GroupNames { get; }
@@ -2570,7 +2569,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal void Apply(string tag, string value, string currency)
             {
                 var ledger = tag?.StartsWith("$LEDGER", StringComparison.OrdinalIgnoreCase) == true;
-                _hasLedgerPrefix |= ledger;
                 var normalizedTag = NormalizeLedgerTag(tag, ref currency);
                 if (normalizedTag.Equals("AccountReady", StringComparison.OrdinalIgnoreCase))
                 {
@@ -2589,7 +2587,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 var cashBalance = normalizedTag.Equals(
                     "CashBalance", StringComparison.OrdinalIgnoreCase);
-                if (cashBalance && !ledger || ledger && !cashBalance)
+                if (ledger && !cashBalance)
                 {
                     return;
                 }
@@ -2657,12 +2655,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     throw new InvalidOperationException(
                         $"IB did not report that account '{AccountId}' was ready.");
-                }
-                if (!_hasLedgerPrefix)
-                {
-                    throw new InvalidOperationException(
-                        $"IB returned ambiguous currency values for '{AccountId}'. Enable " +
-                        "'Prepend $LEDGER- to Currency-Specific Account Values' in TWS.");
                 }
                 if (!NetLiquidation.HasValue || !TotalCashValue.HasValue ||
                     string.IsNullOrWhiteSpace(ValuationCurrency) || _cash.Count == 0)

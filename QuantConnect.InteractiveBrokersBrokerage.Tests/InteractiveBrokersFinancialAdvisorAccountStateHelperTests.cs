@@ -1398,5 +1398,51 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             StringAssert.Contains("only group 'Destination'", exception.Message);
         }
+
+        [Test]
+        public void AccountValueBuilderAcceptsOrdinaryCashBalanceTest()
+        {
+            var builder =
+                new InteractiveBrokersFinancialAdvisorAccountState.AccountValueBuilder(
+                    "PaperA",
+                    Array.Empty<string>());
+            builder.Apply("AccountReady", "true", string.Empty);
+            builder.Apply("NetLiquidation", "1000", "USD");
+            builder.Apply("TotalCashValue", "250", "USD");
+            builder.Apply("CashBalance", "250", "USD");
+
+            var account = builder.Build(Array.Empty<BrokerageAccountPosition>());
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(1000m, account.NetLiquidation);
+                Assert.AreEqual(250m, account.TotalCashValue);
+                Assert.AreEqual(250m, account.CashBalances["USD"]);
+            });
+        }
+
+        [Test]
+        public void AccountValueBuilderAcceptsLedgerCashAndDiscardsLedgerNonCashTest()
+        {
+            var builder =
+                new InteractiveBrokersFinancialAdvisorAccountState.AccountValueBuilder(
+                    "PaperA",
+                    Array.Empty<string>());
+            builder.Apply("AccountReady", "true", string.Empty);
+            builder.Apply("NetLiquidation", "1000", "USD");
+            builder.Apply("TotalCashValue", "250", "USD");
+            builder.Apply("$LEDGER-USD:NetLiquidation", "999", string.Empty);
+            builder.Apply("$LEDGER-USD:TotalCashValue", "999", string.Empty);
+            builder.Apply("$LEDGER-USD:CashBalance", "250", string.Empty);
+
+            var account = builder.Build(Array.Empty<BrokerageAccountPosition>());
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(1000m, account.NetLiquidation);
+                Assert.AreEqual(250m, account.TotalCashValue);
+                Assert.AreEqual(250m, account.CashBalances["USD"]);
+            });
+        }
     }
 }
