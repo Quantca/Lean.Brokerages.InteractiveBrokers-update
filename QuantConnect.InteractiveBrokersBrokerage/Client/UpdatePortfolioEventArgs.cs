@@ -33,7 +33,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// The number of positions held.
         /// If the position is 0, it means the position has just cleared.
         /// </summary>
-        public int Position { get; }
+        public int Position => Convert.ToInt32(PositionQuantity);
 
         /// <summary>
         /// The exact number of positions held.
@@ -99,11 +99,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             int? positionsMultiRequestId = null)
         {
             Contract = contract;
-            Position = position > int.MaxValue
-                ? int.MaxValue
-                : position < int.MinValue
-                    ? int.MinValue
-                    : Convert.ToInt32(position);
             PositionQuantity = position;
             PositionsMultiRequestId = positionsMultiRequestId;
             MarketPrice = marketPrice;

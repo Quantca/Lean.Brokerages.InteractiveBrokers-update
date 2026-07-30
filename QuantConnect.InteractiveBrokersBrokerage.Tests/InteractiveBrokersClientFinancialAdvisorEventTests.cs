@@ -343,8 +343,57 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase(1.5, 2)]
+        [TestCase(2.5, 2)]
+        [TestCase(-1.5, -2)]
+        [TestCase(-2.5, -2)]
+        public void LegacyPositionProjectionUsesUpstreamRounding(
+            double position,
+            int expected)
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            UpdatePortfolioEventArgs update = null;
+            client.UpdatePortfolio += (_, args) => update = args;
+
+            client.updatePortfolio(
+                new Contract(),
+                Convert.ToDecimal(position),
+                2,
+                3,
+                4,
+                5,
+                6,
+                "DU123");
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(expected, update.Position);
+                Assert.AreEqual(Convert.ToDecimal(position), update.PositionQuantity);
+            });
+        }
+
         [Test]
-        public void PositionMultiClampsLegacyOverflowAndPreservesExactQuantityAndEndCallbacks()
+        public void PublicIntegerPositionConstructorPreservesBothProjections()
+        {
+            var update = new UpdatePortfolioEventArgs(
+                new Contract(),
+                123,
+                2,
+                3,
+                4,
+                5,
+                6,
+                "DU123");
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(123, update.Position);
+                Assert.AreEqual(123m, update.PositionQuantity);
+            });
+        }
+
+        [Test]
+        public void PositionMultiPreservesExactOverflowAndThrowsOnlyOnLegacyRead()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
             var exactUpdates = new List<PositionMultiEventArgs>();
@@ -373,15 +422,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(decimal.MaxValue, exactUpdates[0].Position);
                 Assert.AreEqual(decimal.MinValue, exactUpdates[1].Position);
                 Assert.AreEqual(2, legacyUpdates.Count);
-                Assert.AreEqual(int.MaxValue, legacyUpdates[0].Position);
                 Assert.AreEqual(decimal.MaxValue, legacyUpdates[0].PositionQuantity);
                 Assert.AreEqual(41, legacyUpdates[0].PositionsMultiRequestId);
-                Assert.AreEqual(int.MinValue, legacyUpdates[1].Position);
                 Assert.AreEqual(decimal.MinValue, legacyUpdates[1].PositionQuantity);
                 Assert.AreEqual(42, legacyUpdates[1].PositionsMultiRequestId);
                 CollectionAssert.AreEqual(new[] { 41, 42 }, internalEndRequestIds);
                 Assert.AreEqual(2, publicEndCount);
             });
+            Assert.Throws<OverflowException>(() => _ = legacyUpdates[0].Position);
+            Assert.Throws<OverflowException>(() => _ = legacyUpdates[1].Position);
         }
     }
 }
