@@ -1816,11 +1816,17 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             unsupportedOrder,
                             snapshot)).Message);
                 StringAssert.Contains(
-                    "unsupported saved allocation method 'PctChange'",
-                    Assert.Throws<NotSupportedException>(() =>
+                    "Set FaMethod = \"PctChange\" explicitly",
+                    Assert.Throws<InvalidOperationException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             savedPctChangeOrder,
                             snapshot)).Message);
+                savedPctChangeOrder.FaMethod = "PctChange";
+                savedPctChangeOrder.FaPercentage = "25";
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        savedPctChangeOrder,
+                        snapshot));
             });
         }
 
@@ -1876,10 +1882,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         new IBApi.Order { FaGroup = "Monetary" },
                         snapshot));
-                Assert.Throws<NotSupportedException>(() =>
-                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
-                        new IBApi.Order { FaGroup = "SavedPctChange" },
-                        snapshot));
+                StringAssert.Contains(
+                    "Set FaMethod = \"PctChange\" explicitly",
+                    Assert.Throws<InvalidOperationException>(() =>
+                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                            new IBApi.Order { FaGroup = "SavedPctChange" },
+                            snapshot)).Message);
             });
         }
 

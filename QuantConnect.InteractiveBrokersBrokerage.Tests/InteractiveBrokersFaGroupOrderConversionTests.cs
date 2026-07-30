@@ -757,6 +757,61 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup))).Message);
         }
 
+        [Test]
+        public void SavedPctChangeRequiresExplicitMethodOnlyWithReadyAuthorityTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "PctChange",
+                new[] { "ManagedAccount" });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+            var savedMethodOrder =
+                CreateOrder(new InteractiveBrokersOrderProperties());
+            var explicitMethodOrder =
+                CreateOrder(new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = "PctChange",
+                    ExactFaPercentage = -25.5m
+                });
+
+            StringAssert.Contains(
+                "Set FaMethod = \"PctChange\" explicitly",
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        savedMethodOrder)).Message);
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    explicitMethodOrder));
+            Assert.AreEqual(
+                9926m,
+                EmitOrderFill(
+                    brokerage,
+                    explicitMethodOrder,
+                    9925.5m,
+                    9925.5m).FillQuantity);
+
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    savedGroup));
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    savedMethodOrder));
+        }
+
         [TestCase(BrokerageAccountRelationship.Primary)]
         [TestCase(BrokerageAccountRelationship.Aggregate)]
         [TestCase(BrokerageAccountRelationship.Unknown)]
@@ -1365,16 +1420,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 BrokerageAccountSnapshotStatus.Ready,
                 group);
 
-            if (savedMethod == "PctChange")
-            {
-                StringAssert.Contains(
-                    "unsupported saved allocation method 'PctChange'",
-                    Assert.Throws<NotSupportedException>(() =>
-                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
-                            order,
-                            snapshot)).Message);
-            }
-            else if (expectedAllowed)
+            if (expectedAllowed)
             {
                 Assert.DoesNotThrow(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
@@ -1437,11 +1483,16 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             pctChangeOrder.FaGroup = savedPctChange.Name;
             pctChangeOrder.FaMethod = string.Empty;
             StringAssert.Contains(
-                "unsupported saved allocation method 'PctChange'",
-                Assert.Throws<NotSupportedException>(() =>
+                "Set FaMethod = \"PctChange\" explicitly",
+                Assert.Throws<InvalidOperationException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         pctChangeOrder,
                         CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedPctChange))).Message);
+            pctChangeOrder.FaMethod = "PctChange";
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    pctChangeOrder,
+                    CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedPctChange)));
         }
 
         private static IEnumerable<TestCaseData> SavedAndRequestedAllocationMethods()
@@ -1472,10 +1523,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 foreach (var requestedMethod in requestedMethods)
                 {
-                    var expectedAllowed = savedMethod != "PctChange" &&
-                        (requestedMethod.Length == 0 ||
+                    var expectedAllowed =
+                        savedMethod == "PctChange"
+                            ? requestedMethod == "PctChange"
+                            : requestedMethod.Length == 0 ||
                             (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
-                            (requestedMethod == savedMethod || requestedMethod == "PctChange"));
+                            (requestedMethod == savedMethod || requestedMethod == "PctChange");
                     yield return new TestCaseData(
                             savedMethod,
                             requestedMethod,
