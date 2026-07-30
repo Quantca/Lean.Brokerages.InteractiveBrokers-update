@@ -292,53 +292,28 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var ibOrder = new IBApi.Order { Account = _account };
             ConfigureFinancialAdvisorOrder(ibOrder, order);
-            var group = order.GroupOrderManager;
-            var legs = !isUpdate && group != null && _orderProvider != null
-                ? _orderProvider.GetOrders(leg => leg.GroupOrderManager?.Id == group.Id &&
-                    (group.Id != 0 || ReferenceEquals(leg.GroupOrderManager, group))).ToList()
-                : null;
-            if (legs != null && legs.Count == group.Count)
-            {
-                var routes = legs.Select(leg =>
-                {
-                    var route = new IBApi.Order { Account = _account };
-                    ConfigureFinancialAdvisorOrder(route, leg);
-                    decimal.TryParse(route.FaPercentage, NumberStyles.Float, CultureInfo.InvariantCulture, out var percentage);
-                    return (route.Account ?? string.Empty, route.FaGroup ?? string.Empty, route.FaMethod ?? string.Empty, percentage);
-                }).Distinct().Take(2).Count();
-                if (routes != 1)
-                {
-                    throw new InvalidOperationException("All combo legs must use the same effective Financial Advisor Account, FaGroup, FaMethod, and percentage.");
-                }
-            }
             var properties = order.Properties as InteractiveBrokersOrderProperties;
-            if (!string.IsNullOrWhiteSpace(properties?.Account))
+            var isDirectAccountOrder =
+                !string.IsNullOrWhiteSpace(properties?.Account);
+            if (!isDirectAccountOrder)
             {
-                return;
+                var unsupportedConfigurationError =
+                    _financialAdvisorAccountState?.UnsupportedConfigurationError;
+                if (!isUpdate &&
+                    !string.IsNullOrEmpty(unsupportedConfigurationError) &&
+                    FAState.IsFinancialAdvisorGroupOrder(
+                        order, _financialAdvisorsGroupFilter))
+                {
+                    throw new InvalidOperationException(
+                        unsupportedConfigurationError);
+                }
+                ValidateStateIndependentFinancialAdvisorOrderAdmission(order);
             }
-            var unsupportedConfigurationError =
-                _financialAdvisorAccountState?.UnsupportedConfigurationError;
-            if (!isUpdate &&
-                !string.IsNullOrEmpty(unsupportedConfigurationError) &&
-                FAState.IsFinancialAdvisorGroupOrder(
-                    order, _financialAdvisorsGroupFilter))
+            if (!isUpdate)
             {
-                throw new InvalidOperationException(unsupportedConfigurationError);
+                PreflightFinancialAdvisorComboLegs(order, ibOrder);
             }
-            if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
-            {
-                throw new NotSupportedException(
-                    "Legacy Financial Advisor profiles are not supported when unified groups are enabled. Use FaGroup instead.");
-            }
-            if (!string.IsNullOrWhiteSpace(properties?.FaGroup) &&
-                FAState.IsOutsideFinancialAdvisorGroupFilter(
-                    _financialAdvisorsGroupFilter, properties.FaGroup))
-            {
-                throw new InvalidOperationException(
-                    $"Order FA group '{properties.FaGroup}' does not match the configured " +
-                    $"Financial Advisor group filter '{_financialAdvisorsGroupFilter}'.");
-            }
-            if (isUpdate)
+            if (isDirectAccountOrder || isUpdate)
             {
                 return;
             }
@@ -360,6 +335,103 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _algorithm?.Securities.TryGetValue(order.Symbol, out var security) == true
                     ? security.SymbolProperties.LotSize
                     : GetSymbolProperties(order.Symbol).LotSize);
+        }
+
+        private void PreflightFinancialAdvisorComboLegs(
+            Order order,
+            IBApi.Order currentRoute)
+        {
+            var group = order.GroupOrderManager;
+            var orderProvider = _orderProvider;
+            if (group == null || orderProvider == null)
+            {
+                return;
+            }
+
+            int[] orderIds;
+            lock (group.OrderIds)
+            {
+                orderIds = group.OrderIds.ToArray();
+            }
+
+            foreach (var orderId in orderIds)
+            {
+                if (orderId == order.Id)
+                {
+                    continue;
+                }
+
+                // Never call an external order provider while holding the group-order lock.
+                var leg = orderProvider.GetOrderById(orderId);
+                if (leg == null)
+                {
+                    continue;
+                }
+
+                ValidateStateIndependentFinancialAdvisorOrderAdmission(leg);
+                var legRoute = new IBApi.Order { Account = _account };
+                ConfigureFinancialAdvisorOrder(legRoute, leg);
+                if (!HaveEquivalentFinancialAdvisorRoutes(currentRoute, legRoute))
+                {
+                    throw new InvalidOperationException(
+                        "All combo legs must use the same effective Financial Advisor " +
+                        "Account, FaGroup, FaMethod, and percentage.");
+                }
+            }
+        }
+
+        private void ValidateStateIndependentFinancialAdvisorOrderAdmission(
+            Order order)
+        {
+            var properties =
+                order.Properties as InteractiveBrokersOrderProperties;
+            if (!string.IsNullOrWhiteSpace(properties?.Account))
+            {
+                return;
+            }
+            if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
+            {
+                throw new NotSupportedException(
+                    "Legacy Financial Advisor profiles are not supported when unified groups are enabled. Use FaGroup instead.");
+            }
+            if (!string.IsNullOrWhiteSpace(properties?.FaGroup) &&
+                FAState.IsOutsideFinancialAdvisorGroupFilter(
+                    _financialAdvisorsGroupFilter, properties.FaGroup))
+            {
+                throw new InvalidOperationException(
+                    $"Order FA group '{properties.FaGroup}' does not match the configured " +
+                    $"Financial Advisor group filter '{_financialAdvisorsGroupFilter}'.");
+            }
+        }
+
+        private static bool HaveEquivalentFinancialAdvisorRoutes(
+            IBApi.Order first,
+            IBApi.Order second)
+        {
+            return string.Equals(
+                    first.Account ?? string.Empty,
+                    second.Account ?? string.Empty,
+                    StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(
+                    first.FaGroup ?? string.Empty,
+                    second.FaGroup ?? string.Empty,
+                    StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(
+                    first.FaMethod ?? string.Empty,
+                    second.FaMethod ?? string.Empty,
+                    StringComparison.OrdinalIgnoreCase) &&
+                ParseFinancialAdvisorPercentage(first.FaPercentage) ==
+                    ParseFinancialAdvisorPercentage(second.FaPercentage);
+        }
+
+        private static decimal ParseFinancialAdvisorPercentage(string value)
+        {
+            decimal.TryParse(
+                value,
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var percentage);
+            return percentage;
         }
 
         private void ConfigureFinancialAdvisorOrder(

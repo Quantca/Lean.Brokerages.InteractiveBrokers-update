@@ -341,8 +341,47 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsNull(update.PositionsMultiRequestId);
                 Assert.IsNull(accountUpdate.AccountUpdatesMultiRequestId);
             });
-            Assert.Throws<OverflowException>(() =>
-                new UpdatePortfolioEventArgs(new Contract(), decimal.MaxValue, 0, 0, 0, 0, 0, "DU123"));
+        }
+
+        [Test]
+        public void PositionMultiClampsLegacyOverflowAndPreservesExactQuantityAndEndCallbacks()
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            var exactUpdates = new List<PositionMultiEventArgs>();
+            var legacyUpdates = new List<UpdatePortfolioEventArgs>();
+            var internalEndRequestIds = new List<int>();
+            var publicEndCount = 0;
+            client.PositionMulti += (_, args) => exactUpdates.Add(args);
+            client.UpdatePortfolio += (_, args) => legacyUpdates.Add(args);
+            client.PositionMultiEndWithRequestId +=
+                (_, args) => internalEndRequestIds.Add(args.RequestId);
+            client.PositionMultiEnd += (_, _) => ++publicEndCount;
+
+            Assert.DoesNotThrow(() =>
+            {
+                client.positionMulti(
+                    41, "DU123", string.Empty, new Contract(), decimal.MaxValue, 1);
+                client.positionMultiEnd(41);
+                client.positionMulti(
+                    42, "DU123", string.Empty, new Contract(), decimal.MinValue, 1);
+                client.positionMultiEnd(42);
+            });
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(2, exactUpdates.Count);
+                Assert.AreEqual(decimal.MaxValue, exactUpdates[0].Position);
+                Assert.AreEqual(decimal.MinValue, exactUpdates[1].Position);
+                Assert.AreEqual(2, legacyUpdates.Count);
+                Assert.AreEqual(int.MaxValue, legacyUpdates[0].Position);
+                Assert.AreEqual(decimal.MaxValue, legacyUpdates[0].PositionQuantity);
+                Assert.AreEqual(41, legacyUpdates[0].PositionsMultiRequestId);
+                Assert.AreEqual(int.MinValue, legacyUpdates[1].Position);
+                Assert.AreEqual(decimal.MinValue, legacyUpdates[1].PositionQuantity);
+                Assert.AreEqual(42, legacyUpdates[1].PositionsMultiRequestId);
+                CollectionAssert.AreEqual(new[] { 41, 42 }, internalEndRequestIds);
+                Assert.AreEqual(2, publicEndCount);
+            });
         }
     }
 }

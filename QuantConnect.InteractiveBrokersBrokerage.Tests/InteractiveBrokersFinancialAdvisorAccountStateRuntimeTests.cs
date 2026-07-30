@@ -1179,6 +1179,236 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase(true)]
+        [TestCase(false)]
+        public async Task FailedKeyedCancellationRetriesOnceOnNextSuccessfulWireTest(
+            bool positions)
+        {
+            using var scenario = new Scenario();
+            var originalCancel = positions
+                ? scenario.Actions.CancelPositions
+                : scenario.Actions.CancelAccountUpdates;
+            var failedRequestId = 0;
+            var attempts = 0;
+
+            bool Cancel(int requestId, Func<bool> authorize)
+            {
+                if (failedRequestId == 0)
+                {
+                    failedRequestId = requestId;
+                }
+                if (requestId != failedRequestId)
+                {
+                    return originalCancel(requestId, authorize);
+                }
+                if (Interlocked.Increment(ref attempts) == 1)
+                {
+                    return scenario.RunAuthorized(
+                        authorize,
+                        () => throw new InvalidOperationException(
+                            "simulated first cancellation failure"));
+                }
+                return originalCancel(requestId, authorize);
+            }
+
+            if (positions)
+            {
+                scenario.Actions.CancelPositions = Cancel;
+            }
+            else
+            {
+                scenario.Actions.CancelAccountUpdates = Cancel;
+            }
+            using var state = scenario.CreateState();
+            var callbackStateLock =
+                typeof(InteractiveBrokersFinancialAdvisorAccountState)
+                    .GetField(
+                        "_callbackStateLock",
+                        BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?.GetValue(state);
+            Assert.IsNotNull(callbackStateLock);
+            var retryCalledUnderLock = false;
+            scenario.ExternalCallProbe = () =>
+                retryCalledUnderLock |= Monitor.IsEntered(callbackStateLock);
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var canceledRequestIds = positions
+                ? scenario.CanceledPositionIds
+                : scenario.CanceledAccountIds;
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(2, attempts);
+                Assert.AreEqual(
+                    1,
+                    canceledRequestIds.Count(requestId => requestId == failedRequestId));
+                Assert.AreEqual(1, scenario.MaximumConcurrentExternalCalls);
+                Assert.IsFalse(
+                    retryCalledUnderLock,
+                    "A cancellation retry reached the socket delegate under the callback-state lock.");
+            });
+        }
+
+        [Test]
+        public async Task FailedKeyedCancellationRetryIsAttemptedOnlyOnceTest()
+        {
+            using var scenario = new Scenario();
+            var originalCancel = scenario.Actions.CancelPositions;
+            var failedRequestId = 0;
+            var attempts = 0;
+            scenario.Actions.CancelPositions = (requestId, authorize) =>
+            {
+                if (failedRequestId == 0)
+                {
+                    failedRequestId = requestId;
+                }
+                if (requestId != failedRequestId)
+                {
+                    return originalCancel(requestId, authorize);
+                }
+                Interlocked.Increment(ref attempts);
+                return scenario.RunAuthorized(
+                    authorize,
+                    () => throw new InvalidOperationException(
+                        "simulated persistent cancellation failure"));
+            };
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(2, attempts);
+                CollectionAssert.DoesNotContain(
+                    scenario.CanceledPositionIds, failedRequestId);
+                Assert.Greater(
+                    scenario.KeyedRequestIds.Count,
+                    2,
+                    "Later successful wire writes must not trigger a third retry.");
+                Assert.AreEqual(1, scenario.MaximumConcurrentExternalCalls);
+            });
+        }
+
+        [Test]
+        public async Task PhysicalReconnectDiscardsFailedCancellationRequestIdTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var reconnected = new ManualResetEventSlim();
+            var originalCancel = scenario.Actions.CancelPositions;
+            var originalAccountRequest = scenario.Actions.RequestAccountUpdates;
+            var failedRequestId = 0;
+            var attempts = 0;
+            scenario.Actions.CancelPositions = (requestId, authorize) =>
+            {
+                if (failedRequestId == 0)
+                {
+                    failedRequestId = requestId;
+                    Interlocked.Increment(ref attempts);
+                    return scenario.RunAuthorized(
+                        authorize,
+                        () => throw new InvalidOperationException(
+                            "simulated cancellation failure before reconnect"));
+                }
+                if (requestId == failedRequestId)
+                {
+                    Interlocked.Increment(ref attempts);
+                }
+                return originalCancel(requestId, authorize);
+            };
+            scenario.Actions.RequestAccountUpdates = (requestId, accountId, authorize) =>
+            {
+                scenario.Actions.RequestAccountUpdates = originalAccountRequest;
+                scenario.Client.connectionClosed();
+                scenario.Client.nextValidId(456);
+                reconnected.Set();
+                return originalAccountRequest(requestId, accountId, authorize);
+            };
+            using var state = scenario.CreateState();
+
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            Assert.IsTrue(reconnected.Wait(TimeSpan.FromSeconds(5)));
+            state.NotifyBrokerageConnected();
+            var recovered = await WaitForReadyGenerationAsync(state, 0);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+                Assert.AreEqual(1, attempts);
+                CollectionAssert.DoesNotContain(
+                    scenario.CanceledPositionIds, failedRequestId);
+                Assert.IsTrue(
+                    scenario.CanceledPositionIds.All(requestId =>
+                        requestId != failedRequestId));
+            });
+        }
+
+        [Test]
+        public async Task LogicalReconnectRetriesFailedCancellationOnSameConnectionTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            using var cancelPaceEntered = new ManualResetEventSlim();
+            using var releaseCancelPacing = new ManualResetEventSlim();
+            var paceCalls = 0;
+            using var state = scenario.CreateState(paceRequest: () =>
+            {
+                if (Interlocked.Increment(ref paceCalls) == 6)
+                {
+                    cancelPaceEntered.Set();
+                    if (!releaseCancelPacing.Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        throw new TimeoutException(
+                            "Test cancellation pacing was not released.");
+                    }
+                }
+            });
+
+            var interrupted = RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            try
+            {
+                Assert.IsTrue(cancelPaceEntered.Wait(TimeSpan.FromSeconds(5)));
+                scenario.Client.error(
+                    -1,
+                    0,
+                    1100,
+                    "Connectivity between IB and TWS was lost.",
+                    string.Empty);
+                scenario.Client.error(
+                    -1,
+                    0,
+                    1102,
+                    "Connectivity between IB and TWS was restored.",
+                    string.Empty);
+            }
+            finally
+            {
+                releaseCancelPacing.Set();
+            }
+
+            var staleRequestId = scenario.KeyedRequestIds.Single();
+            await interrupted;
+            var recovered = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+                Assert.AreEqual(
+                    1,
+                    scenario.CanceledPositionIds.Count(
+                        requestId => requestId == staleRequestId));
+                Assert.IsTrue(state.IsServiceOwnedRequestId(staleRequestId));
+            });
+        }
+
         [Test]
         public async Task QueuedScopesAreMergedAndCompleteDiscoveryDominatesTest()
         {
@@ -1452,6 +1682,79 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     scenario.Requests.Where(request =>
                         request.StartsWith("account:", StringComparison.Ordinal)));
             });
+        }
+
+        [Test]
+        public async Task AdditionalScopeAcceptsSelectedAndMovedManagedAccountsTest()
+        {
+            using var scenario = new Scenario();
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(
+                    new[] { "Alpha" },
+                    new[] { "ACC1", "ACC2" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                CollectionAssert.AreEqual(new[] { "Alpha" }, snapshot.Groups.Keys);
+                CollectionAssert.AreEquivalent(
+                    new[] { "ACC1", "ACC2" }, snapshot.Accounts.Keys);
+                CollectionAssert.AreEqual(
+                    new[] { "positions:Alpha", "positions:ACC2" },
+                    scenario.Requests.Where(request =>
+                        request.StartsWith("positions:", StringComparison.Ordinal)));
+                Assert.AreEqual(
+                    1,
+                    scenario.Requests.Count(request => request == "account:ACC1"));
+                Assert.AreEqual(
+                    1,
+                    scenario.Requests.Count(request => request == "account:ACC2"));
+            });
+        }
+
+        [TestCase("MASTER")]
+        [TestCase("MASTERA")]
+        [TestCase("UNKNOWN")]
+        public async Task AdditionalScopeRejectsAccountsOutsideManagedChildrenTest(
+            string accountId)
+        {
+            using var scenario = Scenario.SingleAccount();
+            if (accountId == "MASTERA")
+            {
+                scenario.ManagedAccounts = "MASTER,MASTERA,ACC1";
+            }
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(
+                    Array.Empty<string>(),
+                    new[] { accountId }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
+                StringAssert.Contains(
+                    $"Account '{accountId}' is not a managed Financial Advisor subaccount.",
+                    snapshot.ErrorMessage);
+            });
+        }
+
+        [Test]
+        public void ConfiguredGroupFilterStillRejectsAdditionalAccountScopeTest()
+        {
+            using var scenario = new Scenario();
+            using var state = scenario.CreateState(configuredGroup: "Alpha");
+
+            var exception = Assert.Throws<InvalidOperationException>(() =>
+                state.RequestRefresh(new[] { "Alpha" }, new[] { "ACC2" }));
+
+            StringAssert.Contains(
+                "Additional account collection is unavailable",
+                exception.Message);
         }
 
         [Test]

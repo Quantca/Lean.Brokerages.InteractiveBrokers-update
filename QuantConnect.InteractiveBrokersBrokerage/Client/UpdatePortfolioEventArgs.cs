@@ -99,7 +99,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             int? positionsMultiRequestId = null)
         {
             Contract = contract;
-            Position = Convert.ToInt32(position);
+            Position = position > int.MaxValue
+                ? int.MaxValue
+                : position < int.MinValue
+                    ? int.MinValue
+                    : Convert.ToInt32(position);
             PositionQuantity = position;
             PositionsMultiRequestId = positionsMultiRequestId;
             MarketPrice = marketPrice;

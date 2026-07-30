@@ -64,6 +64,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private WorkItem _queuedRefresh;
         private WorkItem _pendingMutation;
         private PendingRequest _pendingRequest;
+        private DeferredCancellation _deferredCancellation;
         private string _handshakeManagedAccounts;
         private bool _connected;
         private bool _unkeyedResponseMayStillArrive;
@@ -75,6 +76,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private long _connectionGeneration, _handshakeManagedAccountsGeneration = -1;
         private long _serviceOwnedRequestIdEpochStart = int.MinValue;
         private long _serviceOwnedRequestIdCurrentMax = (long)int.MinValue - 1;
+        private long _physicalConnectionEpoch;
         private long _requestVersion;
 
         internal BrokerageAccountSnapshot Snapshot => _snapshot;
@@ -210,6 +212,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return;
                 }
                 _connected = false;
+                if (physicalConnectionClosed && !_physicalConnectionClosed)
+                {
+                    ++_physicalConnectionEpoch;
+                    _deferredCancellation = null;
+                }
                 _physicalConnectionClosed |= physicalConnectionClosed;
                 _reconnectRefreshPending = false;
                 _expectingHandshakeManagedAccounts = false;
@@ -492,6 +499,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _disposed = true;
                 _connected = false;
                 _reconnectRefreshPending = false;
+                _deferredCancellation = null;
                 pending = _pendingRequest;
                 _pendingRequest = null;
                 worker = _worker;
@@ -1466,8 +1474,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ? allGroups
                 : SelectGroups(allGroups, scope.GroupNames);
 
-            ValidateAdditionalAccountIds(
-                scope.AdditionalAccountIds, allGroups, managedAccountIds, primaryAccountId);
+            ValidateAdditionalManagedAccountIds(
+                scope.AdditionalAccountIds, managedAccountIds, primaryAccountId);
             try
             {
                 ValidateManagedGroupMembers(
@@ -1633,6 +1641,28 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         !IsPrimaryOrAggregateAccount(id, primaryAccountId)),
                 collectionStartedUtc),
                 scope.RequestVersion);
+        }
+
+        private static void ValidateAdditionalManagedAccountIds(
+            IReadOnlyCollection<string> additionalAccountIds,
+            IReadOnlyCollection<string> managedAccountIds,
+            string primaryAccountId)
+        {
+            if (additionalAccountIds.Count == 0)
+            {
+                return;
+            }
+
+            var managed = managedAccountIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var accountId in additionalAccountIds)
+            {
+                if (!managed.Contains(accountId) ||
+                    IsPrimaryOrAggregateAccount(accountId, primaryAccountId))
+                {
+                    throw new InvalidOperationException(
+                        $"Account '{accountId}' is not a managed Financial Advisor subaccount.");
+                }
+            }
         }
 
         private static bool IsAllowedSummaryAccount(string accountId, string primaryAccountId) =>
@@ -1847,7 +1877,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     throw new InvalidOperationException("An IB account-state request is already pending.");
                 }
                 return _pendingRequest =
-                    new PendingRequest(scope, kind, requestId, faDataType);
+                    new PendingRequest(
+                        scope, kind, requestId, faDataType, _physicalConnectionEpoch);
             }
         }
 
@@ -1969,6 +2000,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 throw new InvalidOperationException(
                     "A wire action did not honor its authorization contract.");
             }
+            if (wrote && !cancellation)
+            {
+                RetryDeferredCancellation();
+            }
             return wrote;
         }
 
@@ -1977,17 +2012,132 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                PaceAndInvoke(pending, cancel, cancellation: true);
+                if (!PaceAndInvoke(pending, cancel, cancellation: true))
+                {
+                    throw new InvalidOperationException(
+                        "The cancellation action did not write to the IB socket.");
+                }
             }
-            catch (RequestInvalidatedException)
+            catch (RequestInvalidatedException exception)
             {
+                RetainFailedCancellation(
+                    pending, cancel, description, requestId, exception);
                 throw;
             }
             catch (Exception exception)
             {
+                RetainFailedCancellation(
+                    pending, cancel, description, requestId, exception);
+            }
+        }
+
+        private void RetainFailedCancellation(
+            PendingRequest pending,
+            WireAction cancel,
+            string description,
+            int requestId,
+            Exception exception)
+        {
+            var retained = false;
+            lock (_callbackStateLock)
+            {
+                if (!_disposed &&
+                    pending.PhysicalConnectionEpoch == _physicalConnectionEpoch &&
+                    _deferredCancellation == null)
+                {
+                    _deferredCancellation = new DeferredCancellation(
+                        cancel,
+                        description,
+                        requestId,
+                        pending.PhysicalConnectionEpoch);
+                    retained = true;
+                }
+            }
+            Log.Error(
+                $"InteractiveBrokersFinancialAdvisorAccountState: failed to cancel " +
+                $"{description} request {requestId}: {exception.Message}" +
+                (retained
+                    ? " The request was retained for one retry."
+                    : " The request will not be retried."));
+        }
+
+        private void RetryDeferredCancellation()
+        {
+            DeferredCancellation retry;
+            lock (_callbackStateLock)
+            {
+                retry = _deferredCancellation;
+                if (retry == null || _disposed || !_connected)
+                {
+                    return;
+                }
+                if (retry.PhysicalConnectionEpoch != _physicalConnectionEpoch)
+                {
+                    _deferredCancellation = null;
+                    return;
+                }
+            }
+
+            try
+            {
+                PaceAndInvoke(retry);
+            }
+            catch (Exception exception)
+            {
                 Log.Error(
-                    $"InteractiveBrokersFinancialAdvisorAccountState: failed to cancel " +
-                    $"{description} request {requestId}: {exception.Message}");
+                    $"InteractiveBrokersFinancialAdvisorAccountState: failed again to cancel " +
+                    $"{retry.Description} request {retry.RequestId}; giving up: " +
+                    exception.Message);
+            }
+            finally
+            {
+                lock (_callbackStateLock)
+                {
+                    if (ReferenceEquals(_deferredCancellation, retry))
+                    {
+                        _deferredCancellation = null;
+                    }
+                }
+            }
+        }
+
+        private void PaceAndInvoke(DeferredCancellation retry)
+        {
+            _disposeTokenSource.Token.ThrowIfCancellationRequested();
+            _requestRateGate.WaitToProceed();
+            _disposeTokenSource.Token.ThrowIfCancellationRequested();
+            _paceRequest();
+
+            var authorizationInvoked = false;
+            var authorizationGranted = false;
+            bool Authorize()
+            {
+                if (authorizationInvoked)
+                {
+                    throw new InvalidOperationException(
+                        "A wire action requested authorization more than once.");
+                }
+                authorizationInvoked = true;
+                var socketConnected = _isConnected();
+                lock (_callbackStateLock)
+                {
+                    if (_disposed || !_connected || !socketConnected ||
+                        !ReferenceEquals(_deferredCancellation, retry) ||
+                        retry.PhysicalConnectionEpoch != _physicalConnectionEpoch)
+                    {
+                        throw new RequestInvalidatedException(
+                            "The deferred IB cancellation was invalidated at its wire boundary.");
+                    }
+                    authorizationGranted = true;
+                    return true;
+                }
+            }
+
+            var wrote = retry.Cancel(Authorize);
+            if (!authorizationInvoked || !wrote || !authorizationGranted)
+            {
+                throw new InvalidOperationException(
+                    "A deferred cancellation did not honor its authorization contract.");
             }
         }
 
@@ -2715,6 +2865,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal PendingKind Kind { get; }
             internal int RequestId { get; }
             internal int FaDataType { get; }
+            internal long PhysicalConnectionEpoch { get; }
             internal TaskCompletionSource<PendingRequest> Completion { get; } =
                 new(TaskCreationOptions.RunContinuationsAsynchronously);
             internal List<PositionRow> PositionRows { get; } = new();
@@ -2727,12 +2878,37 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal bool ExplicitlyRejected { get; set; }
 
             internal PendingRequest(
-                SnapshotScope scope, PendingKind kind, int requestId, int faDataType)
+                SnapshotScope scope,
+                PendingKind kind,
+                int requestId,
+                int faDataType,
+                long physicalConnectionEpoch)
             {
                 Scope = scope;
                 Kind = kind;
                 RequestId = requestId;
                 FaDataType = faDataType;
+                PhysicalConnectionEpoch = physicalConnectionEpoch;
+            }
+        }
+
+        private sealed class DeferredCancellation
+        {
+            internal WireAction Cancel { get; }
+            internal string Description { get; }
+            internal int RequestId { get; }
+            internal long PhysicalConnectionEpoch { get; }
+
+            internal DeferredCancellation(
+                WireAction cancel,
+                string description,
+                int requestId,
+                long physicalConnectionEpoch)
+            {
+                Cancel = cancel;
+                Description = description;
+                RequestId = requestId;
+                PhysicalConnectionEpoch = physicalConnectionEpoch;
             }
         }
 

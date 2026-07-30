@@ -348,6 +348,98 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         [TestCase("Account")]
         [TestCase("FaGroup")]
         [TestCase("FaMethod")]
+        public void CaseOnlyComboLegRoutingDifferencesAreAcceptedTest(
+            string identifier)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var first = new InteractiveBrokersOrderProperties();
+            var second = new InteractiveBrokersOrderProperties();
+            switch (identifier)
+            {
+                case "Account":
+                    first.Account = "ManagedAccount";
+                    second.Account = "managedaccount";
+                    break;
+
+                case "FaGroup":
+                    first.FaGroup = "TargetGroup";
+                    second.FaGroup = "targetgroup";
+                    break;
+
+                case "FaMethod":
+                    first.FaGroup = FaGroupName;
+                    first.FaMethod = "FutureMethod";
+                    second.FaGroup = FaGroupName;
+                    second.FaMethod = "futuremethod";
+                    break;
+            }
+            var orders = CreateComboOrders(brokerage, first, second);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
+        }
+
+        [Test]
+        public void ComboAdmissionPreflightsLaterLegStateIndependentChecksTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var orders = CreateComboOrders(
+                brokerage,
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                },
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaProfile = "LegacyProfile"
+                });
+
+            StringAssert.Contains(
+                "Legacy Financial Advisor profiles",
+                Assert.Throws<NotSupportedException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        orders[0])).Message);
+        }
+
+        [Test]
+        public void CurrentComboLegAdmissionErrorPrecedesLaterLegPreflightErrorTest()
+        {
+            const string unsupportedReason =
+                "Correct the unsupported FA topology in TWS and refresh.";
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            UnsupportedConfigurationErrorField.SetValue(
+                state,
+                unsupportedReason);
+            AccountStateField.SetValue(brokerage, state);
+            var orders = CreateComboOrders(
+                brokerage,
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                },
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaProfile = "LegacyProfile"
+                });
+
+            Assert.AreEqual(
+                unsupportedReason,
+                Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        orders[0])).Message);
+        }
+
+        [TestCase("Account")]
+        [TestCase("FaGroup")]
+        [TestCase("FaMethod")]
         [TestCase("Percentage")]
         public void DivergentComboLegRoutingIsRejectedTest(string divergence)
         {
@@ -420,6 +512,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
             Assert.IsFalse(provider.ObservedGroupOrderIdsLock);
+            Assert.AreEqual(1, provider.GetOrderByIdCalls);
+            Assert.AreEqual(0, provider.GetOrdersCalls);
         }
 
         [Test]
@@ -1599,6 +1693,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             private readonly object _groupOrderIds;
 
             public bool ObservedGroupOrderIdsLock { get; private set; }
+            public int GetOrderByIdCalls { get; private set; }
+            public int GetOrdersCalls { get; private set; }
 
             public GroupLockObservingOrderProvider(
                 IList<LeanOrder> orders,
@@ -1610,6 +1706,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             LeanOrder IOrderProvider.GetOrderById(int orderId)
             {
+                GetOrderByIdCalls++;
                 ObserveGroupOrderIdsLock();
                 return base.GetOrderById(orderId);
             }
@@ -1617,6 +1714,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             IEnumerable<LeanOrder> IOrderProvider.GetOrders(
                 Func<LeanOrder, bool> filter)
             {
+                GetOrdersCalls++;
                 ObserveGroupOrderIdsLock();
                 return base.GetOrders(filter);
             }
