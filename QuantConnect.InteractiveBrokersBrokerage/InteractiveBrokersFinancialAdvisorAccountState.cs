@@ -629,156 +629,156 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             RetryDeferredCancellation(item.PhysicalConnectionEpoch);
                             continue;
                         }
-                    SnapshotScope scope;
-                    var rejected = false;
-                    lock (_callbackStateLock)
-                    {
-                        if (ReferenceEquals(_queuedRefresh, item))
-                        {
-                            _queuedRefresh = null;
-                        }
-                        scope = item.Scope;
-                        if (_disposed || !_connected || _unkeyedResponseMayStillArrive ||
-                            scope.RequestVersion != _requestVersion ||
-                            item.Kind != WorkKind.Refresh &&
-                            !ReferenceEquals(_pendingMutation, item))
-                        {
-                            if (item.Kind == WorkKind.Refresh)
-                            {
-                                continue;
-                            }
-                            rejected = true;
-                            item.BrokerStateInvalidated = true;
-                        }
-                        else
-                        {
-                            _activeRefresh = scope;
-                        }
-                    }
-                    Exception failure = rejected
-                        ? new RequestInvalidatedException(
-                            "The Financial Advisor configuration mutation became " +
-                            "obsolete before it started.")
-                        : null;
-                    var successPublished = false;
-                    string mutationError = null;
-                    try
-                    {
-                        try
-                        {
-                            if (!rejected)
-                            {
-                                // The single-consumer worker loop is the serialization point for every brokerage operation.
-                                if (item.Kind == WorkKind.Refresh)
-                                {
-                                    await RefreshAsync(scope).ConfigureAwait(false);
-                                }
-                                else if (item.Kind == WorkKind.Assignment)
-                                {
-                                    item.Assignment = await RunGroupAssignmentAsync(item)
-                                        .ConfigureAwait(false);
-                                }
-                                else
-                                {
-                                    item.Allocation = await RunGroupAllocationUpdateAsync(item)
-                                        .ConfigureAwait(false);
-                                }
-                            }
-                        }
-                        catch (Exception exception) when (!_disposeTokenSource.IsCancellationRequested)
-                        {
-                            failure = exception;
-                        }
-                        if (item.Kind != WorkKind.Refresh)
-                        {
-                            try { _requests.BeforeMutationPublication(); }
-                            catch (Exception exception) when (
-                                !_disposeTokenSource.IsCancellationRequested) { failure ??= exception; }
-                        }
-                    }
-                    finally
-                    {
+                        SnapshotScope scope;
+                        var rejected = false;
                         lock (_callbackStateLock)
                         {
-                            if (item.Kind != WorkKind.Refresh && failure == null)
+                            if (ReferenceEquals(_queuedRefresh, item))
                             {
-                                var membershipHash = item.Kind == WorkKind.Assignment
-                                    ? item.Assignment.ResultingMembershipHash
-                                    : item.Allocation.ResultingMembershipHash;
-                                var configurationVersion =
-                                    item.Kind == WorkKind.Assignment
-                                        ? item.Assignment.ResultingGroupConfigurationVersion
-                                        : item.Allocation.ResultingGroupConfigurationVersion;
-                                if (!_disposed && _connected &&
-                                    scope.RequestVersion == _requestVersion &&
-                                    _snapshot.Status ==
-                                        BrokerageAccountSnapshotStatus.Ready &&
-                                    string.Equals(
-                                        _snapshot.MembershipHash,
-                                        membershipHash,
-                                        StringComparison.Ordinal) &&
-                                    string.Equals(
-                                        _snapshot.GroupConfigurationVersion,
-                                        configurationVersion,
-                                        StringComparison.Ordinal))
+                                _queuedRefresh = null;
+                            }
+                            scope = item.Scope;
+                            if (_disposed || !_connected || _unkeyedResponseMayStillArrive ||
+                                scope.RequestVersion != _requestVersion ||
+                                item.Kind != WorkKind.Refresh &&
+                                !ReferenceEquals(_pendingMutation, item))
+                            {
+                                if (item.Kind == WorkKind.Refresh)
                                 {
-                                    if (item.Kind == WorkKind.Assignment)
+                                    continue;
+                                }
+                                rejected = true;
+                                item.BrokerStateInvalidated = true;
+                            }
+                            else
+                            {
+                                _activeRefresh = scope;
+                            }
+                        }
+                        Exception failure = rejected
+                            ? new RequestInvalidatedException(
+                                "The Financial Advisor configuration mutation became " +
+                                "obsolete before it started.")
+                            : null;
+                        var successPublished = false;
+                        string mutationError = null;
+                        try
+                        {
+                            try
+                            {
+                                if (!rejected)
+                                {
+                                    // The single-consumer worker loop is the serialization point for every brokerage operation.
+                                    if (item.Kind == WorkKind.Refresh)
                                     {
-                                        _groupAssignment = item.Assignment;
+                                        await RefreshAsync(scope).ConfigureAwait(false);
+                                    }
+                                    else if (item.Kind == WorkKind.Assignment)
+                                    {
+                                        item.Assignment = await RunGroupAssignmentAsync(item)
+                                            .ConfigureAwait(false);
                                     }
                                     else
                                     {
-                                        _groupAllocationUpdate = item.Allocation;
+                                        item.Allocation = await RunGroupAllocationUpdateAsync(item)
+                                            .ConfigureAwait(false);
                                     }
-                                    _groupTradingBlocked = false;
-                                    successPublished = true;
                                 }
-                                else
+                            }
+                            catch (Exception exception) when (!_disposeTokenSource.IsCancellationRequested)
+                            {
+                                failure = exception;
+                            }
+                            if (item.Kind != WorkKind.Refresh)
+                            {
+                                try { _requests.BeforeMutationPublication(); }
+                                catch (Exception exception) when (
+                                    !_disposeTokenSource.IsCancellationRequested) { failure ??= exception; }
+                            }
+                        }
+                        finally
+                        {
+                            lock (_callbackStateLock)
+                            {
+                                if (item.Kind != WorkKind.Refresh && failure == null)
                                 {
-                                    item.BrokerStateInvalidated = true;
-                                    failure = new RequestInvalidatedException(
-                                        "Broker authority changed before the Financial " +
-                                        "Advisor mutation result could be published.");
+                                    var membershipHash = item.Kind == WorkKind.Assignment
+                                        ? item.Assignment.ResultingMembershipHash
+                                        : item.Allocation.ResultingMembershipHash;
+                                    var configurationVersion =
+                                        item.Kind == WorkKind.Assignment
+                                            ? item.Assignment.ResultingGroupConfigurationVersion
+                                            : item.Allocation.ResultingGroupConfigurationVersion;
+                                    if (!_disposed && _connected &&
+                                        scope.RequestVersion == _requestVersion &&
+                                        _snapshot.Status ==
+                                            BrokerageAccountSnapshotStatus.Ready &&
+                                        string.Equals(
+                                            _snapshot.MembershipHash,
+                                            membershipHash,
+                                            StringComparison.Ordinal) &&
+                                        string.Equals(
+                                            _snapshot.GroupConfigurationVersion,
+                                            configurationVersion,
+                                            StringComparison.Ordinal))
+                                    {
+                                        if (item.Kind == WorkKind.Assignment)
+                                        {
+                                            _groupAssignment = item.Assignment;
+                                        }
+                                        else
+                                        {
+                                            _groupAllocationUpdate = item.Allocation;
+                                        }
+                                        _groupTradingBlocked = false;
+                                        successPublished = true;
+                                    }
+                                    else
+                                    {
+                                        item.BrokerStateInvalidated = true;
+                                        failure = new RequestInvalidatedException(
+                                            "Broker authority changed before the Financial " +
+                                            "Advisor mutation result could be published.");
+                                    }
+                                }
+                                if (item.Kind != WorkKind.Refresh && !successPublished &&
+                                    !_disposed)
+                                {
+                                    mutationError = CompleteMutationLocked(item, failure);
+                                }
+                                if (ReferenceEquals(_activeRefresh, scope))
+                                {
+                                    _activeRefresh = null;
+                                }
+                                if (ReferenceEquals(_pendingMutation, item))
+                                {
+                                    _pendingMutation = null;
                                 }
                             }
-                            if (item.Kind != WorkKind.Refresh && !successPublished &&
-                                !_disposed)
-                            {
-                                mutationError = CompleteMutationLocked(item, failure);
-                            }
-                            if (ReferenceEquals(_activeRefresh, scope))
-                            {
-                                _activeRefresh = null;
-                            }
-                            if (ReferenceEquals(_pendingMutation, item))
-                            {
-                                _pendingMutation = null;
-                            }
                         }
-                    }
-                    if (item.Kind != WorkKind.Refresh)
-                    {
-                        if (mutationError != null)
+                        if (item.Kind != WorkKind.Refresh)
                         {
-                            Log.Error(
-                                "InteractiveBrokersFinancialAdvisorAccountState: " +
-                                "configuration mutation failed: " + mutationError);
+                            if (mutationError != null)
+                            {
+                                Log.Error(
+                                    "InteractiveBrokersFinancialAdvisorAccountState: " +
+                                    "configuration mutation failed: " + mutationError);
+                            }
                         }
-                    }
-                    else if (failure != null)
-                    {
-                        var unsupportedConfiguration =
-                            failure is UnsupportedFinancialAdvisorConfigurationException;
-                        var published = PublishFailure(
-                            failure.Message,
-                            forceStale: failure is UnkeyedRequestTimeoutException,
-                            expectedRequestVersion: scope.RequestVersion,
-                            unsupportedConfiguration: unsupportedConfiguration);
-                        if (published && unsupportedConfiguration)
+                        else if (failure != null)
                         {
-                            ReportUnsupported(failure.Message);
+                            var unsupportedConfiguration =
+                                failure is UnsupportedFinancialAdvisorConfigurationException;
+                            var published = PublishFailure(
+                                failure.Message,
+                                forceStale: failure is UnkeyedRequestTimeoutException,
+                                expectedRequestVersion: scope.RequestVersion,
+                                unsupportedConfiguration: unsupportedConfiguration);
+                            if (published && unsupportedConfiguration)
+                            {
+                                ReportUnsupported(failure.Message);
+                            }
                         }
-                    }
                     }
                     catch (Exception exception) when (!_disposeTokenSource.IsCancellationRequested)
                     {
