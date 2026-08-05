@@ -1023,9 +1023,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!_client.Connected) throw new Exception("InteractiveBrokersBrokerage.Connect(): Connection returned but was not in connected state.");
 
-                    // request account information for logging purposes
-                    var group = string.IsNullOrEmpty(_financialAdvisorsGroupFilter) ? "All" : _financialAdvisorsGroupFilter;
-                    _client.ClientSocket.reqAccountSummary(GetNextId(), group, "AccountType");
+                    if (ShouldRequestStartupAccountSummary)
+                    {
+                        // request account information for logging purposes
+                        var group = string.IsNullOrEmpty(_financialAdvisorsGroupFilter) ? "All" : _financialAdvisorsGroupFilter;
+                        _client.ClientSocket.reqAccountSummary(GetNextId(), group, "AccountType");
+                    }
                     if (!FinancialAdvisorServiceOwnsStartupRequests)
                     {
                         _client.ClientSocket.reqManagedAccts();
@@ -1545,7 +1548,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _client.CommissionReport += HandleCommissionReport;
             }
             _client.UpdateAccountValue += HandleUpdateAccountValue;
-            _client.AccountSummary += HandleAccountSummary;
+            if (!FinancialAdvisorServiceOwnsStartupRequests)
+            {
+                _client.AccountSummary += HandleAccountSummary;
+            }
             _client.ManagedAccounts += HandleManagedAccounts;
             _client.FamilyCodes += HandleFamilyCodes;
             _client.Error += HandleError;

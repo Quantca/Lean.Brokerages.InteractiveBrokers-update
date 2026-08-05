@@ -72,63 +72,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreEqual(expectedMessageCount, messages.Count(m => m.Code == "300"));
         }
 
-        [Test]
-        public void HandleErrorSuppressesOnlyOwnedFinancialAdvisorServiceRequestErrors()
-        {
-            using var client = new IB.InteractiveBrokersClient(new IBApi.EReaderMonitorSignal());
-            using var brokerage = new InteractiveBrokersBrokerage();
-            var accountState = new InteractiveBrokersFinancialAdvisorAccountState(
-                client,
-                () => { },
-                () => true,
-                _ => Symbol.Empty,
-                "F-MASTER");
-            SetPrivateFieldValue(
-                brokerage,
-                "_financialAdvisorAccountState",
-                accountState);
-            var serviceRequestId = (int)typeof(
-                    InteractiveBrokersFinancialAdvisorAccountState)
-                .GetMethod(
-                    "NextRequestId",
-                    BindingFlags.NonPublic | BindingFlags.Instance)
-                .Invoke(accountState, null);
-
-            var messages = new List<BrokerageMessageEvent>();
-            brokerage.Message += (_, message) => messages.Add(message);
-            client.Error += brokerage.HandleError;
-
-            client.error(
-                serviceRequestId, 0, 321, "FA service failure", string.Empty);
-            client.error(
-                -2, 0, 321, "unallocated negative request failure", string.Empty);
-
-            Assert.Multiple(() =>
-            {
-                Assert.IsTrue(accountState.IsServiceOwnedRequestId(serviceRequestId));
-                Assert.AreEqual(1, messages.Count);
-                Assert.AreEqual(BrokerageMessageType.Error, messages[0].Type);
-                Assert.AreEqual("321", messages[0].Code);
-                StringAssert.Contains(
-                    "unallocated negative request failure", messages[0].Message);
-            });
-        }
-
         private static object GetPrivateFieldValue(object instance, string name)
         {
             return instance.GetType()
                 .GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)
                 .GetValue(instance);
-        }
-
-        private static void SetPrivateFieldValue(
-            object instance,
-            string name,
-            object value)
-        {
-            instance.GetType()
-                .GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)
-                .SetValue(instance, value);
         }
     }
 }

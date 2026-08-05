@@ -87,14 +87,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.Multiple(() =>
             {
-                Assert.IsNotNull(typeof(UpdateAccountValueEventArgs).GetProperty(
-                    nameof(UpdateAccountValueEventArgs.AccountUpdatesMultiRequestId)));
-                Assert.IsNotNull(typeof(UpdatePortfolioEventArgs).GetProperty(
-                    nameof(UpdatePortfolioEventArgs.PositionsMultiRequestId)));
                 Assert.AreEqual(17, accountUpdate.RequestId);
                 Assert.AreEqual("DU123", accountUpdate.Account);
                 Assert.AreEqual("ModelA", accountUpdate.ModelCode);
+                Assert.AreEqual("NetLiquidation", accountUpdate.Key);
+                Assert.AreEqual("1000", accountUpdate.Value);
+                Assert.AreEqual("USD", accountUpdate.Currency);
                 Assert.AreEqual("NetLiquidation", legacyAccountUpdate.Key);
+                Assert.AreEqual("1000", legacyAccountUpdate.Value);
+                Assert.AreEqual("USD", legacyAccountUpdate.Currency);
                 Assert.AreEqual("DU123", legacyAccountUpdate.AccountName);
                 Assert.AreEqual(17, legacyAccountUpdate.AccountUpdatesMultiRequestId);
                 Assert.AreEqual(17, accountUpdateEnd.RequestId);
@@ -254,6 +255,42 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void PublicErrorCallbackExceptionDoesNotSuppressInternalEvent()
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            var internalErrorCount = 0;
+            client.Error += (_, _) => throw new InvalidOperationException("public error");
+            client.InternalError += (_, _) => internalErrorCount++;
+
+            var exception = Assert.Throws<InvalidOperationException>(() =>
+                client.error(17, 123, 10230, "configuration pending", string.Empty));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual("public error", exception.Message);
+                Assert.AreEqual(1, internalErrorCount);
+            });
+        }
+
+        [Test]
+        public void InternalErrorCallbackExceptionOccursAfterPublicEvent()
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            var publicErrorCount = 0;
+            client.Error += (_, _) => publicErrorCount++;
+            client.InternalError += (_, _) => throw new InvalidOperationException("internal error");
+
+            var exception = Assert.Throws<InvalidOperationException>(() =>
+                client.error(17, 123, 10230, "configuration pending", string.Empty));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual("internal error", exception.Message);
+                Assert.AreEqual(1, publicErrorCount);
+            });
+        }
+
+        [Test]
         public void KeyedPublicCallbackExceptionsDoNotSuppressInternalEvents()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
@@ -345,8 +382,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         [TestCase(1.5, 2)]
         [TestCase(2.5, 2)]
+        [TestCase(0.5, 0)]
         [TestCase(-1.5, -2)]
         [TestCase(-2.5, -2)]
+        [TestCase(-0.5, 0)]
         public void LegacyPositionProjectionUsesUpstreamRounding(
             double position,
             int expected)
@@ -431,6 +470,31 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
             Assert.Throws<OverflowException>(() => _ = legacyUpdates[0].Position);
             Assert.Throws<OverflowException>(() => _ = legacyUpdates[1].Position);
+        }
+
+        [Test]
+        public void OrdinaryPortfolioUpdatePreservesExactOverflowAndThrowsOnlyOnLegacyRead()
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            var updates = new List<UpdatePortfolioEventArgs>();
+            client.UpdatePortfolio += (_, args) => updates.Add(args);
+
+            Assert.DoesNotThrow(() =>
+            {
+                client.updatePortfolio(new Contract(), decimal.MaxValue, 2, 3, 4, 5, 6, "DU123");
+                client.updatePortfolio(new Contract(), decimal.MinValue, 2, 3, 4, 5, 6, "DU123");
+            });
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(2, updates.Count);
+                Assert.AreEqual(decimal.MaxValue, updates[0].PositionQuantity);
+                Assert.AreEqual(decimal.MinValue, updates[1].PositionQuantity);
+                Assert.IsNull(updates[0].PositionsMultiRequestId);
+                Assert.IsNull(updates[1].PositionsMultiRequestId);
+            });
+            Assert.Throws<OverflowException>(() => _ = updates[0].Position);
+            Assert.Throws<OverflowException>(() => _ = updates[1].Position);
         }
     }
 }

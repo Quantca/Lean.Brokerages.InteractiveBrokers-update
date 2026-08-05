@@ -19,6 +19,7 @@ using NUnit.Framework;
 using QuantConnect.Brokerages;
 using QuantConnect.Brokerages.InteractiveBrokers;
 using QuantConnect.Brokerages.InteractiveBrokers.Client;
+using QuantConnect.Logging;
 
 namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 {
@@ -860,7 +861,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             scenario.Requests.Clear();
             scenario.Client.nextValidId(125);
 
-            await Task.Delay(50);
             CollectionAssert.IsEmpty(
                 scenario.Requests,
                 "NextValidId occurs while Connect() still reports IsConnecting.");
@@ -890,7 +890,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             scenario.Client.nextValidId(126);
             state.NotifyBrokerageConnected();
-            await Task.Delay(50);
 
             Assert.Multiple(() =>
             {
@@ -919,7 +918,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Interlocked.Increment(ref blockedPaceCalls) == 1)
                 {
                     paceEntered.Set();
-                    releasePacing.Wait();
+                    if (!releasePacing.Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        throw new TimeoutException(
+                            "Test pacing callback was not released.");
+                    }
                 }
             });
             var ready = await RunRefreshAsync(
@@ -931,15 +934,20 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 state,
                 () => state.RequestRefresh(new[] { "Beta" }));
             Assert.IsTrue(paceEntered.Wait(TimeSpan.FromSeconds(5)));
-            FillRefreshQueue(state);
-            scenario.Client.connectionClosed();
-            FillRefreshQueue(state);
-            scenario.Client.nextValidId(656);
-            state.NotifyBrokerageConnected();
-            Assert.AreEqual(
-                BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
-
-            releasePacing.Set();
+            try
+            {
+                FillRefreshQueue(state);
+                scenario.Client.connectionClosed();
+                FillRefreshQueue(state);
+                scenario.Client.nextValidId(656);
+                state.NotifyBrokerageConnected();
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
+            }
+            finally
+            {
+                releasePacing.Set();
+            }
             await interrupted;
             Assert.IsTrue(SpinWait.SpinUntil(() =>
             {
@@ -1068,7 +1076,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Array.Empty<string>(), new[] { "ACC1" }));
 
             var timeout = await timeoutTask;
-            await Task.Delay(50);
+            Assert.IsTrue(SpinWait.SpinUntil(
+                () => !HasQueuedRefresh(state) &&
+                    GetPrivateField<object>(state, "_activeRefresh") == null,
+                TimeSpan.FromSeconds(5)),
+                "The queued refresh was not deterministically rejected after the timeout.");
 
             Assert.Multiple(() =>
             {
@@ -2002,17 +2014,19 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             unsupportedOrder,
                             snapshot)).Message);
                 StringAssert.Contains(
-                    "Set FaGroup = \"SavedPctChange\" and FaMethod = \"PctChange\" explicitly",
-                    Assert.Throws<InvalidOperationException>(() =>
+                    "unsupported saved allocation method 'PctChange'",
+                    Assert.Throws<NotSupportedException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             savedPctChangeOrder,
                             snapshot)).Message);
                 savedPctChangeOrder.FaMethod = "PctChange";
                 savedPctChangeOrder.FaPercentage = "25";
-                Assert.DoesNotThrow(() =>
-                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
-                        savedPctChangeOrder,
-                        snapshot));
+                StringAssert.Contains(
+                    "unsupported saved allocation method 'PctChange'",
+                    Assert.Throws<NotSupportedException>(() =>
+                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                            savedPctChangeOrder,
+                            snapshot)).Message);
             });
         }
 
@@ -2069,8 +2083,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         new IBApi.Order { FaGroup = "Monetary" },
                         snapshot));
                 StringAssert.Contains(
-                    "Set FaGroup = \"SavedPctChange\" and FaMethod = \"PctChange\" explicitly",
-                    Assert.Throws<InvalidOperationException>(() =>
+                    "unsupported saved allocation method 'PctChange'",
+                    Assert.Throws<NotSupportedException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             new IBApi.Order { FaGroup = "SavedPctChange" },
                             snapshot)).Message);
@@ -2538,6 +2552,111 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase(true)]
+        [TestCase(false)]
+        public async Task PositionRowsMustMatchTheirRequestedGroupOrAccountTest(
+            bool groupRequest)
+        {
+            using var scenario = groupRequest ? new Scenario() : Scenario.SingleAccount();
+            scenario.Actions.RequestPositions = (requestId, accountOrGroup, authorize) =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.Requests.Add($"positions:{accountOrGroup}");
+                    scenario.KeyedRequestIds.Add(requestId);
+                    scenario.Client.positionMulti(
+                        requestId,
+                        "ACC2",
+                        "Model-A",
+                        Scenario.MappedContract(),
+                        1m,
+                        100d);
+                    scenario.Client.positionMultiEnd(requestId);
+                });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(
+                    groupRequest ? new[] { "Alpha" } : Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
+                StringAssert.Contains(
+                    groupRequest
+                        ? "FA group 'Alpha' contained non-member account 'ACC2'"
+                        : "Position response for 'ACC1' contained account 'ACC2'",
+                    snapshot.ErrorMessage);
+            });
+        }
+
+        [TestCase("mapped", "identical", BrokerageAccountSnapshotStatus.Ready)]
+        [TestCase("mapped", "conflicting", BrokerageAccountSnapshotStatus.Failed)]
+        [TestCase("mapped", "average-conflicting", BrokerageAccountSnapshotStatus.Failed)]
+        [TestCase("mapped", "zero", BrokerageAccountSnapshotStatus.Ready)]
+        [TestCase("unmapped", "identical", BrokerageAccountSnapshotStatus.Ready)]
+        [TestCase("unmapped", "conflicting", BrokerageAccountSnapshotStatus.Failed)]
+        [TestCase("unmapped", "average-conflicting", BrokerageAccountSnapshotStatus.Failed)]
+        [TestCase("unmapped", "zero", BrokerageAccountSnapshotStatus.Ready)]
+        public async Task DuplicateAndZeroPositionsFailClosedWithoutInflatingHoldingsTest(
+            string mapping,
+            string shape,
+            BrokerageAccountSnapshotStatus expectedStatus)
+        {
+            var accountId = mapping == "mapped" ? "ACC1" : "ACC2";
+            var groupName = mapping == "mapped" ? "Alpha" : "Beta";
+            var contract = mapping == "mapped"
+                ? Scenario.MappedContract()
+                : Scenario.UnmappedContract();
+            using var scenario = new Scenario();
+            scenario.Actions.RequestPositions = (requestId, accountOrGroup, authorize) =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.Requests.Add($"positions:{accountOrGroup}");
+                    scenario.KeyedRequestIds.Add(requestId);
+                    var quantity = shape == "zero" ? 0m : 1.25m;
+                    scenario.Client.positionMulti(
+                        requestId, accountId, "Model-A", contract, quantity, 100.5d);
+                    if (shape != "zero")
+                    {
+                        scenario.Client.positionMulti(
+                            requestId,
+                            accountId,
+                            "Model-A",
+                            contract,
+                            shape == "conflicting" ? quantity + 1m : quantity,
+                            shape == "average-conflicting" ? 101.5d : 100.5d);
+                    }
+                    scenario.Client.positionMultiEnd(requestId);
+                });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { groupName }));
+
+            Assert.AreEqual(expectedStatus, snapshot.Status);
+            if (expectedStatus == BrokerageAccountSnapshotStatus.Failed)
+            {
+                StringAssert.Contains(
+                    mapping == "mapped"
+                        ? "conflicting duplicate positions"
+                        : "conflicting duplicate unmapped positions",
+                    snapshot.ErrorMessage);
+                return;
+            }
+
+            var account = snapshot.Accounts[accountId];
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    shape == "zero" || mapping == "unmapped" ? 0 : 1,
+                    account.Positions.Count);
+                Assert.AreEqual(
+                    shape == "zero" || mapping == "mapped" ? 0 : 1,
+                    account.UnmappedPositions.Count);
+            });
+        }
+
         [Test]
         public async Task PublicCallbackPayloadMutationCannotAffectSnapshotTest()
         {
@@ -2612,6 +2731,1046 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [Test]
+        public async Task NamedGroupSummariesReplaceOnlyGroupMemberAccountUpdatesTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, groupName) =>
+            {
+                scenario.EmitValidSummaryAccount(
+                    requestId, groupName == "Alpha" ? "ACC1" : "ACC2");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(2, scenario.SummaryRequests.Count);
+                CollectionAssert.AreEqual(
+                    scenario.SummaryRequests.Select(request => request.RequestId),
+                    scenario.CanceledSummaryIds);
+                CollectionAssert.AreEqual(
+                    new[] { "ACC3" },
+                    scenario.Requests.Where(request => request.StartsWith("account:"))
+                        .Select(request => request[8..]));
+                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC2"].NetLiquidation);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC3"].NetLiquidation);
+                Assert.AreEqual(350.50m, snapshot.Accounts["ACC1"].TotalCashValue);
+                Assert.AreEqual(350.50m, snapshot.Accounts["ACC1"].CashBalances["USD"]);
+                Assert.IsFalse(snapshot.Accounts["ACC1"].CashBalances.ContainsKey("BASE"));
+                Assert.AreEqual(1, scenario.MaximumConcurrentExternalCalls);
+                Assert.IsTrue(scenario.SummaryRequests.All(request =>
+                    request.RequestId < 0 && state.IsServiceOwnedRequestId(request.RequestId)));
+                Assert.IsTrue(scenario.SummaryRequests.All(request => request.Tags ==
+                    "AccountType,NetLiquidation,TotalCashValue,AvailableFunds," +
+                    "ExcessLiquidity,BuyingPower,AccountReady,$LEDGER,$LEDGER:ALL"));
+                Assert.Less(
+                    scenario.Requests.IndexOf(
+                        $"cancel-summary:{scenario.SummaryRequests[0].RequestId}"),
+                    scenario.Requests.IndexOf("summary:Beta"));
+            });
+        }
+
+        [TestCase("base", true)]
+        [TestCase("concrete", true)]
+        [TestCase("equal-pair", true)]
+        [TestCase("divergent-pair", false)]
+        [TestCase("duplicate-base", false)]
+        [TestCase("three-rows", false)]
+        [TestCase("invalid-value", false)]
+        [TestCase("foreign", false)]
+        [TestCase("blank", false)]
+        public async Task BareLedgerCashShapesAreAcceptedOrFailClosedTest(
+            string shape, bool fastPath)
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                IReadOnlyCollection<(string Currency, string Value)> cashRows = shape switch
+                {
+                    "base" => new[] { ("BASE", "350.50") },
+                    "concrete" => new[] { ("USD", "350.50") },
+                    "equal-pair" => new[] { ("BASE", "350.50"), ("USD", "350.50") },
+                    "divergent-pair" => new[] { ("BASE", "351.50"), ("USD", "350.50") },
+                    "duplicate-base" => new[] { ("BASE", "350.50"), ("BASE", "350.50") },
+                    "three-rows" => new[]
+                    {
+                        ("BASE", "350.50"), ("USD", "350.50"), ("EUR", "0")
+                    },
+                    "invalid-value" => new[] { ("BASE", "not-a-number") },
+                    "foreign" => new[] { ("EUR", "350.50") },
+                    "blank" => new[] { (string.Empty, "350.50") },
+                    _ => throw new ArgumentOutOfRangeException(nameof(shape))
+                };
+                scenario.EmitValidSummaryAccount(requestId, "ACC1", cashRows: cashRows);
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(fastPath ? 1100.25m : 1000.25m,
+                    snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(fastPath ? 0 : 1, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
+                Assert.AreEqual(250.50m + (fastPath ? 100m : 0m),
+                    snapshot.Accounts["ACC1"].CashBalances["USD"]);
+            });
+        }
+
+        [TestCase("1", false)]
+        [TestCase("-1", false)]
+        [TestCase("0", true)]
+        [TestCase("0.00", true)]
+        [TestCase("-0.00", true)]
+        [TestCase("invalid", false)]
+        public async Task AggregateCashDetectorUsesOnlyNonZeroForeignCashTest(
+            string foreignValue, bool fastPath)
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.EmitAggregateCash(
+                    requestId,
+                    ("BASE", "350.50"),
+                    ("USD", "350.50"),
+                    ("EUR", foreignValue));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(fastPath ? 1100.25m : 1000.25m,
+                    snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(fastPath ? 0 : 1, scenario.AccountRequestIds.Count);
+                Assert.IsFalse(snapshot.Accounts["ACC1"].CashBalances.ContainsKey("EUR"));
+            });
+        }
+
+        [TestCase("missing")]
+        [TestCase("missing-base")]
+        [TestCase("duplicate-currency")]
+        public async Task AggregateCashDetectorAmbiguityUsesExactFallbackTest(string shape)
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                switch (shape)
+                {
+                    case "missing-base":
+                        scenario.EmitAggregateCash(requestId, ("EUR", "0"));
+                        break;
+                    case "duplicate-currency":
+                        scenario.EmitAggregateCash(
+                            requestId,
+                            ("BASE", "350.50"),
+                            ("BASE", "350.50"),
+                            ("USD", "350.50"));
+                        break;
+                }
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(1, scenario.AccountRequestIds.Count);
+            });
+        }
+
+        [TestCase("missing-ready", false)]
+        [TestCase("not-ready", false)]
+        [TestCase("invalid-ready", false)]
+        [TestCase("missing-scalar", false)]
+        [TestCase("missing-cash", false)]
+        [TestCase("invalid-numeric", false)]
+        [TestCase("duplicate-required", false)]
+        [TestCase("blank-base-currency", false)]
+        [TestCase("scalar-currency", false)]
+        [TestCase("base-net-liquidation-currency", false)]
+        [TestCase("no-real-currency", true)]
+        [TestCase("matching-real-currency", true)]
+        [TestCase("conflicting-real-currency", false)]
+        public async Task SummaryIdentityOrReadinessAmbiguityFallsBackTest(
+            string ambiguity, bool fastPath)
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(
+                    requestId,
+                    "ACC1",
+                    baseCurrency: ambiguity == "blank-base-currency" ? string.Empty : "USD",
+                    cashRows: ambiguity == "missing-cash"
+                        ? Array.Empty<(string Currency, string Value)>()
+                        : null,
+                    includeRealCurrency: ambiguity != "no-real-currency",
+                    omittedTag: ambiguity switch
+                    {
+                        "missing-ready" => "AccountReady",
+                        "missing-scalar" => "AvailableFunds",
+                        _ => null
+                    },
+                    accountReadyValue: ambiguity switch
+                    {
+                        "not-ready" => "false",
+                        "invalid-ready" => "not-a-boolean",
+                        _ => "true"
+                    },
+                    realCurrency: ambiguity == "conflicting-real-currency" ? "EUR" : null,
+                    totalCashCurrency: ambiguity == "scalar-currency" ? "EUR" : null,
+                    netLiquidationCurrency:
+                        ambiguity == "base-net-liquidation-currency" ? "BASE" : null,
+                    netLiquidationValue: ambiguity == "invalid-numeric" ? "not-a-number" : null);
+                if (ambiguity == "duplicate-required")
+                {
+                    scenario.Client.accountSummary(
+                        requestId, "ACC1", "AccountReady", "true", string.Empty);
+                }
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(fastPath ? 1100.25m : 1000.25m,
+                    snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(fastPath ? 0 : 1, scenario.AccountRequestIds.Count);
+            });
+        }
+
+        [TestCase("aggregate-only")]
+        [TestCase("unexpected-child")]
+        [TestCase("blank-account")]
+        [TestCase("blank-tag")]
+        public async Task SummaryAttributionCorruptionAlwaysUsesTheExactFallbackTest(
+            string corruption)
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                if (corruption != "aggregate-only")
+                {
+                    scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                }
+                if (corruption == "unexpected-child")
+                {
+                    scenario.Client.accountSummary(
+                        requestId, "ACC2", "NetLiquidation", "999999", "USD");
+                }
+                else if (corruption == "blank-account")
+                {
+                    scenario.Client.accountSummary(
+                        requestId, string.Empty, "Currency", "BASE", string.Empty);
+                }
+                else if (corruption == "blank-tag")
+                {
+                    scenario.Client.accountSummary(
+                        requestId, "OTHER", string.Empty, "BASE", string.Empty);
+                }
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(250.50m, snapshot.Accounts["ACC1"].CashBalances["USD"]);
+            });
+        }
+
+        [Test]
+        public async Task MixedChildBaseCurrenciesFallBackForTheWholeGroupTest()
+        {
+            const string twoMemberGroup = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts>
+                      <String>ACC1</String>
+                      <String>ACC2</String>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario
+            {
+                GroupsDocument = twoMemberGroup,
+                EndingGroupsDocument = twoMemberGroup
+            };
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1", "USD");
+                scenario.EmitValidSummaryAccount(requestId, "ACC2", "EUR");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "700"), ("USD", "350"), ("EUR", "350"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1, scenario.SummaryRequests.Count);
+                Assert.AreEqual(2, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC2"].NetLiquidation);
+            });
+        }
+
+        [Test]
+        public async Task OverlappingGroupValidatesAlreadyResolvedMemberBaseCurrencyTest()
+        {
+            const string overlappingGroups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts>
+                      <String>ACC1</String>
+                      <String>ACC2</String>
+                    </ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Beta</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts>
+                      <String>ACC2</String>
+                      <String>ACC3</String>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario
+            {
+                GroupsDocument = overlappingGroups,
+                EndingGroupsDocument = overlappingGroups
+            };
+            scenario.EnableAccountSummaries((requestId, groupName) =>
+            {
+                if (groupName == "Alpha")
+                {
+                    scenario.EmitValidSummaryAccount(requestId, "ACC1", "USD");
+                    scenario.EmitValidSummaryAccount(requestId, "ACC2", "USD");
+                    scenario.EmitAggregateCash(
+                        requestId, ("BASE", "700"), ("USD", "700"));
+                }
+                else
+                {
+                    scenario.EmitValidSummaryAccount(requestId, "ACC2", "USD");
+                    scenario.EmitValidSummaryAccount(requestId, "ACC3", "EUR");
+                    scenario.EmitAggregateCash(
+                        requestId, ("BASE", "700"), ("EUR", "700"));
+                }
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(2, scenario.SummaryRequests.Count);
+                CollectionAssert.AreEqual(
+                    new[] { "ACC3" },
+                    scenario.Requests.Where(request => request.StartsWith("account:"))
+                        .Select(request => request[8..]));
+                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC2"].NetLiquidation);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC3"].NetLiquidation);
+            });
+        }
+
+        [Test]
+        public async Task MixedAggregateAttributionFallsBackWithoutRoutingRowsToAChildTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummary(
+                    requestId, "OTHER", "Currency", "BASE", string.Empty);
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(250.50m, snapshot.Accounts["ACC1"].CashBalances["USD"]);
+            });
+        }
+
+        [Test]
+        public async Task PrimaryAccountSummaryRowsAreIgnoredWithoutDisablingTheFastPathTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.EmitValidSummaryAccount(requestId, "MASTER");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(0, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(350.50m, snapshot.Accounts["ACC1"].CashBalances["USD"]);
+            });
+        }
+
+        [Test]
+        public async Task FiveHundredOneMemberGroupUsesOneSummaryRequestTest()
+        {
+            var accountIds = Enumerable.Range(1, 501)
+                .Select(index => $"ACC{index:000}")
+                .ToArray();
+            var groupXml =
+                "<ListOfGroups><Group><name>Large</name><defaultMethod>Equal</defaultMethod>" +
+                "<ListOfAccts>" + string.Concat(accountIds.Select(
+                    accountId => $"<String>{accountId}</String>")) +
+                "</ListOfAccts></Group></ListOfGroups>";
+            using var scenario = new Scenario
+            {
+                ManagedAccounts = "MASTER," + string.Join(",", accountIds),
+                GroupsDocument = groupXml,
+                EndingGroupsDocument = groupXml,
+                AliasesDocument = "<ListOfAccountAliases />",
+                FamilyCodes = Array.Empty<FamilyCode>()
+            };
+            scenario.EnableAccountSummaries((requestId, groupName) =>
+            {
+                Assert.AreEqual("Large", groupName);
+                foreach (var accountId in accountIds)
+                {
+                    scenario.EmitValidSummaryAccount(requestId, accountId);
+                }
+                scenario.EmitAggregateCash(requestId, ("BASE", "0"), ("USD", "0"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(501, snapshot.Accounts.Count);
+                Assert.AreEqual(1, scenario.SummaryRequests.Count);
+                Assert.AreEqual("Large", scenario.SummaryRequests.Single().GroupName);
+                Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
+                Assert.AreEqual(0, scenario.AccountRequestIds.Count);
+            });
+        }
+
+        [Test]
+        public async Task TopologyChangeAfterValidSummaryPreventsPublicationTest()
+        {
+            using var scenario = new Scenario
+            {
+                EndingGroupsDocument = Scenario.GroupsXml.Replace(
+                    "<name>Alpha</name>",
+                    "<name>AlphaChanged</name>",
+                    StringComparison.Ordinal)
+            };
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
+                StringAssert.Contains("topology changed", snapshot.ErrorMessage.ToLowerInvariant());
+                Assert.AreEqual(1, scenario.SummaryRequests.Count);
+                Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
+                Assert.AreEqual(0, scenario.AccountRequestIds.Count);
+            });
+        }
+
+        [Test]
+        public async Task SummaryRowsRequireTheExactActiveRequestTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId + 1, "ACC1");
+                scenario.EmitAggregateCash(
+                    requestId + 1, ("BASE", "1"), ("USD", "1"));
+                scenario.Client.accountSummaryEnd(requestId + 1);
+
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+                scenario.Client.accountSummary(
+                    requestId, "ACC1", "NetLiquidation", "999999", "USD");
+            });
+            scenario.SummaryCancellation = requestId => scenario.Client.accountSummary(
+                requestId, "ACC1", "CashBalance", "999999", "USD");
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(350.50m, snapshot.Accounts["ACC1"].CashBalances["USD"]);
+                Assert.AreEqual(0, scenario.AccountRequestIds.Count);
+                Assert.IsNull(GetPrivateField<object>(state, "_pendingRequest"));
+            });
+        }
+
+        [Test]
+        public async Task SummaryWithoutEndIsCanceledAndLateRowsCannotCorruptFallbackTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+            });
+            scenario.SummaryCancellation = requestId =>
+            {
+                scenario.Client.accountSummary(
+                    requestId, "ACC1", "NetLiquidation", "999999", "USD");
+                scenario.Client.accountSummaryEnd(requestId);
+            };
+            using var state = scenario.CreateState(
+                requestTimeout: TimeSpan.FromMilliseconds(100));
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
+                Assert.AreEqual(1, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(250.50m, snapshot.Accounts["ACC1"].CashBalances["USD"]);
+                Assert.IsNull(GetPrivateField<object>(state, "_pendingRequest"));
+            });
+        }
+
+        [Test]
+        public async Task PhysicalDisconnectDiscardsOutstandingAndLateSummaryRowsTest()
+        {
+            using var scenario = new Scenario();
+            using var firstSummaryStarted = new ManualResetEventSlim();
+            var firstRequestId = 0;
+            var requestCount = 0;
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                if (Interlocked.Increment(ref requestCount) == 1)
+                {
+                    firstRequestId = requestId;
+                    firstSummaryStarted.Set();
+                    return;
+                }
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var interrupted = RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+            Assert.IsTrue(firstSummaryStarted.Wait(TimeSpan.FromSeconds(5)));
+
+            scenario.Client.connectionClosed();
+            scenario.Client.accountSummary(
+                firstRequestId, "ACC1", "NetLiquidation", "999999", "USD");
+            scenario.Client.accountSummaryEnd(firstRequestId);
+            var stale = await interrupted;
+
+            scenario.Client.nextValidId(42);
+            state.NotifyBrokerageConnected();
+            var recovered = await WaitForReadyGenerationAsync(state, 0);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, stale.Status);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, recovered.Status);
+                Assert.AreEqual(2, scenario.SummaryRequests.Count);
+                Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
+                Assert.AreEqual(1100.25m, recovered.Accounts["ACC1"].NetLiquidation);
+                Assert.IsNull(GetPrivateField<object>(state, "_pendingRequest"));
+            });
+        }
+
+        [Test]
+        public async Task DisposeDiscardsOutstandingAndLateSummaryRowsTest()
+        {
+            using var scenario = new Scenario();
+            using var summaryStarted = new ManualResetEventSlim();
+            var requestId = 0;
+            scenario.EnableAccountSummaries((id, _) =>
+            {
+                requestId = id;
+                summaryStarted.Set();
+            });
+            using var state = scenario.CreateState();
+            var refresh = RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+            Assert.IsTrue(summaryStarted.Wait(TimeSpan.FromSeconds(5)));
+            var worker = GetPrivateField<Task>(state, "_worker");
+
+            state.Dispose();
+            scenario.Client.accountSummary(
+                requestId, "ACC1", "NetLiquidation", "999999", "USD");
+            scenario.Client.accountSummaryEnd(requestId);
+            var failed = await refresh;
+            await worker.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, failed.Status);
+                StringAssert.Contains("disposed", failed.ErrorMessage);
+                Assert.AreEqual(0, scenario.CanceledSummaryIds.Count);
+                Assert.IsNull(GetPrivateField<object>(state, "_pendingRequest"));
+            });
+        }
+
+        [TestCase("ib-error")]
+        [TestCase("wire-exception")]
+        [NonParallelizable]
+        public async Task SummaryRequestFailuresUseTheExactFallbackTest(string failure)
+        {
+            var originalLogHandler = Log.LogHandler;
+            var logHandler = new QueueLogHandler();
+            Log.LogHandler = logHandler;
+            try
+            {
+                using var scenario = new Scenario();
+                scenario.EnableAccountSummaries((requestId, _) =>
+                {
+                    if (failure == "ib-error")
+                    {
+                        scenario.Client.error(
+                            requestId, 0, 321, "simulated summary rejection", string.Empty);
+                        return;
+                    }
+                    throw new InvalidOperationException("simulated summary wire failure");
+                });
+                using var state = scenario.CreateState();
+
+                var snapshot = await RunRefreshAsync(
+                    state, () => state.RequestRefresh(new[] { "Alpha" }));
+                var messages = logHandler.Logs
+                    .Where(entry => entry.MessageType == LogType.Error &&
+                        entry.Message.Contains(
+                            "named-group account summary fallback(s)",
+                            StringComparison.Ordinal))
+                    .Select(entry => entry.Message)
+                    .ToArray();
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                    Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                    Assert.AreEqual(1, scenario.AccountRequestIds.Count);
+                    Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
+                    CollectionAssert.AreEqual(
+                        new[]
+                        {
+                            "InteractiveBrokersFinancialAdvisorAccountState: named-group " +
+                            "account summary fallback(s): group 'Alpha': RequestFailure " +
+                            "(InvalidOperationException)"
+                        },
+                        messages);
+                });
+            }
+            finally
+            {
+                Log.LogHandler = originalLogHandler;
+                logHandler.Dispose();
+            }
+        }
+
+        [Test]
+        public async Task FailedSummaryCancellationDisablesBatchingUntilPhysicalReconnectTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, groupName) =>
+            {
+                scenario.EmitValidSummaryAccount(
+                    requestId, groupName == "Alpha" ? "ACC1" : "ACC2");
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            var cancellationAttempts = 0;
+            scenario.SummaryCancellation = requestId =>
+            {
+                scenario.Client.accountSummary(
+                    requestId, "ACC1", "CashBalance", "999999", "USD");
+                if (Interlocked.Increment(ref cancellationAttempts) == 1)
+                {
+                    throw new InvalidOperationException("simulated cancellation failure");
+                }
+            };
+            using var state = scenario.CreateState();
+
+            var first = await RunRefreshAsync(
+                state, () => state.RequestRefresh(Array.Empty<string>()));
+            var firstSummaryCount = scenario.SummaryRequests.Count;
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            var second = await WaitForReadyGenerationAsync(state, first.Generation);
+            var secondSummaryCount = scenario.SummaryRequests.Count;
+
+            state.MarkDisconnected("simulated physical disconnect", physicalConnectionClosed: true);
+            scenario.Client.nextValidId(1);
+            Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+            var third = await WaitForReadyGenerationAsync(state, second.Generation);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, first.Status);
+                Assert.AreEqual(1100.25m, first.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(1000.25m, first.Accounts["ACC2"].NetLiquidation);
+                Assert.AreEqual(1, firstSummaryCount);
+                Assert.AreEqual(firstSummaryCount, secondSummaryCount);
+                Assert.AreEqual(1000.25m, second.Accounts["ACC1"].NetLiquidation);
+                Assert.Greater(scenario.SummaryRequests.Count, secondSummaryCount);
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, third.Status);
+                Assert.GreaterOrEqual(cancellationAttempts, 2);
+            });
+        }
+
+        [Test]
+        [NonParallelizable]
+        public async Task GroupFallbacksProduceOneDeterministicErrorPerRefreshTest()
+        {
+            var originalLogHandler = Log.LogHandler;
+            var logHandler = new QueueLogHandler();
+            Log.LogHandler = logHandler;
+            try
+            {
+                using var scenario = new Scenario();
+                scenario.EnableAccountSummaries((requestId, groupName) =>
+                {
+                    var alpha = groupName == "Alpha";
+                    scenario.EmitValidSummaryAccount(
+                        requestId,
+                        alpha ? "ACC1" : "ACC2",
+                        omittedTag: alpha ? "AccountReady" : null);
+                    scenario.EmitAggregateCash(
+                        requestId,
+                        ("BASE", "350.50"),
+                        ("USD", "350.50"),
+                        ("EUR", alpha ? "0" : "1"));
+                    scenario.Client.accountSummaryEnd(requestId);
+                });
+                using var state = scenario.CreateState();
+
+                var first = await RunRefreshAsync(
+                    state, () => state.RequestRefresh(new[] { "Beta", "Alpha" }));
+                Assert.IsTrue(state.RequestRefresh(new[] { "Beta", "Alpha" }));
+                var second = await WaitForReadyGenerationAsync(state, first.Generation);
+
+                var messages = logHandler.Logs
+                    .Where(entry => entry.MessageType == LogType.Error && entry.Message.Contains(
+                        "named-group account summary fallback(s)",
+                        StringComparison.Ordinal))
+                    .Select(entry => entry.Message)
+                    .ToArray();
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, second.Status);
+                    Assert.AreEqual(2, messages.Length);
+                    Assert.IsTrue(messages.All(message =>
+                        message.Contains("group 'Alpha': MissingRows", StringComparison.Ordinal) &&
+                        message.Contains("ACC1:AccountReady", StringComparison.Ordinal) &&
+                        message.Contains(
+                            "group 'Beta': NonBaseAggregateCash currencies=[EUR]",
+                            StringComparison.Ordinal) &&
+                        message.IndexOf("group 'Alpha'", StringComparison.Ordinal) <
+                        message.IndexOf("group 'Beta'", StringComparison.Ordinal) &&
+                        !message.Contains("350.50", StringComparison.Ordinal)));
+                });
+            }
+            finally
+            {
+                Log.LogHandler = originalLogHandler;
+                logHandler.Dispose();
+            }
+        }
+
+        [Test]
+        [NonParallelizable]
+        public async Task FirstFailedRefreshThenReadyLogsOneDiagnosticTest()
+        {
+            var originalLogHandler = Log.LogHandler;
+            var logHandler = new QueueLogHandler();
+            Log.LogHandler = logHandler;
+            try
+            {
+                using var scenario = Scenario.SingleAccount();
+                var requestPositions = scenario.Actions.RequestPositions;
+                scenario.Actions.RequestPositions =
+                    (requestId, accountOrGroup, authorize) =>
+                        scenario.RunAuthorized(authorize, () =>
+                            throw new InvalidOperationException(
+                                "simulated initial position failure"));
+                using var state = scenario.CreateState();
+
+                var failed = await RunRefreshAsync(
+                    state, () => state.RequestRefresh(Array.Empty<string>()));
+                scenario.Actions.RequestPositions = requestPositions;
+                var ready = await RunRefreshAsync(
+                    state, () => state.RequestRefresh(Array.Empty<string>()));
+                await WaitForReadyDiagnosticCountAsync(logHandler, 1);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, failed.Status);
+                    StringAssert.Contains(
+                        "simulated initial position failure", failed.ErrorMessage);
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, ready.Status);
+                    Assert.AreEqual(1, GetReadyDiagnosticMessages(logHandler).Length);
+                });
+            }
+            finally
+            {
+                Log.LogHandler = originalLogHandler;
+                logHandler.Dispose();
+            }
+        }
+
+        [Test]
+        [NonParallelizable]
+        public async Task ReadyDiagnosticLogsOncePerPhysicalConnectionEpochTest()
+        {
+            var originalLogHandler = Log.LogHandler;
+            var logHandler = new QueueLogHandler();
+            Log.LogHandler = logHandler;
+            try
+            {
+                using var scenario = new Scenario
+                {
+                    ManagedAccounts = "MASTER,MASTERA,ACC1,ACC2,ACC3"
+                };
+                scenario.EnableAccountSummaries((requestId, groupName) =>
+                {
+                    scenario.EmitValidSummaryAccount(
+                        requestId, groupName == "Alpha" ? "ACC1" : "ACC2");
+                    scenario.EmitAggregateCash(
+                        requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                    scenario.Client.accountSummaryEnd(requestId);
+                });
+                using var state = scenario.CreateState();
+
+                var first = await RunRefreshAsync(
+                    state, () => state.RequestRefresh(Array.Empty<string>()));
+                Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+                var second = await WaitForReadyGenerationAsync(state, first.Generation);
+
+                state.MarkDisconnected("simulated logical disconnect");
+                state.MarkConnected();
+                Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+                var logicalReconnect = await WaitForReadyGenerationAsync(
+                    state, second.Generation);
+
+                state.MarkDisconnected(
+                    "simulated physical disconnect", physicalConnectionClosed: true);
+                scenario.Client.nextValidId(1);
+                Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
+                await WaitForReadyGenerationAsync(
+                    state, logicalReconnect.Generation);
+                await WaitForReadyDiagnosticCountAsync(logHandler, 2);
+
+                var messages = GetReadyDiagnosticMessages(logHandler);
+                const string expected =
+                    "FA snapshot ready: accessibleManagedAccounts=4; " +
+                    "discoveredGroups=2; groups=[Alpha:1,Beta:1]; " +
+                    "collectedAccounts=3; clientAccountsOutsideGroups=1; " +
+                    "accountSummaryFastPathAccounts=2; accountUpdateFallbackAccounts=1; " +
+                    "complete=true; observedAccountTypes=[INDIVIDUAL]";
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(2, messages.Length);
+                    Assert.IsTrue(messages.All(message => message == expected));
+                });
+            }
+            finally
+            {
+                Log.LogHandler = originalLogHandler;
+                logHandler.Dispose();
+            }
+        }
+
+        [Test]
+        public void ReadyDiagnosticBoundsAndSortsGroupDetailsTest()
+        {
+            var groups = Enumerable.Range(0, 52)
+                .Reverse()
+                .Select(index => new BrokerageAccountGroup(
+                    $"Group{index:00}", "Equal", new[] { "ACC1" }))
+                .ToDictionary(group => group.Name, StringComparer.OrdinalIgnoreCase);
+            var snapshot = new BrokerageAccountSnapshot(
+                BrokerageAccountSnapshotStatus.Ready,
+                1,
+                DateTime.UtcNow,
+                DateTime.UtcNow,
+                groups,
+                new Dictionary<string, BrokerageAccountState>(
+                    StringComparer.OrdinalIgnoreCase),
+                Array.Empty<string>(),
+                "membership",
+                "configuration",
+                string.Empty,
+                "MASTER",
+                new[] { "MASTER", "MASTERA" },
+                groups,
+                isComplete: false);
+            var listedGroups = string.Join(",", Enumerable.Range(0, 50)
+                .Select(index => $"Group{index:00}:1"));
+
+            Assert.AreEqual(
+                "FA snapshot ready: accessibleManagedAccounts=1; " +
+                $"discoveredGroups=52; groups=[{listedGroups}]; omittedGroups=2; " +
+                "collectedAccounts=0; clientAccountsOutsideGroups=0; " +
+                "accountSummaryFastPathAccounts=0; accountUpdateFallbackAccounts=0; " +
+                "complete=false; observedAccountTypes=[]",
+                InteractiveBrokersFinancialAdvisorAccountState
+                    .FormatReadySnapshotDiagnostic(snapshot, 0, 0));
+        }
+
+        [Test]
+        public async Task FailedGroupMembersRemainOnTheExactPathAcrossOverlappingGroupsTest()
+        {
+            const string overlappingGroups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts>
+                      <String>ACC1</String>
+                      <String>ACC2</String>
+                    </ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Beta</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts>
+                      <String>ACC2</String>
+                      <String>ACC3</String>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario
+            {
+                GroupsDocument = overlappingGroups,
+                EndingGroupsDocument = overlappingGroups
+            };
+            scenario.EnableAccountSummaries((requestId, groupName) =>
+            {
+                if (groupName == "Alpha")
+                {
+                    scenario.EmitValidSummaryAccount(
+                        requestId, "ACC1", omittedTag: "AccountReady");
+                    scenario.EmitValidSummaryAccount(requestId, "ACC2");
+                }
+                else
+                {
+                    scenario.EmitValidSummaryAccount(requestId, "ACC2");
+                    scenario.EmitValidSummaryAccount(requestId, "ACC3");
+                }
+                scenario.EmitAggregateCash(
+                    requestId, ("BASE", "700"), ("USD", "700"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                CollectionAssert.AreEquivalent(
+                    new[] { "ACC1", "ACC2" },
+                    scenario.Requests.Where(request => request.StartsWith("account:"))
+                        .Select(request => request[8..]));
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC2"].NetLiquidation);
+                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC3"].NetLiquidation);
+            });
+        }
+
         private static async Task<BrokerageAccountSnapshot> RunRefreshAsync(
             InteractiveBrokersFinancialAdvisorAccountState state,
             Func<bool> request)
@@ -2649,6 +3808,29 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
             throw new TimeoutException(
                 "The reconnect refresh did not publish a newer Ready snapshot.");
+        }
+
+        private static string[] GetReadyDiagnosticMessages(QueueLogHandler logHandler) =>
+            logHandler.Logs
+                .Where(entry => entry.MessageType == LogType.Trace && entry.Message.Contains(
+                    "FA snapshot ready:", StringComparison.Ordinal))
+                .Select(entry => entry.Message)
+                .ToArray();
+
+        private static async Task WaitForReadyDiagnosticCountAsync(
+            QueueLogHandler logHandler,
+            int expectedCount)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (GetReadyDiagnosticMessages(logHandler).Length >= expectedCount)
+                {
+                    return;
+                }
+                await Task.Delay(5);
+            }
+            Assert.Fail($"Expected {expectedCount} FA Ready diagnostics.");
         }
 
         private static long GetRequestVersion(
@@ -2794,7 +3976,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             internal List<int> AccountRequestIds { get; } = new();
             internal List<int> CanceledPositionIds { get; } = new();
             internal List<int> CanceledAccountIds { get; } = new();
+            internal List<(int RequestId, string GroupName, string Tags)>
+                SummaryRequests { get; } = new();
+            internal List<int> CanceledSummaryIds { get; } = new();
             internal Action ExternalCallProbe { get; set; } = () => { };
+            internal Action<int> SummaryCancellation { get; set; } = _ => { };
             internal string ManagedAccounts { get; set; } = "MASTER,ACC1,ACC2,ACC3";
             internal string EndingManagedAccounts { get; set; }
             internal string GroupsDocument { get; set; } = GroupsXml;
@@ -2868,7 +4054,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         CancelAccountUpdates = (requestId, authorize) =>
                             RunAuthorized(
                                 authorize,
-                                () => CanceledAccountIds.Add(requestId))
+                                () => CanceledAccountIds.Add(requestId)),
+                        RequestAccountSummary = null,
+                        CancelAccountSummary = null
                     };
             }
 
@@ -2902,6 +4090,96 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 AliasesDocument = "<ListOfAccountAliases />",
                 FamilyCodes = Array.Empty<FamilyCode>()
             };
+
+            internal void EnableAccountSummaries(Action<int, string> emit)
+            {
+                Actions.RequestAccountSummary =
+                    (requestId, groupName, tags, authorize) =>
+                        RunAuthorized(authorize, () =>
+                        {
+                            Requests.Add($"summary:{groupName}");
+                            KeyedRequestIds.Add(requestId);
+                            SummaryRequests.Add((requestId, groupName, tags));
+                            emit(requestId, groupName);
+                        });
+                Actions.CancelAccountSummary = (requestId, authorize) =>
+                    RunAuthorized(authorize, () =>
+                    {
+                        Requests.Add($"cancel-summary:{requestId}");
+                        CanceledSummaryIds.Add(requestId);
+                        SummaryCancellation(requestId);
+                    });
+            }
+
+            internal void EmitValidSummaryAccount(
+                int requestId,
+                string accountId,
+                string baseCurrency = "USD",
+                IReadOnlyCollection<(string Currency, string Value)> cashRows = null,
+                bool includeRealCurrency = true,
+                string omittedTag = null,
+                string accountReadyValue = "true",
+                string realCurrency = null,
+                string totalCashCurrency = null,
+                string netLiquidationCurrency = null,
+                string netLiquidationValue = null)
+            {
+                void Emit(string tag, string value, string currency)
+                {
+                    if (!tag.Equals(omittedTag, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Client.accountSummary(
+                            requestId, accountId, tag, value, currency);
+                    }
+                }
+
+                Emit("AccountType", "INDIVIDUAL", string.Empty);
+                Emit(
+                    "NetLiquidation",
+                    netLiquidationValue ?? "1100.25",
+                    netLiquidationCurrency ?? baseCurrency);
+                Emit("TotalCashValue", "350.50", totalCashCurrency ?? baseCurrency);
+                Emit("AvailableFunds", "300.25", baseCurrency);
+                Emit("ExcessLiquidity", "275.25", baseCurrency);
+                Emit("BuyingPower", "600.50", baseCurrency);
+                Emit("AccountReady", accountReadyValue, string.Empty);
+                Client.accountSummary(
+                    requestId, accountId, "Currency", "BASE", string.Empty);
+                if (includeRealCurrency)
+                {
+                    Client.accountSummary(
+                        requestId,
+                        accountId,
+                        "RealCurrency",
+                        realCurrency ?? baseCurrency,
+                        "BASE");
+                }
+                Client.accountSummary(
+                    requestId, accountId, "TotalCashBalance", "999999", "BASE");
+                Client.accountSummary(
+                    requestId, accountId, "NetLiquidationByCurrency", "888888", baseCurrency);
+                foreach (var cash in cashRows ??
+                    new[] { (Currency: "BASE", Value: "350.50") })
+                {
+                    Client.accountSummary(
+                        requestId,
+                        accountId,
+                        "CashBalance",
+                        cash.Value,
+                        cash.Currency);
+                }
+            }
+
+            internal void EmitAggregateCash(
+                int requestId,
+                params (string Currency, string Value)[] rows)
+            {
+                foreach (var row in rows)
+                {
+                    Client.accountSummary(
+                        requestId, "All", "CashBalance", row.Value, row.Currency);
+                }
+            }
 
             internal bool RunAuthorized(Func<bool> authorize, Action action)
             {
@@ -2989,7 +4267,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 PrimaryExch = "ARCA"
             };
 
-            private static Contract UnmappedContract() => new()
+            internal static Contract UnmappedContract() => new()
             {
                 ConId = 202,
                 Symbol = "UNMAPPED",

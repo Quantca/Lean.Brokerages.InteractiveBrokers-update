@@ -239,6 +239,51 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 orderEvent.Message);
         }
 
+        [TestCase(true, 1, TestName = "ExplicitGroupBuyPreservesFractionalPartialFills")]
+        [TestCase(true, -1, TestName = "ExplicitGroupSellPreservesFractionalPartialFills")]
+        [TestCase(false, 1, TestName = "ImplicitFilterBuyPreservesFractionalPartialFills")]
+        [TestCase(false, -1, TestName = "ImplicitFilterSellPreservesFractionalPartialFills")]
+        public void UnifiedFinancialAdvisorGroupPartialFillsUseExactCumulativeQuantitiesTest(
+            bool explicitGroup,
+            int direction)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            if (!explicitGroup)
+            {
+                FaFilterField.SetValue(brokerage, FaGroupName);
+            }
+            var order = CreateFractionalFillOrder(
+                direction * 19.75m,
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = explicitGroup ? FaGroupName : string.Empty
+                });
+
+            var firstFill = EmitOrderFill(
+                brokerage,
+                order,
+                7.25m,
+                7.25m);
+            var finalFill = EmitOrderFill(
+                brokerage,
+                order,
+                12.5m,
+                19.75m);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(direction * 7.25m, firstFill.FillQuantity);
+                Assert.AreEqual(OrderStatus.PartiallyFilled, firstFill.Status);
+                StringAssert.Contains("remaining", firstFill.Message);
+                Assert.AreEqual(direction * 12.5m, finalFill.FillQuantity);
+                Assert.AreEqual(OrderStatus.Filled, finalFill.Status);
+                Assert.AreEqual(
+                    "Interactive Brokers Order Fill Event",
+                    finalFill.Message);
+            });
+        }
+
         [TestCase(
             "PctChange",
             9926d,
@@ -786,6 +831,63 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void PublicUpdateOrderRejectsInvalidSavedContractsOrSharesQuantityBeforeSocketPathTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 4m,
+                    ["B"] = 6m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+            var group = new GroupOrderManager(1, 2, 12m);
+            var order = new ComboMarketOrder(
+                Symbols.SPY,
+                1m,
+                DateTime.UtcNow,
+                group,
+                properties: new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName
+                });
+            group.OrderIds.Add(order.Id);
+            var client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
+            var connectedField = FindSocketConnectedField(client.ClientSocket);
+            var orderUpdatesField = typeof(InteractiveBrokersBrokerage).GetField(
+                "_orderUpdates",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            ClientField.SetValue(brokerage, client);
+            connectedField.SetValue(client.ClientSocket, true);
+
+            try
+            {
+                Assert.IsFalse(brokerage.UpdateOrder(order));
+                Assert.AreEqual(0, GetCollectionCount(orderUpdatesField.GetValue(brokerage)));
+                Assert.AreEqual(0, GetCollectionCount(RequestInformationField.GetValue(brokerage)));
+                Assert.AreEqual(0, GetCollectionCount(PendingOrderResponseField.GetValue(brokerage)));
+            }
+            finally
+            {
+                connectedField.SetValue(client.ClientSocket, false);
+                client.Dispose();
+                ClientField.SetValue(brokerage, null);
+            }
+        }
+
+        [Test]
         public void PriceOnlyUpdateIsAcceptedWithReadyUnblockedStateTest()
         {
             var brokerage = CreateOfflineBrokerage();
@@ -973,7 +1075,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void SavedPctChangeRequiresExplicitMethodOnlyWithReadyAuthorityTest()
+        public void SavedPctChangeIsUnsupportedOnlyWithReadyAuthorityTest()
         {
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
@@ -1007,26 +1109,18 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ExactFaPercentage = -25.5m
                 });
 
-            StringAssert.Contains(
-                $"Set FaGroup = \"{FaGroupName}\" and FaMethod = \"PctChange\" explicitly",
-                Assert.Throws<InvalidOperationException>(() =>
-                    brokerage.ValidateFinancialAdvisorOrderAdmission(
-                        savedMethodOrder)).Message);
-            StringAssert.Contains(
-                $"Set FaGroup = \"{FaGroupName}\" and FaMethod = \"PctChange\" explicitly",
-                Assert.Throws<InvalidOperationException>(() =>
-                    brokerage.ValidateFinancialAdvisorOrderAdmission(
-                        methodOnlyOrder)).Message);
-            Assert.DoesNotThrow(() =>
-                brokerage.ValidateFinancialAdvisorOrderAdmission(
-                    explicitMethodOrder));
-            Assert.AreEqual(
-                9926m,
-                EmitOrderFill(
-                    brokerage,
-                    explicitMethodOrder,
-                    9925.5m,
-                    9925.5m).FillQuantity);
+            foreach (var order in new[]
+            {
+                savedMethodOrder,
+                methodOnlyOrder,
+                explicitMethodOrder
+            })
+            {
+                StringAssert.Contains(
+                    "unsupported saved allocation method 'PctChange'",
+                    Assert.Throws<NotSupportedException>(() =>
+                        brokerage.ValidateFinancialAdvisorOrderAdmission(order)).Message);
+            }
 
             SnapshotField.SetValue(
                 state,
@@ -1036,6 +1130,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(
                     savedMethodOrder));
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    explicitMethodOrder));
         }
 
         [TestCase(BrokerageAccountRelationship.Primary)]
@@ -1358,6 +1455,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
         }
 
+        [TestCase(true, TestName = "ExplicitGroupFractionalContractsOrSharesReachesWire")]
+        [TestCase(false, TestName = "ImplicitFilterFractionalContractsOrSharesReachesWire")]
+        public void FractionalContractsOrSharesTotalSurvivesAdmissionAndConversionTest(
+            bool explicitGroup)
+        {
+            var algorithm = new AlgorithmStub();
+            var security = algorithm.AddEquity("SPY");
+            SetLotSize(security, 0.25m);
+            var brokerage = CreateOfflineBrokerage(algorithm);
+            UnifiedGroupsField.SetValue(brokerage, true);
+            if (!explicitGroup)
+            {
+                FaFilterField.SetValue(brokerage, FaGroupName);
+            }
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "ContractsOrShares",
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = 9.5m,
+                    ["B"] = 10.25m
+                });
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                RuntimeHelpers.GetUninitializedObject(
+                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    savedGroup));
+            AccountStateField.SetValue(brokerage, state);
+            var order = CreateOrder(
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = explicitGroup ? FaGroupName : string.Empty
+                },
+                quantity: 19.75m);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+            var convertedOrder = ConvertOrder(brokerage, order);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(0.25m, security.SymbolProperties.LotSize);
+                Assert.AreEqual(19.75m, convertedOrder.TotalQuantity);
+                Assert.AreEqual(FaGroupName, convertedOrder.FaGroup);
+                Assert.IsEmpty(convertedOrder.FaMethod);
+            });
+        }
+
         [Test]
         public void StartupAndReconnectRecoveryPreserveFinancialAdvisorIdentityTest()
         {
@@ -1495,6 +1644,40 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 Assert.AreEqual(20m, recovered.Quantity);
                 Assert.AreEqual(typeof(OrderProperties), recovered.Properties.GetType());
+            });
+        }
+
+        [Test]
+        public void RecoveredPctChangeOrderKeepsPercentageAndZeroWireQuantityTest()
+        {
+            var algorithm = new AlgorithmStub();
+            algorithm.AddEquity("SPY");
+            var brokerage = CreateOfflineBrokerage(algorithm);
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var recovered = RecoverOrder(brokerage, new IBApi.Order
+            {
+                Account = FaMasterAccount,
+                FaGroup = FaGroupName,
+                FaMethod = "PctChange",
+                FaPercentage = "-25.5",
+                TotalQuantity = 0m,
+                Action = "SELL",
+                OrderType = "LMT",
+                LmtPrice = 100d,
+                Tif = IB.TimeInForce.Day,
+                OrderId = 31
+            });
+            var properties = (InteractiveBrokersOrderProperties)recovered.Properties;
+            var converted = ConvertOrder(brokerage, recovered);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(FaGroupName, properties.FaGroup);
+                Assert.AreEqual("PctChange", properties.FaMethod);
+                Assert.AreEqual(-25.5m, properties.ExactFaPercentage);
+                Assert.AreEqual(0m, converted.TotalQuantity);
+                Assert.AreEqual("PctChange", converted.FaMethod);
+                Assert.AreEqual("-25.5", converted.FaPercentage);
             });
         }
 
@@ -1701,24 +1884,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         pctChangeOrder,
                         CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, monetary))).Message);
-
-            var savedPctChange = new BrokerageAccountGroup(
-                "SavedPctChange",
-                "PctChange",
-                new[] { "ManagedAccount" });
-            pctChangeOrder.FaGroup = savedPctChange.Name;
-            pctChangeOrder.FaMethod = string.Empty;
-            StringAssert.Contains(
-                "Set FaGroup = \"SavedPctChange\" and FaMethod = \"PctChange\" explicitly",
-                Assert.Throws<InvalidOperationException>(() =>
-                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
-                        pctChangeOrder,
-                        CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedPctChange))).Message);
-            pctChangeOrder.FaMethod = "PctChange";
-            Assert.DoesNotThrow(() =>
-                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
-                    pctChangeOrder,
-                    CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedPctChange)));
         }
 
         private static IEnumerable<TestCaseData> SavedAndRequestedAllocationMethods()
@@ -1730,8 +1895,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "Percent",
                 "NetLiq",
                 "AvailableEquity",
-                "Equal",
-                "PctChange"
+                "Equal"
             };
             var requestedMethods = new[]
             {
@@ -1749,12 +1913,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 foreach (var requestedMethod in requestedMethods)
                 {
-                    var expectedAllowed =
-                        savedMethod == "PctChange"
-                            ? requestedMethod == "PctChange"
-                            : requestedMethod.Length == 0 ||
-                            (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
-                            (requestedMethod == savedMethod || requestedMethod == "PctChange");
+                    var expectedAllowed = requestedMethod.Length == 0 ||
+                        requestedMethod == "PctChange" ||
+                        (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
+                        requestedMethod == savedMethod;
                     yield return new TestCaseData(
                             savedMethod,
                             requestedMethod,
@@ -1890,6 +2052,23 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private static int GetCollectionCount(object collection)
         {
             return (int)collection.GetType().GetProperty("Count").GetValue(collection);
+        }
+
+        private static void SetLotSize(Security security, decimal lotSize)
+        {
+            var current = security.SymbolProperties;
+            typeof(Security).GetProperty(nameof(Security.SymbolProperties)).SetValue(
+                security,
+                new SymbolProperties(
+                    current.Description,
+                    current.QuoteCurrency,
+                    current.ContractMultiplier,
+                    current.MinimumPriceVariation,
+                    lotSize,
+                    current.MarketTicker,
+                    current.MinimumOrderSize,
+                    current.PriceMagnifier,
+                    current.StrikeMultiplier));
         }
 
         private static LimitOrder CreateFractionalFillOrder(

@@ -34,6 +34,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private const int FinancialAdvisorUnsavedChangesErrorCode = 10230;
         private const int FinancialAdvisorInvalidAccountsErrorCode = 10231;
         private const int QueueCapacity = 8;
+        private const string FinancialAdvisorAccountSummaryTags =
+            "AccountType,NetLiquidation,TotalCashValue,AvailableFunds," +
+            "ExcessLiquidity,BuyingPower,AccountReady,$LEDGER,$LEDGER:ALL";
+        private static readonly string[] RequiredAccountSummaryTags =
+        {
+            "AccountType",
+            "NetLiquidation",
+            "TotalCashValue",
+            "AvailableFunds",
+            "ExcessLiquidity",
+            "BuyingPower",
+            "AccountReady"
+        };
+        private static readonly string[] CurrencyAccountSummaryTags =
+        {
+            "NetLiquidation",
+            "TotalCashValue",
+            "AvailableFunds",
+            "ExcessLiquidity",
+            "BuyingPower"
+        };
 
         private readonly InteractiveBrokersClient _client;
         private readonly Action _paceRequest;
@@ -58,6 +79,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private volatile string _unsupportedConfigurationError;
         private volatile bool _groupTradingBlocked;
         private volatile bool _expectingHandshakeManagedAccounts;
+        private volatile bool _accountSummaryUnavailableUntilReconnect;
         private Task _worker;
         private SnapshotScope _lastRequestedRefreshScope;
         private SnapshotScope _activeRefresh;
@@ -77,6 +99,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private long _serviceOwnedRequestIdEpochStart = int.MinValue;
         private long _serviceOwnedRequestIdCurrentMax = (long)int.MinValue - 1;
         private long _physicalConnectionEpoch;
+        private long _lastLoggedReadySnapshotPhysicalConnectionEpoch = -1;
         private long _requestVersion;
 
         internal BrokerageAccountSnapshot Snapshot => _snapshot;
@@ -178,6 +201,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     _serviceOwnedRequestIdEpochStart = _nextRequestId;
                     _serviceOwnedRequestIdCurrentMax = (long)_nextRequestId - 1;
+                    _accountSummaryUnavailableUntilReconnect = false;
                 }
                 _connected = true;
                 if (confirmedReconnect && _hasRequestedRefresh)
@@ -1607,7 +1631,81 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 accountId => new AccountValueBuilder(
                     accountId, GetAccountGroupNames(allGroups, accountId)),
                 StringComparer.OrdinalIgnoreCase);
-            foreach (var accountId in accountsToCollect)
+            var unresolvedAccounts = accountsToCollect.ToHashSet(
+                StringComparer.OrdinalIgnoreCase);
+            var summaryIneligibleAccounts = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+            var summaryFallbacks = new List<string>();
+            if (_requests.RequestAccountSummary != null &&
+                _requests.CancelAccountSummary != null)
+            {
+                foreach (var group in selectedGroups.Values
+                    .OrderBy(group => group.Name, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (_accountSummaryUnavailableUntilReconnect)
+                    {
+                        break;
+                    }
+                    var membersToCollect = group.AccountIds
+                        .Where(accountId =>
+                            unresolvedAccounts.Contains(accountId) &&
+                            !summaryIneligibleAccounts.Contains(accountId))
+                        .OrderBy(accountId => accountId, StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+                    if (membersToCollect.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    IReadOnlyList<AccountSummaryEventArgs> rows;
+                    try
+                    {
+                        rows = await RequestAccountSummaryAsync(scope, group.Name)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception exception) when (
+                        CanFallbackFromAccountSummaryException(exception))
+                    {
+                        summaryFallbacks.Add(
+                            $"group '{group.Name}': RequestFailure " +
+                            $"({exception.GetType().Name})");
+                        summaryIneligibleAccounts.UnionWith(membersToCollect);
+                        continue;
+                    }
+
+                    if (!TryCreateAccountSummaryBuilders(
+                            group,
+                            membersToCollect,
+                            rows,
+                            primaryAccountId,
+                            allGroups,
+                            out var summaryBuilders,
+                            out var fallback))
+                    {
+                        summaryFallbacks.Add($"group '{group.Name}': {fallback}");
+                        summaryIneligibleAccounts.UnionWith(membersToCollect);
+                        continue;
+                    }
+                    foreach (var pair in summaryBuilders)
+                    {
+                        builders[pair.Key] = pair.Value;
+                        unresolvedAccounts.Remove(pair.Key);
+                    }
+                }
+            }
+            if (summaryFallbacks.Count != 0)
+            {
+                Log.Error(
+                    "InteractiveBrokersFinancialAdvisorAccountState: named-group account " +
+                    "summary fallback(s): " + string.Join("; ", summaryFallbacks),
+                    overrideMessageFloodProtection: true);
+            }
+
+            var accountSummaryFastPathAccounts =
+                accountsToCollect.Length - unresolvedAccounts.Count;
+            var accountUpdateFallbackAccounts = unresolvedAccounts.Count;
+            foreach (var accountId in unresolvedAccounts.OrderBy(
+                accountId => accountId, StringComparer.OrdinalIgnoreCase))
             {
                 var rows = await RequestAccountUpdatesAsync(scope, accountId)
                     .ConfigureAwait(false);
@@ -1694,7 +1792,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     managedAccountIds.Count(id =>
                         !IsPrimaryOrAggregateAccount(id, primaryAccountId)),
                 collectionStartedUtc),
-                scope.RequestVersion);
+                scope.RequestVersion,
+                accountSummaryFastPathAccounts,
+                accountUpdateFallbackAccounts);
         }
 
         private static void ValidateAdditionalManagedAccountIds(
@@ -1722,6 +1822,358 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private static bool IsAllowedSummaryAccount(string accountId, string primaryAccountId) =>
             "All".Equals(accountId, StringComparison.OrdinalIgnoreCase) ||
             IsPrimaryOrAggregateAccount(accountId, primaryAccountId);
+
+        private static bool CanFallbackFromAccountSummaryException(Exception exception) =>
+            exception is not RequestInvalidatedException &&
+            exception is not ObjectDisposedException &&
+            exception is not OperationCanceledException;
+
+        private static bool TryCreateAccountSummaryBuilders(
+            BrokerageAccountGroup group,
+            IReadOnlyCollection<string> membersToCollect,
+            IReadOnlyList<AccountSummaryEventArgs> rows,
+            string primaryAccountId,
+            IReadOnlyDictionary<string, BrokerageAccountGroup> allGroups,
+            out Dictionary<string, AccountValueBuilder> builders,
+            out string fallback)
+        {
+            builders = new Dictionary<string, AccountValueBuilder>(
+                StringComparer.OrdinalIgnoreCase);
+            fallback = string.Empty;
+            var targets = membersToCollect.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var groupMembers = group.AccountIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var childRows = group.AccountIds.ToDictionary(
+                accountId => accountId,
+                _ => new List<AccountSummaryEventArgs>(),
+                StringComparer.OrdinalIgnoreCase);
+            var detectorRows = new List<AccountSummaryEventArgs>();
+            var detectorAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var unexpectedRows = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var row in rows ?? Array.Empty<AccountSummaryEventArgs>())
+            {
+                var accountId = row?.Account?.Trim() ?? string.Empty;
+                var tag = row?.Tag?.Trim() ?? string.Empty;
+                if (accountId.Length == 0 || tag.Length == 0)
+                {
+                    fallback = "InvalidAttribution (blank account or tag)";
+                    return false;
+                }
+                if (groupMembers.Contains(accountId))
+                {
+                    childRows[accountId].Add(row);
+                    continue;
+                }
+                if (IsPrimaryOrAggregateAccount(accountId, primaryAccountId))
+                {
+                    continue;
+                }
+                if (IsRequiredAccountSummaryTag(tag))
+                {
+                    unexpectedRows.Add($"{accountId}:{tag}");
+                    continue;
+                }
+                detectorAccounts.Add(accountId);
+                if (tag.Equals("CashBalance", StringComparison.OrdinalIgnoreCase))
+                {
+                    detectorRows.Add(row);
+                }
+            }
+
+            if (unexpectedRows.Count != 0)
+            {
+                fallback = "UnexpectedAccounts rows=[" + string.Join(",", unexpectedRows
+                    .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)) + "]";
+                return false;
+            }
+            if (detectorAccounts.Count > 1)
+            {
+                fallback = "InconsistentAggregateAttribution accounts=[" +
+                    string.Join(",", detectorAccounts.OrderBy(
+                        accountId => accountId, StringComparer.OrdinalIgnoreCase)) + "]";
+                return false;
+            }
+
+            var missingRows = new List<string>();
+            var duplicateRows = new List<string>();
+            foreach (var accountId in group.AccountIds.OrderBy(
+                accountId => accountId, StringComparer.OrdinalIgnoreCase))
+            {
+                foreach (var tag in RequiredAccountSummaryTags)
+                {
+                    var count = childRows[accountId].Count(row =>
+                        tag.Equals(row.Tag, StringComparison.OrdinalIgnoreCase));
+                    if (count == 0)
+                    {
+                        missingRows.Add($"{accountId}:{tag}");
+                    }
+                    else if (count != 1)
+                    {
+                        duplicateRows.Add($"{accountId}:{tag}");
+                    }
+                }
+            }
+            if (missingRows.Count != 0)
+            {
+                fallback = "MissingRows rows=[" + string.Join(",", missingRows) + "]";
+                return false;
+            }
+            if (duplicateRows.Count != 0)
+            {
+                fallback = "DuplicateRows rows=[" + string.Join(",", duplicateRows) + "]";
+                return false;
+            }
+
+            var baseCurrencies = new Dictionary<string, string>(
+                StringComparer.OrdinalIgnoreCase);
+            var candidateBuilders = new Dictionary<string, AccountValueBuilder>(
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var accountId in group.AccountIds.OrderBy(
+                accountId => accountId, StringComparer.OrdinalIgnoreCase))
+            {
+                var accountRows = childRows[accountId];
+                var required = RequiredAccountSummaryTags.ToDictionary(
+                    tag => tag,
+                    tag => accountRows.Single(row =>
+                        tag.Equals(row.Tag, StringComparison.OrdinalIgnoreCase)),
+                    StringComparer.OrdinalIgnoreCase);
+                if (string.IsNullOrWhiteSpace(required["AccountType"].Value))
+                {
+                    fallback = $"InvalidValue accounts=[{accountId}] tags=[AccountType]";
+                    return false;
+                }
+                if (!bool.TryParse(required["AccountReady"].Value, out var accountReady) ||
+                    !accountReady)
+                {
+                    fallback = $"AccountNotReady accounts=[{accountId}]";
+                    return false;
+                }
+
+                var baseCurrency = required["NetLiquidation"].Currency?.Trim() ?? string.Empty;
+                if (baseCurrency.Length == 0 ||
+                    baseCurrency.Equals("BASE", StringComparison.OrdinalIgnoreCase))
+                {
+                    fallback = $"MissingBaseCurrency accounts=[{accountId}]";
+                    return false;
+                }
+                foreach (var tag in CurrencyAccountSummaryTags)
+                {
+                    var row = required[tag];
+                    if (!TryParseAccountSummaryDecimal(row.Value) ||
+                        !baseCurrency.Equals(
+                            row.Currency?.Trim(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        fallback = $"ScalarMismatch accounts=[{accountId}] tags=[{tag}]";
+                        return false;
+                    }
+                }
+                var realCurrencies = accountRows
+                    .Where(row => "RealCurrency".Equals(
+                        row.Tag, StringComparison.OrdinalIgnoreCase))
+                    .Select(row => row.Value?.Trim() ?? string.Empty)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                if (realCurrencies.Any(currency =>
+                    !baseCurrency.Equals(currency, StringComparison.OrdinalIgnoreCase)))
+                {
+                    fallback = $"RealCurrencyMismatch accounts=[{accountId}] currencies=[" +
+                        string.Join(",", realCurrencies.OrderBy(
+                            currency => currency, StringComparer.OrdinalIgnoreCase)) + "]";
+                    return false;
+                }
+
+                var cashRows = accountRows.Where(row =>
+                    "CashBalance".Equals(row.Tag, StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (!TrySelectAccountSummaryCash(
+                        accountId,
+                        baseCurrency,
+                        cashRows,
+                        out var cashValue,
+                        out var cashFallback))
+                {
+                    fallback = cashFallback;
+                    return false;
+                }
+
+                baseCurrencies[accountId] = baseCurrency;
+                if (targets.Contains(accountId))
+                {
+                    var candidate = new AccountValueBuilder(
+                        accountId, GetAccountGroupNames(allGroups, accountId));
+                    foreach (var tag in RequiredAccountSummaryTags)
+                    {
+                        var row = required[tag];
+                        candidate.Apply(
+                            tag,
+                            row.Value,
+                            CurrencyAccountSummaryTags.Contains(
+                                tag, StringComparer.OrdinalIgnoreCase)
+                                    ? baseCurrency
+                                    : row.Currency);
+                    }
+                    candidate.Apply("CashBalance", cashValue, baseCurrency);
+                    try
+                    {
+                        candidate.Build(Array.Empty<BrokerageAccountPosition>());
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        fallback = $"IncompleteAccount accounts=[{accountId}]";
+                        return false;
+                    }
+                    candidateBuilders[accountId] = candidate;
+                }
+            }
+
+            var commonBaseCurrencies = baseCurrencies.Values
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(currency => currency, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (commonBaseCurrencies.Length != 1)
+            {
+                fallback = "MixedBaseCurrencies currencies=[" +
+                    string.Join(",", commonBaseCurrencies) + "]";
+                return false;
+            }
+            if (!TryValidateAggregateCashDetector(
+                    detectorRows, commonBaseCurrencies[0], out fallback))
+            {
+                return false;
+            }
+
+            builders = candidateBuilders;
+            return true;
+        }
+
+        private static bool TrySelectAccountSummaryCash(
+            string accountId,
+            string baseCurrency,
+            IReadOnlyCollection<AccountSummaryEventArgs> cashRows,
+            out string cashValue,
+            out string fallback)
+        {
+            cashValue = string.Empty;
+            fallback = string.Empty;
+            if (cashRows.Count is < 1 or > 2)
+            {
+                fallback = $"CashShape accounts=[{accountId}] rowCount={cashRows.Count}";
+                return false;
+            }
+            var currencies = cashRows
+                .Select(row => row.Currency?.Trim() ?? string.Empty)
+                .ToArray();
+            if (currencies.Any(string.IsNullOrEmpty) ||
+                currencies.Distinct(StringComparer.OrdinalIgnoreCase).Count() != currencies.Length ||
+                cashRows.Any(row => !TryParseAccountSummaryDecimal(row.Value)))
+            {
+                fallback = $"InvalidCashRows accounts=[{accountId}] currencies=[" +
+                    string.Join(",", currencies.OrderBy(
+                        currency => currency, StringComparer.OrdinalIgnoreCase)) + "]";
+                return false;
+            }
+            if (cashRows.Count == 1)
+            {
+                var row = cashRows.Single();
+                if (!"BASE".Equals(row.Currency, StringComparison.OrdinalIgnoreCase) &&
+                    !baseCurrency.Equals(row.Currency, StringComparison.OrdinalIgnoreCase))
+                {
+                    fallback = $"CashCurrencyMismatch accounts=[{accountId}] currencies=[" +
+                        row.Currency?.Trim() + "]";
+                    return false;
+                }
+                cashValue = row.Value;
+                return true;
+            }
+
+            var baseRow = cashRows.SingleOrDefault(row =>
+                "BASE".Equals(row.Currency, StringComparison.OrdinalIgnoreCase));
+            var concreteRow = cashRows.SingleOrDefault(row =>
+                baseCurrency.Equals(row.Currency, StringComparison.OrdinalIgnoreCase));
+            if (baseRow == null || concreteRow == null)
+            {
+                fallback = $"CashCurrencyMismatch accounts=[{accountId}] currencies=[" +
+                    string.Join(",", currencies.OrderBy(
+                        currency => currency, StringComparer.OrdinalIgnoreCase)) + "]";
+                return false;
+            }
+            decimal.TryParse(
+                baseRow.Value,
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var baseValue);
+            decimal.TryParse(
+                concreteRow.Value,
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var concreteValue);
+            if (baseValue != concreteValue)
+            {
+                fallback = $"CashDivergence accounts=[{accountId}]";
+                return false;
+            }
+            cashValue = concreteRow.Value;
+            return true;
+        }
+
+        private static bool TryValidateAggregateCashDetector(
+            IReadOnlyCollection<AccountSummaryEventArgs> detectorRows,
+            string baseCurrency,
+            out string fallback)
+        {
+            fallback = string.Empty;
+            if (detectorRows.Count == 0)
+            {
+                fallback = "MissingAggregateCashDetector";
+                return false;
+            }
+            var currencies = detectorRows
+                .Select(row => row.Currency?.Trim() ?? string.Empty)
+                .ToArray();
+            if (currencies.Any(string.IsNullOrEmpty) ||
+                currencies.Distinct(StringComparer.OrdinalIgnoreCase).Count() != currencies.Length ||
+                detectorRows.Any(row => !TryParseAccountSummaryDecimal(row.Value)))
+            {
+                fallback = "InvalidAggregateCashDetector currencies=[" +
+                    string.Join(",", currencies.OrderBy(
+                        currency => currency, StringComparer.OrdinalIgnoreCase)) + "]";
+                return false;
+            }
+            if (!currencies.Any(currency =>
+                "BASE".Equals(currency, StringComparison.OrdinalIgnoreCase) ||
+                baseCurrency.Equals(currency, StringComparison.OrdinalIgnoreCase)))
+            {
+                fallback = "IncompleteAggregateCashDetector currencies=[" +
+                    string.Join(",", currencies.OrderBy(
+                        currency => currency, StringComparer.OrdinalIgnoreCase)) + "]";
+                return false;
+            }
+            var nonBaseCurrencies = detectorRows
+                .Where(row =>
+                    !"BASE".Equals(row.Currency, StringComparison.OrdinalIgnoreCase) &&
+                    !baseCurrency.Equals(row.Currency, StringComparison.OrdinalIgnoreCase) &&
+                    decimal.Parse(
+                        row.Value, NumberStyles.Float, CultureInfo.InvariantCulture) != 0m)
+                .Select(row => row.Currency.Trim())
+                .OrderBy(currency => currency, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (nonBaseCurrencies.Length != 0)
+            {
+                fallback = "NonBaseAggregateCash currencies=[" +
+                    string.Join(",", nonBaseCurrencies) + "]";
+                return false;
+            }
+            return true;
+        }
+
+        private static bool TryParseAccountSummaryDecimal(string value) =>
+            decimal.TryParse(
+                value,
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out _);
+
+        private static bool IsRequiredAccountSummaryTag(string tag) =>
+            RequiredAccountSummaryTags.Contains(tag, StringComparer.OrdinalIgnoreCase);
 
         private async Task<string> RequestManagedAccountsAsync(
             SnapshotScope scope, bool useHandshakeCache = true)
@@ -1805,6 +2257,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 authorize => _requests.CancelAccountUpdates(requestId, authorize),
                 $"account updates for '{accountId}'").ConfigureAwait(false);
             return pending.AccountRows.ToArray();
+        }
+
+        private async Task<IReadOnlyList<AccountSummaryEventArgs>>
+            RequestAccountSummaryAsync(SnapshotScope scope, string groupName)
+        {
+            var requestId = NextRequestId();
+            var pending = await SendKeyedAsync(
+                scope, PendingKind.AccountSummary, requestId,
+                authorize => _requests.RequestAccountSummary(
+                    requestId,
+                    groupName,
+                    FinancialAdvisorAccountSummaryTags,
+                    authorize),
+                authorize => _requests.CancelAccountSummary(requestId, authorize),
+                $"account summary for FA group '{groupName}'").ConfigureAwait(false);
+            return pending.SummaryRows.ToArray();
         }
 
         private async Task<PendingRequest> SendUnkeyedAsync(
@@ -2093,18 +2561,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             Exception exception)
         {
             var retained = false;
+            var accountSummariesDisabled = false;
             lock (_callbackStateLock)
             {
                 if (!_disposed &&
-                    pending.PhysicalConnectionEpoch == _physicalConnectionEpoch &&
-                    _deferredCancellation == null)
+                    pending.PhysicalConnectionEpoch == _physicalConnectionEpoch)
                 {
-                    _deferredCancellation = new DeferredCancellation(
-                        cancel,
-                        description,
-                        requestId,
-                        pending.PhysicalConnectionEpoch);
-                    retained = true;
+                    if (pending.Kind == PendingKind.AccountSummary &&
+                        !_accountSummaryUnavailableUntilReconnect)
+                    {
+                        _accountSummaryUnavailableUntilReconnect = true;
+                        accountSummariesDisabled = true;
+                    }
+                    if (_deferredCancellation == null)
+                    {
+                        _deferredCancellation = new DeferredCancellation(
+                            cancel,
+                            description,
+                            requestId,
+                            pending.PhysicalConnectionEpoch);
+                        retained = true;
+                    }
                 }
             }
             Log.Error(
@@ -2112,7 +2589,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 $"{description} request {requestId}: {exception.Message}" +
                 (retained
                     ? " The request was retained for one retry."
-                    : " The request will not be retried."));
+                    : " The request will not be retried.") +
+                (accountSummariesDisabled
+                    ? " Named-group account summaries are disabled until a physical reconnect."
+                    : string.Empty),
+                overrideMessageFloodProtection: accountSummariesDisabled);
         }
 
         private void RetryDeferredCancellation(
@@ -2224,6 +2705,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.InternalManagedAccounts += OnManagedAccounts;
             _client.InternalReceiveFa += OnFinancialAdvisor;
             _client.InternalFamilyCodes += OnFamilyCodes;
+            _client.AccountSummary += OnAccountSummary;
+            _client.AccountSummaryEnd += OnAccountSummaryEnd;
             _client.AccountUpdateMultiWithRequestId += OnAccountUpdate;
             _client.AccountUpdateMultiEndWithRequestId += OnAccountUpdateEnd;
             _client.PositionMulti += OnPosition;
@@ -2240,6 +2723,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.InternalManagedAccounts -= OnManagedAccounts;
             _client.InternalReceiveFa -= OnFinancialAdvisor;
             _client.InternalFamilyCodes -= OnFamilyCodes;
+            _client.AccountSummary -= OnAccountSummary;
+            _client.AccountSummaryEnd -= OnAccountSummaryEnd;
             _client.AccountUpdateMultiWithRequestId -= OnAccountUpdate;
             _client.AccountUpdateMultiEndWithRequestId -= OnAccountUpdateEnd;
             _client.PositionMulti -= OnPosition;
@@ -2344,6 +2829,41 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private void OnAccountUpdateEnd(object sender, AccountUpdateMultiEndEventArgs args) =>
             CompleteKeyed(PendingKind.AccountUpdates, args.RequestId);
+
+        private void OnAccountSummary(object sender, AccountSummaryEventArgs args)
+        {
+            lock (_callbackStateLock)
+            {
+                if (_pendingRequest is
+                    {
+                        Kind: PendingKind.AccountSummary,
+                        Finished: false
+                    } pending &&
+                    pending.RequestId == args.RequestId)
+                {
+                    pending.SummaryRows.Add(args);
+                }
+            }
+        }
+
+        private void OnAccountSummaryEnd(object sender, RequestEndEventArgs args)
+        {
+            PendingRequest completed = null;
+            lock (_callbackStateLock)
+            {
+                if (_pendingRequest is
+                    {
+                        Kind: PendingKind.AccountSummary,
+                        Finished: false
+                    } pending &&
+                    pending.RequestId == args.RequestId)
+                {
+                    completed = pending;
+                    completed.Finished = true;
+                }
+            }
+            completed?.Completion.TrySetResult(completed);
+        }
 
         private void OnPosition(object sender, PositionMultiEventArgs args) =>
             AddKeyedRow(PendingKind.Positions, args.RequestId, args, null);
@@ -2539,11 +3059,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 unsupportedConfiguration: unsupportedConfiguration);
 
         private void PublishReady(
-            BrokerageAccountSnapshot snapshot, long requestVersion) =>
+            BrokerageAccountSnapshot snapshot,
+            long requestVersion,
+            int accountSummaryFastPathAccounts,
+            int accountUpdateFallbackAccounts) =>
             TryPublishSnapshot(
                 snapshot, null, forceStale: false,
                 expectedRequestVersion: requestVersion,
-                requireConnected: true, unsupportedConfiguration: false);
+                requireConnected: true, unsupportedConfiguration: false,
+                accountSummaryFastPathAccounts,
+                accountUpdateFallbackAccounts);
 
         private bool TryPublishSnapshot(
             BrokerageAccountSnapshot readySnapshot,
@@ -2551,9 +3076,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             bool forceStale,
             long? expectedRequestVersion,
             bool requireConnected,
-            bool unsupportedConfiguration)
+            bool unsupportedConfiguration,
+            int accountSummaryFastPathAccounts = 0,
+            int accountUpdateFallbackAccounts = 0)
         {
             BrokerageAccountSnapshot snapshot;
+            var logReadySnapshot = false;
             lock (_callbackStateLock)
             {
                 if (_disposed || requireConnected && !_connected ||
@@ -2586,8 +3114,73 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     _groupTradingBlocked = false;
                 }
+                if (readySnapshot != null && _pendingMutation == null)
+                {
+                    _activeRefresh = null;
+                }
+                if (readySnapshot != null &&
+                    _lastLoggedReadySnapshotPhysicalConnectionEpoch !=
+                    _physicalConnectionEpoch)
+                {
+                    _lastLoggedReadySnapshotPhysicalConnectionEpoch =
+                        _physicalConnectionEpoch;
+                    logReadySnapshot = true;
+                }
+            }
+            if (logReadySnapshot)
+            {
+                Log.Trace(
+                    FormatReadySnapshotDiagnostic(
+                        snapshot,
+                        accountSummaryFastPathAccounts,
+                        accountUpdateFallbackAccounts),
+                    overrideMessageFloodProtection: true);
             }
             return true;
+        }
+
+        internal static string FormatReadySnapshotDiagnostic(
+            BrokerageAccountSnapshot snapshot,
+            int accountSummaryFastPathAccounts,
+            int accountUpdateFallbackAccounts)
+        {
+            ArgumentNullException.ThrowIfNull(snapshot);
+
+            var aggregateAccountId = snapshot.PrimaryAccountId.Length == 0
+                ? string.Empty
+                : snapshot.PrimaryAccountId + "A";
+            var accessibleManagedAccounts = snapshot.ManagedAccountIds.Count(accountId =>
+                aggregateAccountId.Length == 0 || !accountId.Equals(
+                    aggregateAccountId, StringComparison.OrdinalIgnoreCase));
+            var groups = snapshot.AllGroups.Values
+                .OrderBy(group => group.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(group => group.Name, StringComparer.Ordinal)
+                .ToArray();
+            var listedGroups = groups.Take(50).Select(group =>
+                $"{group.Name}:{group.AccountIds.Count}");
+            var omittedGroups = groups.Length > 50
+                ? $"; omittedGroups={groups.Length - 50}"
+                : string.Empty;
+            var accountTypes = snapshot.Accounts.Values
+                .Select(account => account.AccountType?.Trim() ?? string.Empty)
+                .Where(accountType => accountType.Length != 0)
+                .OrderBy(accountType => accountType, StringComparer.Ordinal)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(accountType => accountType, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(accountType => accountType, StringComparer.Ordinal);
+            var clientAccountsOutsideGroups = snapshot.Accounts.Values.Count(
+                account => account.GroupNames.Count == 0);
+
+            return "FA snapshot ready: " +
+                $"accessibleManagedAccounts={accessibleManagedAccounts}; " +
+                $"discoveredGroups={groups.Length}; " +
+                $"groups=[{string.Join(",", listedGroups)}]{omittedGroups}; " +
+                $"collectedAccounts={snapshot.Accounts.Count}; " +
+                $"clientAccountsOutsideGroups={clientAccountsOutsideGroups}; " +
+                $"accountSummaryFastPathAccounts={accountSummaryFastPathAccounts}; " +
+                $"accountUpdateFallbackAccounts={accountUpdateFallbackAccounts}; " +
+                $"complete={(snapshot.IsComplete ? "true" : "false")}; " +
+                $"observedAccountTypes=[{string.Join(",", accountTypes)}]";
         }
 
         private void ReportUnsupported(string message)
@@ -2775,6 +3368,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal Func<int, Func<bool>, bool> CancelPositions { get; set; }
             internal Func<int, string, Func<bool>, bool> RequestAccountUpdates { get; set; }
             internal Func<int, Func<bool>, bool> CancelAccountUpdates { get; set; }
+            internal Func<int, string, string, Func<bool>, bool>
+                RequestAccountSummary { get; set; }
+            internal Func<int, Func<bool>, bool> CancelAccountSummary { get; set; }
             internal Func<int> GetServerVersion { get; set; }
             internal Func<int, int, string, Func<bool>, bool>
                 ReplaceFinancialAdvisor { get; set; }
@@ -2808,6 +3404,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     InvokeAuthorized(
                         authorize,
                         () => client.ClientSocket.cancelAccountUpdatesMulti(id));
+                RequestAccountSummary = (id, groupName, tags, authorize) =>
+                    InvokeAuthorized(
+                        authorize,
+                        () => client.ClientSocket.reqAccountSummary(
+                            id, groupName, tags));
+                CancelAccountSummary = (id, authorize) =>
+                    InvokeAuthorized(
+                        authorize,
+                        () => client.ClientSocket.cancelAccountSummary(id));
                 GetServerVersion = () => client.ClientSocket.ServerVersion;
                 ReplaceFinancialAdvisor = (id, faDataType, xml, authorize) =>
                     InvokeAuthorized(
@@ -2835,6 +3440,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             FamilyCodes,
             Positions,
             AccountUpdates,
+            AccountSummary,
             Replacement
         }
 
@@ -2929,6 +3535,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 new(TaskCreationOptions.RunContinuationsAsynchronously);
             internal List<PositionRow> PositionRows { get; } = new();
             internal List<AccountUpdateMultiEventArgs> AccountRows { get; } = new();
+            internal List<AccountSummaryEventArgs> SummaryRows { get; } = new();
             internal FamilyCodeRow[] FamilyCodeRows { get; set; } =
                 Array.Empty<FamilyCodeRow>();
             internal string Text { get; set; } = string.Empty;

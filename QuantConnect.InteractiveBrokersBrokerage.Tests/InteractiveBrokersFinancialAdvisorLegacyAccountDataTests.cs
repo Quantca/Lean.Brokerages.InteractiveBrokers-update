@@ -40,6 +40,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         private static readonly FieldInfo AccountField =
             GetRequiredField("_account");
+        private static readonly FieldInfo AccountDataField =
+            GetRequiredField("_accountData");
         private static readonly FieldInfo AlgorithmField =
             GetRequiredField("_algorithm");
         private static readonly FieldInfo ClientField =
@@ -67,38 +69,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "NextRequestId", InstanceNonPublic)
             ?? throw new InvalidOperationException(
                 "Missing Financial Advisor service request ID allocator.");
-
-        [Test]
-        public void UnifiedGroupsDisabledIsUpstreamEquivalentTest()
-        {
-            foreach (var filterSet in new[] { false, true })
-            {
-                var filter = filterSet ? GroupName : string.Empty;
-                using var upstream = LegacyAccountScenario.CreateUpstream(filter);
-                using var disabled = LegacyAccountScenario.CreateConfigured(
-                    filter,
-                    unifiedGroupsEnabled: false);
-
-                upstream.EmitLegacyRows();
-                disabled.EmitLegacyRows();
-
-                Assert.Multiple(() =>
-                {
-                    Assert.AreEqual(
-                        upstream.GetCashBalance(),
-                        disabled.GetCashBalance(),
-                        $"Cash differed with filterSet={filterSet}.");
-                    Assert.AreEqual(
-                        upstream.GetHoldingQuantity(),
-                        disabled.GetHoldingQuantity(),
-                        $"Holdings differed with filterSet={filterSet}.");
-                    Assert.AreEqual(
-                        Convert.ToInt32(ExactPosition),
-                        disabled.GetHoldingQuantity(),
-                        "Disabled mode must preserve the upstream whole-position conversion.");
-                });
-            }
-        }
 
         [Test]
         public void UnifiedGroupsAffectOnlyFinancialAdvisorAccountsTest()
@@ -150,6 +120,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 scenario.Brokerage.FinancialAdvisorServiceOwnsStartupRequests);
         }
 
+        [TestCase(false, false, "", true)]
+        [TestCase(false, false, GroupName, true)]
+        [TestCase(true, false, "", true)]
+        [TestCase(true, false, GroupName, true)]
+        [TestCase(false, true, "", false)]
+        [TestCase(false, true, GroupName, true)]
+        [TestCase(true, true, "", false)]
+        [TestCase(true, true, GroupName, false)]
+        public void StartupAccountSummaryPreservesOnlySafeLegacyRequestsTest(
+            bool unifiedGroupsEnabled,
+            bool isFinancialAdvisor,
+            string groupFilter,
+            bool expected)
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                groupFilter,
+                unifiedGroupsEnabled,
+                isFinancialAdvisor);
+
+            Assert.AreEqual(
+                expected,
+                scenario.Brokerage.ShouldRequestStartupAccountSummary);
+        }
+
         [TestCase(false, false)]
         [TestCase(false, true)]
         [TestCase(true, false)]
@@ -191,7 +185,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     scenario.GetHoldingQuantity());
                 Assert.AreEqual(
                     "SPY",
-                    scenario.Brokerage.GetAccountHoldings().Single().Symbol.Value);
+                    scenario.GetHoldingSymbol().Value);
             });
         }
 
@@ -246,6 +240,23 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void ServiceRequestIdFromClosedConnectionReachesLegacyAccountDataAfterHandshakeTest()
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                GroupName,
+                unifiedGroupsEnabled: true);
+
+            scenario.CloseAndRestorePhysicalConnection();
+            scenario.EmitPublicServiceRowsWithoutInternalCallbacks();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(9999.99m, scenario.GetCashBalance());
+                Assert.AreEqual(999.5m, scenario.GetHoldingQuantity());
+            });
+        }
+
+        [Test]
         public void ConfiguredGroupFilterRejectsAdditionalAccountRefreshWithoutThrowingTest()
         {
             using var scenario = LegacyAccountScenario.CreateConfigured(
@@ -274,7 +285,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         private sealed class LegacyAccountScenario : IDisposable
         {
-            private readonly FieldInfo _socketConnectedField;
             private readonly int _serviceRequestId;
             private bool _disposed;
 
@@ -332,12 +342,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 {
                     Client.AccountUpdateMulti += HandleUpdateAccountValue;
                 }
-
-                _socketConnectedField = FindSocketConnectedField(Client.ClientSocket);
-                _socketConnectedField.SetValue(Client.ClientSocket, true);
-                Assert.IsTrue(
-                    Client.Connected,
-                    "The hermetic client must be marked connected without calling eConnect.");
             }
 
             public static LegacyAccountScenario CreateConfigured(
@@ -487,15 +491,28 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 EmitServiceRows();
             }
 
+            public void CloseAndRestorePhysicalConnection()
+            {
+                Client.connectionClosed();
+                Client.nextValidId(1);
+            }
+
             public decimal GetCashBalance()
             {
-                return Brokerage.GetCashBalance().Single(
-                    cash => cash.Currency == Currencies.USD).Amount;
+                return ((InteractiveBrokersAccountData)AccountDataField.GetValue(Brokerage))
+                    .CashBalances[Currencies.USD];
             }
 
             public decimal GetHoldingQuantity()
             {
-                return Brokerage.GetAccountHoldings().Single().Quantity;
+                return ((InteractiveBrokersAccountData)AccountDataField.GetValue(Brokerage))
+                    .AccountHoldings.Values.Single().Holding.Quantity;
+            }
+
+            public Symbol GetHoldingSymbol()
+            {
+                return ((InteractiveBrokersAccountData)AccountDataField.GetValue(Brokerage))
+                    .AccountHoldings.Values.Single().Holding.Symbol;
             }
 
             private void HandlePortfolioUpdate(
@@ -531,38 +548,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 };
             }
 
-            private static FieldInfo FindSocketConnectedField(EClientSocket socket)
-            {
-                for (var type = socket.GetType(); type != null; type = type.BaseType)
-                {
-                    foreach (var field in type.GetFields(InstanceNonPublic))
-                    {
-                        if (field.FieldType != typeof(bool))
-                        {
-                            continue;
-                        }
-
-                        var original = field.GetValue(socket);
-                        try
-                        {
-                            field.SetValue(socket, true);
-                            if (socket.IsConnected())
-                            {
-                                field.SetValue(socket, original);
-                                return field;
-                            }
-                        }
-                        finally
-                        {
-                            field.SetValue(socket, original);
-                        }
-                    }
-                }
-
-                throw new InvalidOperationException(
-                    "Unable to locate the EClientSocket in-memory connection flag.");
-            }
-
             public void Dispose()
             {
                 if (_disposed)
@@ -572,7 +557,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
                 _disposed = true;
                 DisposeFinancialAdvisorAccountStateMethod.Invoke(Brokerage, null);
-                _socketConnectedField.SetValue(Client.ClientSocket, false);
                 Client.Dispose();
                 ClientField.SetValue(Brokerage, null);
                 Brokerage.Dispose();

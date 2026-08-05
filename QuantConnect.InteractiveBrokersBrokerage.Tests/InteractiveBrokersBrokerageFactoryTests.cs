@@ -38,29 +38,98 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             var constructors = typeof(InteractiveBrokersBrokerage)
                 .GetConstructors(BindingFlags.Instance | BindingFlags.Public);
-            var legacyParameterTypes = new[]
-            {
-                typeof(IAlgorithm),
-                typeof(IOrderProvider),
-                typeof(ISecurityProvider),
-                typeof(string),
-                typeof(string),
-                typeof(int),
-                typeof(string),
-                typeof(string),
-                typeof(string),
-                typeof(string),
-                typeof(string),
-                typeof(string),
-                typeof(bool),
-                typeof(TimeSpan?),
-                typeof(string)
-            };
-            var legacyParameters = constructors
-                .Select(constructor => constructor.GetParameters())
-                .Single(parameters => parameters
-                    .Select(parameter => parameter.ParameterType)
-                    .SequenceEqual(legacyParameterTypes));
+
+            AssertConstructor(constructors, Array.Empty<Type>(), Array.Empty<string>());
+            AssertConstructor(
+                constructors,
+                new[] { typeof(IAlgorithm), typeof(IOrderProvider), typeof(ISecurityProvider) },
+                new[] { "algorithm", "orderProvider", "securityProvider" });
+            AssertConstructor(
+                constructors,
+                new[] { typeof(IAlgorithm), typeof(IOrderProvider), typeof(ISecurityProvider), typeof(string) },
+                new[] { "algorithm", "orderProvider", "securityProvider", "account" });
+
+            var legacyParameters = AssertConstructor(
+                constructors,
+                new[]
+                {
+                    typeof(IAlgorithm),
+                    typeof(IOrderProvider),
+                    typeof(ISecurityProvider),
+                    typeof(string),
+                    typeof(string),
+                    typeof(int),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(bool),
+                    typeof(TimeSpan?),
+                    typeof(string)
+                },
+                new[]
+                {
+                    "algorithm",
+                    "orderProvider",
+                    "securityProvider",
+                    "account",
+                    "host",
+                    "port",
+                    "ibDirectory",
+                    "ibVersion",
+                    "userName",
+                    "password",
+                    "tradingMode",
+                    "agentDescription",
+                    "loadExistingHoldings",
+                    "weeklyRestartUtcTime",
+                    "financialAdvisorsGroupFilter"
+                });
+            var unifiedParameters = AssertConstructor(
+                constructors,
+                new[]
+                {
+                    typeof(IAlgorithm),
+                    typeof(IOrderProvider),
+                    typeof(ISecurityProvider),
+                    typeof(string),
+                    typeof(string),
+                    typeof(int),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(string),
+                    typeof(bool),
+                    typeof(TimeSpan?),
+                    typeof(string),
+                    typeof(bool),
+                    typeof(bool)
+                },
+                new[]
+                {
+                    "algorithm",
+                    "orderProvider",
+                    "securityProvider",
+                    "account",
+                    "host",
+                    "port",
+                    "ibDirectory",
+                    "ibVersion",
+                    "userName",
+                    "password",
+                    "tradingMode",
+                    "agentDescription",
+                    "loadExistingHoldings",
+                    "weeklyRestartUtcTime",
+                    "financialAdvisorsGroupFilter",
+                    "financialAdvisorGroupManagementEnabled",
+                    "financialAdvisorUnifiedGroupsEnabled"
+                });
+
             Assert.Multiple(() =>
             {
                 Assert.IsTrue(legacyParameters.Take(11).All(parameter => !parameter.IsOptional));
@@ -71,7 +140,23 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(true, legacyParameters[12].DefaultValue);
                 Assert.IsNull(legacyParameters[13].DefaultValue);
                 Assert.IsNull(legacyParameters[14].DefaultValue);
+                Assert.IsTrue(unifiedParameters.All(parameter => !parameter.IsOptional));
             });
+        }
+
+        private static ParameterInfo[] AssertConstructor(
+            IEnumerable<ConstructorInfo> constructors,
+            Type[] parameterTypes,
+            string[] parameterNames)
+        {
+            var parameters = constructors
+                .Select(constructor => constructor.GetParameters())
+                .Single(candidate => candidate
+                    .Select(parameter => parameter.ParameterType)
+                    .SequenceEqual(parameterTypes));
+
+            CollectionAssert.AreEqual(parameterNames, parameters.Select(parameter => parameter.Name));
+            return parameters;
         }
 
         [Test]

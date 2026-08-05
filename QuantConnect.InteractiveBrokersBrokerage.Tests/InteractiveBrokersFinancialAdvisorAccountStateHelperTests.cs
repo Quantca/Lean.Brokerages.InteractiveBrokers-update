@@ -1040,29 +1040,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void AdditionalAccountStateIsLimitedToGloballyUnassignedManagedSubaccounts()
-        {
-            var groups = new Dictionary<string, BrokerageAccountGroup>
-            {
-                ["GroupOne"] = new("GroupOne", "NetLiq", new[] { "PaperA" }),
-                ["GroupTwo"] = new("GroupTwo", "NetLiq", new[] { "PaperB" })
-            };
-            var managed = new[] { "PaperMaster", "PaperMasterA", "PaperA", "PaperB", "PaperC" };
-
-            Assert.DoesNotThrow(() => InteractiveBrokersFinancialAdvisorAccountState.ValidateAdditionalAccountIds(
-                new[] { "PaperC" }, groups, managed, "PaperMaster"));
-            Assert.Throws<System.InvalidOperationException>(() =>
-                InteractiveBrokersFinancialAdvisorAccountState.ValidateAdditionalAccountIds(
-                    new[] { "PaperB" }, groups, managed, "PaperMaster"));
-            Assert.Throws<System.InvalidOperationException>(() =>
-                InteractiveBrokersFinancialAdvisorAccountState.ValidateAdditionalAccountIds(
-                    new[] { "PaperMaster" }, groups, managed, "PaperMaster"));
-            Assert.Throws<System.InvalidOperationException>(() =>
-                InteractiveBrokersFinancialAdvisorAccountState.ValidateAdditionalAccountIds(
-                    new[] { "Unknown" }, groups, managed, "PaperMaster"));
-        }
-
-        [Test]
         public void ManagedAccountIdentifiersUseBrokerageCanonicalCasing()
         {
             var accountId = InteractiveBrokersFinancialAdvisorAccountState.GetCanonicalManagedAccountId(

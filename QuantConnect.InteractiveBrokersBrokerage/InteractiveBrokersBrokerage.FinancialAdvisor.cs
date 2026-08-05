@@ -44,6 +44,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         internal bool FinancialAdvisorServiceOwnsStartupRequests =>
             _financialAdvisorUnifiedGroupsEnabled && IsFinancialAdvisor;
 
+        internal bool ShouldRequestStartupAccountSummary =>
+            !FinancialAdvisorServiceOwnsStartupRequests &&
+            (!IsFinancialAdvisor || !string.IsNullOrEmpty(_financialAdvisorsGroupFilter));
+
         /// <inheritdoc/>
         public BrokerageAccountSnapshot GetAccountSnapshot()
         {
@@ -508,17 +512,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             var savedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(group.AllocationMethod);
             var requestedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
-            if (savedMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase) &&
-                !requestedMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException(
-                    $"Financial Advisor group '{group.Name}' uses saved PctChange allocation. " +
-                    $"Set FaGroup = \"{group.Name}\" and FaMethod = \"PctChange\" explicitly " +
-                    "so LEAN uses the upstream " +
-                    "placeholder-quantity fill accounting path.");
-            }
             if (savedMethod is not ("ContractsOrShares" or "Ratio" or "Percent" or
-                "NetLiq" or "AvailableEquity" or "Equal" or "PctChange"))
+                "NetLiq" or "AvailableEquity" or "Equal"))
             {
                 throw new NotSupportedException(
                     $"Financial Advisor group '{group.Name}' uses unsupported saved allocation method " +
@@ -531,13 +526,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     throw new InvalidOperationException(
                         $"Financial Advisor PctChange order for group '{group.Name}' requires a valid FaPercentage.");
-                }
-                if (savedMethod is not ("NetLiq" or "AvailableEquity" or "Equal" or "PctChange"))
-                {
-                    throw new InvalidOperationException(
-                        $"Financial Advisor PctChange cannot override group '{group.Name}' saved method " +
-                        $"'{group.AllocationMethod}'. Change the saved method to NetLiq, AvailableEquity, or Equal " +
-                        "and refresh the snapshot, or leave FaMethod empty.");
                 }
                 return;
             }
