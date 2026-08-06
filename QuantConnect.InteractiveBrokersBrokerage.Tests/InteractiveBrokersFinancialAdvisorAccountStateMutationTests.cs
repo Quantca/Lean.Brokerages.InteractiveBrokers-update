@@ -5,7 +5,13 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- */
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+*/
 
 using System;
 using System.Collections.Generic;
@@ -285,6 +291,63 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task MutationFailsBeforeWireOnUnsupportedServerVersionTest()
+        {
+            using var scenario = new MutationScenario
+            {
+                ServerVersion = MinServerVer.REPLACE_FA_END - 1
+            };
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                StringAssert.Contains(
+                    $"requires IB server version {MinServerVer.REPLACE_FA_END} or later",
+                    failed.ErrorMessage);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    state.Snapshot.Status);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [TestCase(MinServerVer.REPLACE_FA_END)]
+        [TestCase(0)]
+        public async Task MutationSupportsMinimumOrUnknownServerVersionTest(
+            int serverVersion)
+        {
+            using var scenario = new MutationScenario
+            {
+                ServerVersion = serverVersion
+            };
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var completed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
+                    completed.Status);
+                Assert.AreEqual(1, scenario.ReplaceCount);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    state.Snapshot.Status);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
         public async Task NoOpMutationStillReadsFreshAuthorityAndPublishesNewSnapshot()
         {
             using var scenario = new MutationScenario();
@@ -480,8 +543,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Assert.IsTrue(state.IsGroupTradingBlocked);
                 });
 
-                state.MarkDisconnected("disconnect before mutation publication");
-                state.MarkConnected();
+                scenario.Client.connectionClosed();
+                scenario.Client.nextValidId(123);
                 releasePublication.Set();
                 var failed = await AllocationTerminalAsync(state);
 
@@ -1255,15 +1318,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 Assert.IsTrue(RequestChangedAllocation(state, ready));
                 Assert.IsTrue(publicationEntered.Wait(TimeSpan.FromSeconds(10)));
-                var callbackLock = GetCallbackStateLock(state);
-                lock (callbackLock)
-                {
-                    var versionField = GetRequestVersionField();
-                    versionField.SetValue(
-                        state,
-                        (long)versionField.GetValue(state) + 1);
-                }
-                state.MarkConnected();
+                scenario.Client.connectionClosed();
+                scenario.Client.nextValidId(124);
                 releasePublication.Set();
                 var failed = await AllocationTerminalAsync(state);
 
@@ -1518,6 +1574,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             internal InteractiveBrokersFinancialAdvisorAccountState.RequestActions Actions
                 { get; }
             internal ReplacementBehavior Replacement { get; set; }
+            internal int ServerVersion { get; set; } = int.MaxValue;
             internal Func<int, bool> OpenOrderResult { get; set; } = _ => false;
             internal int StaleReadbacksBeforeApply { get; set; }
             internal int UnsavedChangesReadbacksBeforeApply
@@ -1794,7 +1851,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 RunExternal(() =>
                 {
                     ObserveMonitor(ref _serverVersionObservedUnderMonitor);
-                    serverVersion = int.MaxValue;
+                    serverVersion = ServerVersion;
                 });
                 return serverVersion;
             }

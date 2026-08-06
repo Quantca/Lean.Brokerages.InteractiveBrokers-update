@@ -126,37 +126,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
-        internal static void ValidateAdditionalAccountIds(
-            IReadOnlyCollection<string> additionalAccountIds,
-            IReadOnlyDictionary<string, BrokerageAccountGroup> allGroups,
-            IReadOnlyCollection<string> managedAccountIds,
-            string masterAccountId)
-        {
-            if (additionalAccountIds.Count == 0)
-            {
-                return;
-            }
-
-            var managed = managedAccountIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
-            foreach (var accountId in additionalAccountIds)
-            {
-                if (!managed.Contains(accountId) ||
-                    accountId.Equals(masterAccountId, StringComparison.OrdinalIgnoreCase) ||
-                    accountId.Equals(masterAccountId + "A", StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new InvalidOperationException($"Account '{accountId}' is not a managed Financial Advisor subaccount.");
-                }
-
-                var owner = allGroups.Values.FirstOrDefault(group =>
-                    group.AccountIds.Contains(accountId, StringComparer.OrdinalIgnoreCase));
-                if (owner != null)
-                {
-                    throw new InvalidOperationException(
-                        $"Additional account '{accountId}' belongs to Financial Advisor group '{owner.Name}'. Only globally unassigned accounts can be requested outside the selected groups.");
-                }
-            }
-        }
-
         private static void ValidateManagedGroupMembers(
             IReadOnlyDictionary<string, BrokerageAccountGroup> groups,
             IReadOnlyCollection<string> managedAccountIds,

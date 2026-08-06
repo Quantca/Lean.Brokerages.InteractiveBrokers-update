@@ -5,7 +5,13 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- */
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+*/
 
 using System;
 using System.Collections.Generic;
@@ -25,7 +31,8 @@ using LeanOrderType = QuantConnect.Orders.OrderType;
 namespace QuantConnect.Brokerages.InteractiveBrokers
 {
     /// <summary>
-    /// Serializes and publishes read-only Financial Advisor account snapshots.
+    /// Serializes Financial Advisor snapshot collection, group mutations, reconciliation,
+    /// and publication of their immutable results.
     /// </summary>
     internal sealed partial class InteractiveBrokersFinancialAdvisorAccountState : IDisposable
     {
@@ -34,6 +41,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private const int FinancialAdvisorUnsavedChangesErrorCode = 10230;
         private const int FinancialAdvisorInvalidAccountsErrorCode = 10231;
         private const int QueueCapacity = 8;
+        private const int MaximumAccountSummaryFallbackDetails = 10;
+        private const int MaximumAccountSummaryFallbackDetailLength = 512;
         private const string FinancialAdvisorAccountSummaryTags =
             "AccountType,NetLiquidation,TotalCashValue,AvailableFunds," +
             "ExcessLiquidity,BuyingPower,AccountReady,$LEDGER,$LEDGER:ALL";
@@ -176,11 +185,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 0), algorithmRequested: true);
         }
 
-        internal void MarkConnected() => RestoreConnectivity(
-            afterNextValidId: false, clearUnkeyedAmbiguity: true);
-
-        private void RestoreConnectivity(bool afterNextValidId,
-            bool clearUnkeyedAmbiguity = false)
+        // Unkeyed callbacks cannot identify their originating request, so ambiguity is cleared
+        // only when NextValidId confirms a new physical connection.
+        private void RestoreConnectivity(bool afterNextValidId)
         {
             lock (_callbackStateLock)
             {
@@ -193,7 +200,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     _physicalConnectionClosed = false;
                 }
-                if (confirmedReconnect || clearUnkeyedAmbiguity)
+                if (confirmedReconnect)
                 {
                     _unkeyedResponseMayStillArrive = false;
                 }
@@ -300,6 +307,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
+        internal bool IsExpectedGroupsReadbackRetry(ErrorEventArgs error)
+        {
+            if (error == null ||
+                error.Code != FinancialAdvisorUnsavedChangesErrorCode ||
+                error.Id is not (-1 or 0))
+            {
+                return false;
+            }
+
+            lock (_callbackStateLock)
+            {
+                return _pendingRequest is
+                {
+                    Kind: PendingKind.FinancialAdvisorReadback,
+                    FaDataType: GroupsFaDataType,
+                    Finished: false,
+                    WireSent: true
+                };
+            }
+        }
+
         private static bool IsServiceRequestIdInAllocatorRange(int requestId) =>
             requestId <= -2;
 
@@ -307,7 +335,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string allocationMethod) =>
             NormalizeGroupAllocationMethod(allocationMethod);
 
-        // Intentionally distinct from IsFinancialAdvisorGroupFilteredOut: this is the normalized unified-service boundary.
+        // Intentionally distinct from IsFaGroupFlitterSet: unified routing trims names and uses OrdinalIgnoreCase.
         internal static bool IsOutsideFinancialAdvisorGroupFilter(
             string financialAdvisorsGroupFilter,
             string groupName)
@@ -330,18 +358,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 (!string.IsNullOrWhiteSpace(properties?.FaGroup) ||
                     !string.IsNullOrWhiteSpace(properties?.FaProfile) ||
                     !string.IsNullOrWhiteSpace(financialAdvisorsGroupFilter));
-        }
-
-        // Intentionally distinct: this preserves upstream IsNullOrEmpty and InvariantCultureIgnoreCase semantics for non-unified routing.
-        internal static bool IsFinancialAdvisorGroupFilteredOut(
-            string financialAdvisorsGroupFilter,
-            string groupName)
-        {
-            return !string.IsNullOrEmpty(financialAdvisorsGroupFilter)
-                && !string.IsNullOrEmpty(groupName)
-                && !groupName.Equals(
-                    financialAdvisorsGroupFilter,
-                    StringComparison.InvariantCultureIgnoreCase);
         }
 
         internal bool RequestGroupAssignment(
@@ -585,6 +601,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private bool QueueRefresh(SnapshotScope requested, bool algorithmRequested)
         {
+            // Equivalent work coalesces, while differing queued scopes merge; the request
+            // version prevents superseded collection work from publishing a snapshot.
             lock (_callbackStateLock)
             {
                 if (_disposed || !_connected || _unkeyedResponseMayStillArrive ||
@@ -692,7 +710,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             {
                                 if (!rejected)
                                 {
-                                    // The single-consumer worker loop is the serialization point for every brokerage operation.
+                                    // The single-consumer worker serializes FA snapshot and
+                                    // group-mutation operations.
                                     if (item.Kind == WorkKind.Refresh)
                                     {
                                         await RefreshAsync(scope).ConfigureAwait(false);
@@ -726,6 +745,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             {
                                 if (item.Kind != WorkKind.Refresh && failure == null)
                                 {
+                                    // Publish mutation success only while its confirmed topology
+                                    // still matches the current Ready snapshot; otherwise fail closed.
                                     var membershipHash = item.Kind == WorkKind.Assignment
                                         ? item.Assignment.ResultingMembershipHash
                                         : item.Allocation.ResultingMembershipHash;
@@ -1636,6 +1657,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var summaryIneligibleAccounts = new HashSet<string>(
                 StringComparer.OrdinalIgnoreCase);
             var summaryFallbacks = new List<string>();
+            var summaryFallbackCount = 0;
             if (_requests.RequestAccountSummary != null &&
                 _requests.CancelAccountSummary != null)
             {
@@ -1666,11 +1688,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     catch (Exception exception) when (
                         CanFallbackFromAccountSummaryException(exception))
                     {
-                        summaryFallbacks.Add(
-                            $"group '{group.Name}': RequestFailure " +
-                            $"({exception.GetType().Name})");
-                        summaryIneligibleAccounts.UnionWith(membersToCollect);
-                        continue;
+                        AddAccountSummaryFallback(
+                            summaryFallbacks,
+                            ref summaryFallbackCount,
+                            group.Name,
+                            $"RequestFailure ({exception.GetType().Name}): " +
+                            exception.Message);
+                        break;
                     }
 
                     if (!TryCreateAccountSummaryBuilders(
@@ -1682,7 +1706,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             out var summaryBuilders,
                             out var fallback))
                     {
-                        summaryFallbacks.Add($"group '{group.Name}': {fallback}");
+                        AddAccountSummaryFallback(
+                            summaryFallbacks,
+                            ref summaryFallbackCount,
+                            group.Name,
+                            fallback);
                         summaryIneligibleAccounts.UnionWith(membersToCollect);
                         continue;
                     }
@@ -1697,7 +1725,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 Log.Error(
                     "InteractiveBrokersFinancialAdvisorAccountState: named-group account " +
-                    "summary fallback(s): " + string.Join("; ", summaryFallbacks),
+                    "summary fallback(s): " + string.Join("; ", summaryFallbacks) +
+                    (summaryFallbackCount > summaryFallbacks.Count
+                        ? $"; omittedFallbacks={summaryFallbackCount - summaryFallbacks.Count}"
+                        : string.Empty),
                     overrideMessageFloodProtection: true);
             }
 
@@ -1726,6 +1757,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
 
+            // Re-read every topology input after financial collection so configuration or
+            // membership drift invalidates the mixed-time snapshot instead of publishing it.
             var endingManagedAccountIds = ParseManagedAccounts(
                 await RequestManagedAccountsAsync(scope, useHandshakeCache: false)
                     .ConfigureAwait(false));
@@ -1824,9 +1857,33 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             IsPrimaryOrAggregateAccount(accountId, primaryAccountId);
 
         private static bool CanFallbackFromAccountSummaryException(Exception exception) =>
-            exception is not RequestInvalidatedException &&
-            exception is not ObjectDisposedException &&
-            exception is not OperationCanceledException;
+            exception is TimeoutException ||
+            exception is AccountSummaryRequestRejectedException;
+
+        private static void AddAccountSummaryFallback(
+            ICollection<string> fallbacks,
+            ref int fallbackCount,
+            string groupName,
+            string reason)
+        {
+            fallbackCount++;
+            if (fallbacks.Count >= MaximumAccountSummaryFallbackDetails)
+            {
+                return;
+            }
+            fallbacks.Add(
+                $"group '{SanitizeAccountSummaryDiagnostic(groupName)}': " +
+                SanitizeAccountSummaryDiagnostic(reason));
+        }
+
+        private static string SanitizeAccountSummaryDiagnostic(string value)
+        {
+            var sanitized = string.Concat((value ?? string.Empty).Select(
+                character => char.IsControl(character) ? ' ' : character)).Trim();
+            return sanitized.Length <= MaximumAccountSummaryFallbackDetailLength
+                ? sanitized
+                : sanitized[..MaximumAccountSummaryFallbackDetailLength] + "...";
+        }
 
         private static bool TryCreateAccountSummaryBuilders(
             BrokerageAccountGroup group,
@@ -1850,6 +1907,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var detectorAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var unexpectedRows = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            // Only group-member rows can populate child builders. Eligible non-member cash rows
+            // are isolated as aggregate detector input; no non-member row is applied to a child.
             foreach (var row in rows ?? Array.Empty<AccountSummaryEventArgs>())
             {
                 var accountId = row?.Account?.Trim() ?? string.Empty;
@@ -2147,6 +2206,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         currency => currency, StringComparer.OrdinalIgnoreCase)) + "]";
                 return false;
             }
+            var baseRow = detectorRows.SingleOrDefault(row =>
+                "BASE".Equals(row.Currency, StringComparison.OrdinalIgnoreCase));
+            var concreteRow = detectorRows.SingleOrDefault(row =>
+                baseCurrency.Equals(row.Currency, StringComparison.OrdinalIgnoreCase));
+            if (baseRow != null && concreteRow != null &&
+                decimal.Parse(
+                    baseRow.Value, NumberStyles.Float, CultureInfo.InvariantCulture) !=
+                decimal.Parse(
+                    concreteRow.Value, NumberStyles.Float, CultureInfo.InvariantCulture))
+            {
+                fallback = "AggregateCashDivergence";
+                return false;
+            }
             var nonBaseCurrencies = detectorRows
                 .Where(row =>
                     !"BASE".Equals(row.Currency, StringComparison.OrdinalIgnoreCase) &&
@@ -2275,6 +2347,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return pending.SummaryRows.ToArray();
         }
 
+        // A sent unkeyed request that times out may still produce an indistinguishable callback.
+        // NextValidId after a physical close is required to clear that ambiguity.
         private async Task<PendingRequest> SendUnkeyedAsync(
             SnapshotScope scope,
             PendingKind kind,
@@ -2318,6 +2392,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
+        // Keyed streams can be canceled and late callbacks rejected by request ID, so their
+        // timeouts do not poison the unkeyed callback channel.
         private async Task<PendingRequest> SendKeyedAsync(
             SnapshotScope scope,
             PendingKind kind,
@@ -2684,6 +2760,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private int NextRequestId()
         {
+            // Negative IDs isolate service-owned keyed responses, while epoch bounds prevent
+            // late responses from a previous physical connection from being claimed.
             lock (_callbackStateLock)
             {
                 if (!IsServiceRequestIdInAllocatorRange(_nextRequestId))
@@ -2959,9 +3037,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             ? new InvalidOperationException(
                                 $"IB rejected the Financial Advisor configuration replacement " +
                                 $"({args.Code}): {args.Message}")
-                            : new InvalidOperationException(
-                                $"IB rejected the account-state request " +
-                                $"({args.Code}): {args.Message}");
+                            : pending.Kind == PendingKind.AccountSummary
+                                ? new AccountSummaryRequestRejectedException(
+                                    $"IB rejected the account-state request " +
+                                    $"({args.Code}): {args.Message}")
+                                : new InvalidOperationException(
+                                    $"IB rejected the account-state request " +
+                                    $"({args.Code}): {args.Message}");
                     }
                 }
             }
@@ -3113,9 +3195,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 if (readySnapshot != null && _pendingMutation == null)
                 {
                     _groupTradingBlocked = false;
-                }
-                if (readySnapshot != null && _pendingMutation == null)
-                {
                     _activeRefresh = null;
                 }
                 if (readySnapshot != null &&
@@ -3374,6 +3453,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal Func<int> GetServerVersion { get; set; }
             internal Func<int, int, string, Func<bool>, bool>
                 ReplaceFinancialAdvisor { get; set; }
+            // Test barrier after mutation processing and before terminal result publication.
             internal Action BeforeMutationPublication { get; set; } = () => { };
 
             internal RequestActions(InteractiveBrokersClient client)
@@ -3526,6 +3606,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private sealed class PendingRequest
         {
+            private bool _wireSent;
+
             internal SnapshotScope Scope { get; }
             internal PendingKind Kind { get; }
             internal int RequestId { get; }
@@ -3539,7 +3621,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal FamilyCodeRow[] FamilyCodeRows { get; set; } =
                 Array.Empty<FamilyCodeRow>();
             internal string Text { get; set; } = string.Empty;
-            internal bool WireSent { get; set; }
+            internal bool WireSent
+            {
+                get => Volatile.Read(ref _wireSent);
+                set => Volatile.Write(ref _wireSent, value);
+            }
             internal bool Finished { get; set; }
             internal bool ExplicitlyRejected { get; set; }
 
@@ -3582,6 +3668,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             internal UnkeyedRequestTimeoutException(string message, Exception inner)
                 : base(message, inner)
+            {
+            }
+        }
+
+        private sealed class AccountSummaryRequestRejectedException :
+            InvalidOperationException
+        {
+            internal AccountSummaryRequestRejectedException(string message)
+                : base(message)
             {
             }
         }

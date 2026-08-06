@@ -5,7 +5,13 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- */
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+*/
 
 using System;
 using System.Collections.Concurrent;
@@ -2014,19 +2020,17 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             unsupportedOrder,
                             snapshot)).Message);
                 StringAssert.Contains(
-                    "unsupported saved allocation method 'PctChange'",
-                    Assert.Throws<NotSupportedException>(() =>
+                    "requires explicit order-level routing",
+                    Assert.Throws<InvalidOperationException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             savedPctChangeOrder,
                             snapshot)).Message);
                 savedPctChangeOrder.FaMethod = "PctChange";
                 savedPctChangeOrder.FaPercentage = "25";
-                StringAssert.Contains(
-                    "unsupported saved allocation method 'PctChange'",
-                    Assert.Throws<NotSupportedException>(() =>
-                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
-                            savedPctChangeOrder,
-                            snapshot)).Message);
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        savedPctChangeOrder,
+                        snapshot));
             });
         }
 
@@ -2083,8 +2087,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         new IBApi.Order { FaGroup = "Monetary" },
                         snapshot));
                 StringAssert.Contains(
-                    "unsupported saved allocation method 'PctChange'",
-                    Assert.Throws<NotSupportedException>(() =>
+                    "requires explicit order-level routing",
+                    Assert.Throws<InvalidOperationException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             new IBApi.Order { FaGroup = "SavedPctChange" },
                             snapshot)).Message);
@@ -2262,13 +2266,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 CollectionAssert.AreEqual(new[] { unsupportedReason }, reports);
             });
 
-            state.MarkDisconnected("simulated disconnect");
+            scenario.Client.connectionClosed();
             Assert.Multiple(() =>
             {
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
                 Assert.AreEqual(unsupportedReason, state.UnsupportedConfigurationError);
             });
-            state.MarkConnected();
+            scenario.Client.nextValidId(123);
             scenario.GroupsDocument = Scenario.EmptyGroupsXml;
             scenario.EndingGroupsDocument = Scenario.EmptyGroupsXml;
 
@@ -2866,6 +2870,50 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase("base", true)]
+        [TestCase("concrete", true)]
+        [TestCase("equal-pair", true)]
+        [TestCase("divergent-pair", false)]
+        public async Task AggregateBaseAndConcreteCashMustAgreeTest(
+            string shape, bool fastPath)
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                var rows = shape switch
+                {
+                    "base" => new[] { (Currency: "BASE", Value: "350.50") },
+                    "concrete" => new[] { (Currency: "USD", Value: "350.50") },
+                    "equal-pair" => new[]
+                    {
+                        (Currency: "BASE", Value: "350.50"),
+                        (Currency: "USD", Value: "350.50")
+                    },
+                    "divergent-pair" => new[]
+                    {
+                        (Currency: "BASE", Value: "351.50"),
+                        (Currency: "USD", Value: "350.50")
+                    },
+                    _ => throw new ArgumentOutOfRangeException(nameof(shape))
+                };
+                scenario.EmitAggregateCash(requestId, rows);
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(fastPath ? 1100.25m : 1000.25m,
+                    snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(fastPath ? 0 : 1, scenario.AccountRequestIds.Count);
+            });
+        }
+
         [TestCase("missing")]
         [TestCase("missing-base")]
         [TestCase("duplicate-currency")]
@@ -3403,10 +3451,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
-        [TestCase("ib-error")]
-        [TestCase("wire-exception")]
+        [Test]
         [NonParallelizable]
-        public async Task SummaryRequestFailuresUseTheExactFallbackTest(string failure)
+        public async Task SummaryRequestRejectionUsesTheExactFallbackTest()
         {
             var originalLogHandler = Log.LogHandler;
             var logHandler = new QueueLogHandler();
@@ -3416,13 +3463,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 using var scenario = new Scenario();
                 scenario.EnableAccountSummaries((requestId, _) =>
                 {
-                    if (failure == "ib-error")
-                    {
-                        scenario.Client.error(
-                            requestId, 0, 321, "simulated summary rejection", string.Empty);
-                        return;
-                    }
-                    throw new InvalidOperationException("simulated summary wire failure");
+                    scenario.Client.error(
+                        requestId, 0, 321, "simulated summary rejection", string.Empty);
                 });
                 using var state = scenario.CreateState();
 
@@ -3442,14 +3484,119 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
                     Assert.AreEqual(1, scenario.AccountRequestIds.Count);
                     Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
-                    CollectionAssert.AreEqual(
-                        new[]
-                        {
-                            "InteractiveBrokersFinancialAdvisorAccountState: named-group " +
-                            "account summary fallback(s): group 'Alpha': RequestFailure " +
-                            "(InvalidOperationException)"
-                        },
-                        messages);
+                    Assert.AreEqual(1, messages.Length);
+                    StringAssert.Contains(
+                        "RequestFailure (AccountSummaryRequestRejectedException): " +
+                        "IB rejected the account-state request (321): " +
+                        "simulated summary rejection",
+                        messages.Single());
+                });
+            }
+            finally
+            {
+                Log.LogHandler = originalLogHandler;
+                logHandler.Dispose();
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task UnexpectedSummaryExceptionFailsTheRefreshTest(
+            bool invalidOperationException)
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((_, _) =>
+            {
+                if (invalidOperationException)
+                {
+                    throw new InvalidOperationException(
+                        "simulated programming failure");
+                }
+                throw new ArgumentException("simulated programming failure");
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
+                StringAssert.Contains("simulated programming failure", snapshot.ErrorMessage);
+                Assert.AreEqual(0, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1, scenario.CanceledSummaryIds.Count);
+            });
+        }
+
+        [Test]
+        public async Task FirstSummaryRequestFailureStopsSummaryBatchingTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, groupName) =>
+                scenario.Client.error(
+                    requestId,
+                    0,
+                    321,
+                    $"simulated request failure for {groupName}",
+                    string.Empty));
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                CollectionAssert.AreEqual(
+                    new[] { "Alpha" },
+                    scenario.SummaryRequests.Select(request => request.GroupName));
+                CollectionAssert.AreEquivalent(
+                    new[] { "ACC1", "ACC2", "ACC3" },
+                    scenario.Requests.Where(request => request.StartsWith("account:"))
+                        .Select(request => request[8..]));
+            });
+        }
+
+        [Test]
+        [NonParallelizable]
+        public async Task SummaryFallbackDiagnosticIsSanitizedAndBoundedTest()
+        {
+            var originalLogHandler = Log.LogHandler;
+            var logHandler = new QueueLogHandler();
+            Log.LogHandler = logHandler;
+            try
+            {
+                using var scenario = new Scenario();
+                var exceptionMessage =
+                    "first line\r\nsecond line " + new string('x', 1000) + " END";
+                scenario.EnableAccountSummaries((requestId, _) =>
+                    scenario.Client.error(
+                        requestId,
+                        0,
+                        321,
+                        exceptionMessage,
+                        string.Empty));
+                using var state = scenario.CreateState();
+
+                var snapshot = await RunRefreshAsync(
+                    state, () => state.RequestRefresh(new[] { "Alpha" }));
+                var message = logHandler.Logs.Single(entry =>
+                    entry.MessageType == LogType.Error && entry.Message.Contains(
+                        "named-group account summary fallback(s)",
+                        StringComparison.Ordinal)).Message;
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                    StringAssert.Contains(
+                        "RequestFailure (AccountSummaryRequestRejectedException): " +
+                        "IB rejected the account-state request (321): " +
+                        "first line  second line",
+                        message);
+                    Assert.IsFalse(message.Contains('\r'));
+                    Assert.IsFalse(message.Contains('\n'));
+                    Assert.IsFalse(message.Contains(" END", StringComparison.Ordinal));
+                    Assert.Less(message.Length, 700);
                 });
             }
             finally
@@ -3570,6 +3717,76 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         [Test]
         [NonParallelizable]
+        public async Task SummaryFallbackDiagnosticCapsGroupDetailsTest()
+        {
+            const int groupCount = 12;
+            var groupNames = Enumerable.Range(0, groupCount)
+                .Select(index => $"Group{index:00}")
+                .ToArray();
+            var accountIds = Enumerable.Range(0, groupCount)
+                .Select(index => $"ACC{index:00}")
+                .ToArray();
+            var groupsXml = "<ListOfGroups>" + string.Concat(groupNames.Select(
+                (groupName, index) =>
+                    $"<Group><name>{groupName}</name><defaultMethod>Equal</defaultMethod>" +
+                    $"<ListOfAccts><String>{accountIds[index]}</String></ListOfAccts></Group>")) +
+                "</ListOfGroups>";
+            var originalLogHandler = Log.LogHandler;
+            var logHandler = new QueueLogHandler();
+            Log.LogHandler = logHandler;
+            try
+            {
+                using var scenario = new Scenario
+                {
+                    ManagedAccounts = "MASTER," + string.Join(",", accountIds),
+                    GroupsDocument = groupsXml,
+                    EndingGroupsDocument = groupsXml,
+                    AliasesDocument = "<ListOfAccountAliases />",
+                    FamilyCodes = Array.Empty<FamilyCode>()
+                };
+                scenario.EnableAccountSummaries((requestId, groupName) =>
+                {
+                    var index = Array.IndexOf(groupNames, groupName);
+                    scenario.EmitValidSummaryAccount(
+                        requestId, accountIds[index], omittedTag: "AccountReady");
+                    scenario.EmitAggregateCash(
+                        requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                    scenario.Client.accountSummaryEnd(requestId);
+                });
+                using var state = scenario.CreateState();
+
+                var snapshot = await RunRefreshAsync(
+                    state, () => state.RequestRefresh(Array.Empty<string>()));
+                var message = logHandler.Logs.Single(entry =>
+                    entry.MessageType == LogType.Error && entry.Message.Contains(
+                        "named-group account summary fallback(s)",
+                        StringComparison.Ordinal)).Message;
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                    Assert.AreEqual(groupCount, scenario.SummaryRequests.Count);
+                    Assert.AreEqual(groupCount, scenario.AccountRequestIds.Count);
+                    foreach (var groupName in groupNames.Take(10))
+                    {
+                        StringAssert.Contains($"group '{groupName}'", message);
+                    }
+                    foreach (var groupName in groupNames.Skip(10))
+                    {
+                        Assert.IsFalse(message.Contains(groupName, StringComparison.Ordinal));
+                    }
+                    StringAssert.Contains("omittedFallbacks=2", message);
+                });
+            }
+            finally
+            {
+                Log.LogHandler = originalLogHandler;
+                logHandler.Dispose();
+            }
+        }
+
+        [Test]
+        [NonParallelizable]
         public async Task FirstFailedRefreshThenReadyLogsOneDiagnosticTest()
         {
             var originalLogHandler = Log.LogHandler;
@@ -3637,8 +3854,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
                 var second = await WaitForReadyGenerationAsync(state, first.Generation);
 
-                state.MarkDisconnected("simulated logical disconnect");
-                state.MarkConnected();
+                scenario.Client.error(
+                    -1, 0, 1100, "Connectivity between IB and TWS was lost.", string.Empty);
+                scenario.Client.error(
+                    -1, 0, 1102, "Connectivity between IB and TWS was restored.", string.Empty);
                 Assert.IsTrue(state.RequestRefresh(Array.Empty<string>()));
                 var logicalReconnect = await WaitForReadyGenerationAsync(
                     state, second.Generation);
