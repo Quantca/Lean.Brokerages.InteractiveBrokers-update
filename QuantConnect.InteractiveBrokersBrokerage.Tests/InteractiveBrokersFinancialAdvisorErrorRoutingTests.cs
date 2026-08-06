@@ -14,6 +14,7 @@
 */
 
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using NUnit.Framework;
 using QuantConnect.Brokerages;
@@ -63,6 +64,136 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", null);
             }
+        }
+
+        [TestCase(-1)]
+        [TestCase(0)]
+        public void ExpectedGroupsReadbackRetrySuppressesOnlyBrokerageMessage(int requestId)
+        {
+            using var client = new IB.InteractiveBrokersClient(new IBApi.EReaderMonitorSignal());
+            using var accountState = new InteractiveBrokersFinancialAdvisorAccountState(
+                client,
+                () => { },
+                () => true,
+                _ => Symbol.Empty,
+                "F-MASTER");
+            using var brokerage = new InteractiveBrokersBrokerage();
+            SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", accountState);
+            var pending = InstallGroupsReadbackPending(accountState);
+
+            try
+            {
+                var publicErrorCount = 0;
+                var messages = new List<BrokerageMessageEvent>();
+                brokerage.Message += (_, message) => messages.Add(message);
+                client.Error += brokerage.HandleError;
+                client.Error += (_, _) => publicErrorCount++;
+
+                client.error(
+                    requestId,
+                    0,
+                    10230,
+                    "The FA configuration has unsaved changes",
+                    string.Empty);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(1, publicErrorCount,
+                        "The client Error event remains public even when the brokerage owns the retry.");
+                    Assert.IsEmpty(messages);
+                    Assert.IsTrue(GetPendingBoolean(pending, "Finished"),
+                        "The internal error callback must still complete the pending readback for retry.");
+                    Assert.IsFalse(accountState.IsExpectedGroupsReadbackRetry(
+                        new IB.ErrorEventArgs(requestId, 0, 10230, "repeated")),
+                        "A completed readback no longer owns a later unkeyed 10230 error.");
+                });
+
+                client.error(
+                    requestId,
+                    0,
+                    10230,
+                    "Unrelated unsaved changes",
+                    string.Empty);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(2, publicErrorCount);
+                    Assert.AreEqual(1, messages.Count);
+                    Assert.AreEqual("10230", messages[0].Code);
+                    StringAssert.Contains("Unrelated unsaved changes", messages[0].Message);
+                });
+            }
+            finally
+            {
+                SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", null);
+            }
+        }
+
+        [Test]
+        public void UnsavedChangesWithoutPendingGroupsReadbackIsNotSuppressed()
+        {
+            using var client = new IB.InteractiveBrokersClient(new IBApi.EReaderMonitorSignal());
+            using var accountState = new InteractiveBrokersFinancialAdvisorAccountState(
+                client,
+                () => { },
+                () => true,
+                _ => Symbol.Empty,
+                "F-MASTER");
+            using var brokerage = new InteractiveBrokersBrokerage();
+            SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", accountState);
+
+            try
+            {
+                var messages = new List<BrokerageMessageEvent>();
+                brokerage.Message += (_, message) => messages.Add(message);
+                client.Error += brokerage.HandleError;
+
+                client.error(-1, 0, 10230, "Unowned unsaved changes", string.Empty);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(1, messages.Count);
+                    Assert.AreEqual("10230", messages[0].Code);
+                    StringAssert.Contains("Unowned unsaved changes", messages[0].Message);
+                });
+            }
+            finally
+            {
+                SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", null);
+            }
+        }
+
+        private static object InstallGroupsReadbackPending(
+            InteractiveBrokersFinancialAdvisorAccountState accountState)
+        {
+            var stateType = typeof(InteractiveBrokersFinancialAdvisorAccountState);
+            var pendingType = stateType.GetNestedType(
+                "PendingRequest", BindingFlags.NonPublic);
+            var pendingKindType = stateType.GetNestedType(
+                "PendingKind", BindingFlags.NonPublic);
+            var constructor = pendingType.GetConstructors(
+                    BindingFlags.Instance | BindingFlags.NonPublic)
+                .Single();
+            var pending = constructor.Invoke(new[]
+            {
+                null,
+                System.Enum.Parse(pendingKindType, "FinancialAdvisorReadback"),
+                (object)0,
+                1,
+                0L
+            });
+            pendingType.GetProperty(
+                    "WireSent", BindingFlags.Instance | BindingFlags.NonPublic)
+                .SetValue(pending, true);
+            SetPrivateFieldValue(accountState, "_pendingRequest", pending);
+            return pending;
+        }
+
+        private static bool GetPendingBoolean(object pending, string propertyName)
+        {
+            return (bool)pending.GetType()
+                .GetProperty(propertyName, BindingFlags.Instance | BindingFlags.NonPublic)
+                .GetValue(pending);
         }
 
         private static void SetPrivateFieldValue(object instance, string name, object value)

@@ -427,8 +427,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="orderProvider">An instance of IOrderProvider used to fetch Order objects by brokerage ID</param>
         /// <param name="securityProvider">The security provider used to give access to algorithm securities</param>
         /// <param name="account">The Interactive Brokers account name</param>
-        /// <param name="host">Host name or IP address of the machine where TWS is running.</param>
-        /// <param name="port">The port specified in the TWS API socket configuration.</param>
+        /// <param name="host">host name or IP address of the machine where TWS is running. Leave blank to connect to the local host.</param>
+        /// <param name="port">must match the port specified in TWS on the Configure&gt;API&gt;Socket Port field.</param>
         /// <param name="ibDirectory">The IB Gateway root directory</param>
         /// <param name="ibVersion">The IB Gateway version</param>
         /// <param name="userName">The login user name</param>
@@ -436,10 +436,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="tradingMode">The trading mode: 'live' or 'paper'</param>
         /// <param name="agentDescription">Used for Rule 80A describes the type of trader.</param>
         /// <param name="loadExistingHoldings">False will ignore existing security holdings from being loaded.</param>
-        /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted on Sundays.</param>
-        /// <param name="financialAdvisorsGroupFilter">The financial advisors group filter associated with this client.</param>
-        /// <param name="financialAdvisorGroupManagementEnabled">Whether unified-group configuration management is enabled.</param>
-        /// <param name="financialAdvisorUnifiedGroupsEnabled">Whether unified Financial Advisor groups are enabled.</param>
+        /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)</param>
+        /// <param name="financialAdvisorsGroupFilter">The name of the financial advisors group filter associated with this client.</param>
+        /// <param name="financialAdvisorGroupManagementEnabled">
+        /// Whether Financial Advisor group assignment and allocation management are enabled. Requires
+        /// <paramref name="financialAdvisorUnifiedGroupsEnabled"/>.
+        /// </param>
+        /// <param name="financialAdvisorUnifiedGroupsEnabled">
+        /// Whether unified Financial Advisor snapshots and group-order routing are enabled.
+        /// </param>
         public InteractiveBrokersBrokerage(
             IAlgorithm algorithm,
             IOrderProvider orderProvider,
@@ -484,7 +489,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// Provides public access to the underlying IBClient instance
         /// </summary>
         /// <remarks>
-        /// Public subscribers share IB's single-threaded message pump and must not block. A blocking subscriber can starve message delivery, including callbacks awaited by the FA service; an unkeyed FA timeout can poison that service until a physical reconnect.
+        /// Public subscribers run synchronously on IB's single-threaded message pump and must not block.
+        /// Blocking delays subsequent messages, including callbacks awaited by the FA service. If an unkeyed
+        /// FA request times out, the service rejects further unkeyed requests until a physical reconnect.
         /// </remarks>
         public IB.InteractiveBrokersClient Client => _client;
 
@@ -1551,9 +1558,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             if (!FinancialAdvisorServiceOwnsStartupRequests)
             {
                 _client.AccountSummary += HandleAccountSummary;
+                _client.ManagedAccounts += HandleManagedAccounts;
+                _client.FamilyCodes += HandleFamilyCodes;
             }
-            _client.ManagedAccounts += HandleManagedAccounts;
-            _client.FamilyCodes += HandleFamilyCodes;
             _client.Error += HandleError;
             _client.TickPrice += HandleTickPrice;
             _client.TickSize += HandleTickSize;
@@ -2104,6 +2111,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             Log.Trace($"InteractiveBrokersBrokerage.HandleError(): RequestId: {requestId} ErrorCode: {errorCode} - {errorMsg}");
+
+            if (_financialAdvisorAccountState?.IsExpectedGroupsReadbackRetry(e) == true)
+            {
+                return;
+            }
 
             if (_financialAdvisorAccountState?.IsServiceOwnedRequestId(requestId) == true)
             {
@@ -5795,6 +5807,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns><c>true</c> if the group is allowed; otherwise, <c>false</c>.</returns>
         private bool IsFaGroupFlitterSet(string groupName)
         {
+            // Intentionally distinct from IsOutsideFinancialAdvisorGroupFilter; preserves upstream's IsNullOrEmpty/InvariantCultureIgnoreCase semantics.
             return !string.IsNullOrEmpty(_financialAdvisorsGroupFilter)
                 && !string.IsNullOrEmpty(groupName)
                 && !groupName.Equals(_financialAdvisorsGroupFilter, StringComparison.InvariantCultureIgnoreCase);

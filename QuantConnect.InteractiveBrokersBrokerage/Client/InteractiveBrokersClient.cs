@@ -32,7 +32,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<ErrorEventArgs> Error;
 
         /// <summary>
-        /// Error callback used by internal request owners independently of public subscribers.
+        /// Error callback used by internal request owners. It runs after the public event invocation and is still
+        /// invoked if that invocation throws.
         /// </summary>
         internal event EventHandler<ErrorEventArgs> InternalError;
 
@@ -217,7 +218,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         internal event EventHandler<AccountUpdateMultiEndEventArgs> AccountUpdateMultiEndWithRequestId;
 
         /// <summary>
-        /// Occurs when a position update for a Financial Advisor (FA) request has been received.
+        /// Occurs when a position update from a positions-multi request has been received, preserving its
+        /// request and model identifiers.
         /// </summary>
         internal event EventHandler<PositionMultiEventArgs> PositionMulti;
 
@@ -703,6 +705,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <summary>
         /// Marks the completion of a Financial Advisor configuration replacement.
         /// </summary>
+        /// <param name="reqId">The replacement request identifier.</param>
+        /// <param name="text">The completion message returned by Interactive Brokers.</param>
         public override void replaceFAEnd(int reqId, string text)
         {
             OnReplaceFaEnd(new ReplaceFaEndEventArgs(reqId, text));
@@ -746,7 +750,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             }
             finally
             {
-                // Public subscribers must not mutate event-argument payloads shared with internal request owners.
                 OnFamilyCodes(args);
             }
         }

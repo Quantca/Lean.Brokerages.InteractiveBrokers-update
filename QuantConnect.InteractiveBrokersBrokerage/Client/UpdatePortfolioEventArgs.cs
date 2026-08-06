@@ -36,7 +36,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public int Position => Convert.ToInt32(PositionQuantity);
 
         /// <summary>
-        /// The exact number of positions held.
+        /// The exact position quantity reported by Interactive Brokers. Unlike <see cref="Position"/>, this
+        /// value preserves fractional quantities without applying the legacy integer projection.
         /// If the position is 0, it means the position has just cleared.
         /// </summary>
         public decimal PositionQuantity { get; }

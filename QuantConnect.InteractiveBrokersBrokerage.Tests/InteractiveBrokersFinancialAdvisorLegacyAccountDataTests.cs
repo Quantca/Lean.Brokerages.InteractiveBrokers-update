@@ -207,6 +207,31 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void FractionalOptionPortfolioCallbacksPreserveExactQuantityAndFilterServiceRowsTest()
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                GroupName,
+                unifiedGroupsEnabled: true);
+            var notificationCount = 0;
+            var notificationPosition = 0m;
+            scenario.Brokerage.OptionNotification += (_, eventArgs) =>
+            {
+                ++notificationCount;
+                notificationPosition = eventArgs.Position;
+            };
+
+            scenario.EmitNonServiceFractionalOptionRow();
+            scenario.EmitServiceFractionalOptionRow();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(ExactPosition, scenario.GetHoldingQuantity());
+                Assert.AreEqual(1, notificationCount);
+                Assert.AreEqual(ExactPosition, notificationPosition);
+            });
+        }
+
+        [Test]
         public void NonServiceRowsAreNeverDroppedWhenCallbacksInterleaveTest()
         {
             using var scenario = LegacyAccountScenario.CreateConfigured(
@@ -423,6 +448,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Currencies.USD);
             }
 
+            public void EmitNonServiceFractionalOptionRow()
+            {
+                Client.updatePortfolio(
+                    CreateOptionContract(),
+                    ExactPosition,
+                    101,
+                    176.75,
+                    100.5,
+                    0,
+                    0,
+                    AccountId);
+            }
+
+            public void EmitServiceFractionalOptionRow()
+            {
+                Client.positionMulti(
+                    _serviceRequestId,
+                    "DU-SERVICE",
+                    string.Empty,
+                    CreateOptionContract(),
+                    999.5m,
+                    900.5);
+            }
+
             public void EmitPublicServiceRowsWithoutInternalCallbacks()
             {
                 EmitPublicRowsWithoutInternalCallbacks(_serviceRequestId);
@@ -545,6 +594,24 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Exchange = "SMART",
                     PrimaryExch = "ARCA",
                     Multiplier = "1"
+                };
+            }
+
+            private static Contract CreateOptionContract()
+            {
+                return new Contract
+                {
+                    ConId = 102,
+                    Symbol = "SPY",
+                    LocalSymbol = "SPY   301220C00500000",
+                    LastTradeDateOrContractMonth = "20301220",
+                    SecType = IB.SecurityType.Option,
+                    Currency = Currencies.USD,
+                    Exchange = "SMART",
+                    PrimaryExch = "ARCA",
+                    Multiplier = "100",
+                    Right = IB.RightType.Call,
+                    Strike = 500
                 };
             }
 
