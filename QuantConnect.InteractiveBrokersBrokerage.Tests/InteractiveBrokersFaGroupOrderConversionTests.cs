@@ -17,7 +17,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using IBApi;
 using NUnit.Framework;
@@ -110,6 +109,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private static readonly MethodInfo EmitOrderFillMethod =
             typeof(InteractiveBrokersBrokerage).GetMethod(
                 "EmitOrderFill",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly MethodInfo ConfigureFinancialAdvisorOrderMethod =
+            typeof(InteractiveBrokersBrokerage).GetMethod(
+                "ConfigureFinancialAdvisorOrder",
                 BindingFlags.Instance | BindingFlags.NonPublic);
 
         /// <summary>
@@ -359,6 +362,61 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void OptionExerciseBypassesUnifiedFinancialAdvisorOrderPathsTest()
+        {
+            const string unsupportedReason =
+                "Correct the unsupported FA topology in TWS and refresh.";
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            UnsupportedConfigurationErrorField.SetValue(
+                stateFixture.State,
+                unsupportedReason);
+            GroupTradingBlockedField.SetValue(stateFixture.State, true);
+            AccountStateField.SetValue(brokerage, stateFixture.State);
+            var order = new OptionExerciseOrder(
+                Symbols.SPY_C_192_Feb19_2016,
+                2m,
+                new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
+                properties: new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = "Percent"
+                });
+            var ibOrder = new IBApi.Order
+            {
+                Account = "OriginalAccount",
+                FaGroup = "OriginalGroup",
+                FaMethod = "OriginalMethod",
+                FaPercentage = "12.5",
+                TotalQuantity = 7m
+            };
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+            ConfigureFinancialAdvisorOrderMethod.Invoke(
+                brokerage,
+                new object[] { ibOrder, order });
+            var orderEvent = EmitOrderFill(
+                brokerage,
+                order,
+                1.5m,
+                1.5m);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual("OriginalAccount", ibOrder.Account);
+                Assert.AreEqual("OriginalGroup", ibOrder.FaGroup);
+                Assert.AreEqual("OriginalMethod", ibOrder.FaMethod);
+                Assert.AreEqual("12.5", ibOrder.FaPercentage);
+                Assert.AreEqual(7m, ibOrder.TotalQuantity);
+                Assert.AreEqual(2m, orderEvent.FillQuantity);
+                Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
+            });
+        }
+
+        [Test]
         public void ExactFillTreatsSubPrecisionResidualAsFilledTest()
         {
             var brokerage = CreateOfflineBrokerage();
@@ -498,9 +556,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "Correct the unsupported FA topology in TWS and refresh.";
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             UnsupportedConfigurationErrorField.SetValue(
                 state,
                 unsupportedReason);
@@ -609,8 +666,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
             FaFilterField.SetValue(brokerage, FaGroupName);
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             GroupTradingBlockedField.SetValue(state, true);
             AccountStateField.SetValue(brokerage, state);
 
@@ -645,9 +702,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
             FaFilterField.SetValue(brokerage, FaGroupName);
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             UnsupportedConfigurationErrorField.SetValue(state, unsupportedReason);
             SnapshotField.SetValue(
                 state,
@@ -695,9 +751,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
             FaFilterField.SetValue(brokerage, FaGroupName);
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             AccountStateField.SetValue(brokerage, state);
             var order = CreateOrder(new InteractiveBrokersOrderProperties
             {
@@ -719,9 +774,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
             FaFilterField.SetValue(brokerage, FaGroupName);
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             UnsupportedConfigurationErrorField.SetValue(
                 state,
                 "Placement-only unsupported topology.");
@@ -771,9 +825,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = 4m,
                     ["B"] = 6m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -809,9 +862,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = 4m,
                     ["B"] = 6m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -844,9 +896,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = 4m,
                     ["B"] = 6m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -901,9 +952,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = 4m,
                     ["B"] = 6m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -937,9 +987,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = 4m,
                     ["B"] = 6m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -979,9 +1028,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = 4m,
                     ["B"] = 6m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             UnsupportedConfigurationErrorField.SetValue(
                 state,
                 "Placement-only unsupported topology.");
@@ -1006,9 +1054,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             GroupTradingBlockedField.SetValue(state, true);
             SnapshotField.SetValue(
                 state,
@@ -1075,7 +1122,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void SavedPctChangeIsUnsupportedOnlyWithReadyAuthorityTest()
+        public void SavedPctChangeRequiresExplicitOrderLevelRoutingWithReadyAuthorityTest()
         {
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
@@ -1084,9 +1131,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 FaGroupName,
                 "PctChange",
                 new[] { "ManagedAccount" });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -1112,15 +1158,24 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             foreach (var order in new[]
             {
                 savedMethodOrder,
-                methodOnlyOrder,
-                explicitMethodOrder
+                methodOnlyOrder
             })
             {
-                StringAssert.Contains(
-                    "unsupported saved allocation method 'PctChange'",
-                    Assert.Throws<NotSupportedException>(() =>
-                        brokerage.ValidateFinancialAdvisorOrderAdmission(order)).Message);
+                var message = Assert.Throws<InvalidOperationException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(order)).Message;
+                Assert.Multiple(() =>
+                {
+                    StringAssert.Contains("Paper TWS can save this method", message);
+                    StringAssert.Contains("explicit order-level routing", message);
+                    StringAssert.Contains("FaGroup", message);
+                    StringAssert.Contains("FaMethod='PctChange'", message);
+                    StringAssert.Contains("valid FaPercentage", message);
+                    StringAssert.Contains("placeholder-quantity", message);
+                });
             }
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    explicitMethodOrder));
 
             SnapshotField.SetValue(
                 state,
@@ -1132,7 +1187,42 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     savedMethodOrder));
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    methodOnlyOrder));
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
                     explicitMethodOrder));
+        }
+
+        [TestCase("ContractsOrShares")]
+        [TestCase("Ratio")]
+        [TestCase("Percent")]
+        public void ExplicitPctChangeRejectsInconsistentSavedAllocationVectorTest(
+            string savedMethod)
+        {
+            var group = new BrokerageAccountGroup(
+                FaGroupName,
+                savedMethod,
+                new[] { "A", "B" },
+                new Dictionary<string, decimal>
+                {
+                    ["A"] = savedMethod == "Percent" ? 100m : 1m
+                });
+            var order = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                FaMethod = "PctChange",
+                FaPercentage = "25",
+                TotalQuantity = 0m
+            };
+
+            StringAssert.Contains(
+                "allocation keys must exactly match",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        CreateSnapshot(
+                            BrokerageAccountSnapshotStatus.Ready,
+                            group))).Message);
         }
 
         [TestCase(BrokerageAccountRelationship.Primary)]
@@ -1252,8 +1342,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 FaGroupName,
                 "NetLiq",
                 new[] { "ManagedAccount" });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup));
@@ -1379,8 +1469,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = firstAllocation,
                     ["B"] = secondAllocation
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup));
@@ -1478,9 +1568,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     ["A"] = 9.5m,
                     ["B"] = 10.25m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -1694,9 +1783,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 {
                     ["A"] = 1m
                 });
-            var state = (InteractiveBrokersFinancialAdvisorAccountState)
-                RuntimeHelpers.GetUninitializedObject(
-                    typeof(InteractiveBrokersFinancialAdvisorAccountState));
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            var state = stateFixture.State;
             SnapshotField.SetValue(
                 state,
                 CreateSnapshot(
@@ -1895,7 +1983,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "Percent",
                 "NetLiq",
                 "AvailableEquity",
-                "Equal"
+                "Equal",
+                "PctChange"
             };
             var requestedMethods = new[]
             {
@@ -1913,10 +2002,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 foreach (var requestedMethod in requestedMethods)
                 {
-                    var expectedAllowed = requestedMethod.Length == 0 ||
-                        requestedMethod == "PctChange" ||
-                        (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
-                        requestedMethod == savedMethod;
+                    var expectedAllowed = requestedMethod == "PctChange" ||
+                        savedMethod != "PctChange" &&
+                        (requestedMethod.Length == 0 ||
+                            (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
+                            requestedMethod == savedMethod);
                     yield return new TestCaseData(
                             savedMethod,
                             requestedMethod,
@@ -2189,6 +2279,30 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             return brokerage;
         }
 
+        private sealed class FinancialAdvisorAccountStateFixture : IDisposable
+        {
+            private readonly IB.InteractiveBrokersClient _client;
+
+            internal InteractiveBrokersFinancialAdvisorAccountState State { get; }
+
+            internal FinancialAdvisorAccountStateFixture()
+            {
+                _client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
+                State = new InteractiveBrokersFinancialAdvisorAccountState(
+                    _client,
+                    () => { },
+                    () => true,
+                    _ => Symbols.SPY,
+                    FaMasterAccount);
+            }
+
+            public void Dispose()
+            {
+                State.Dispose();
+                _client.Dispose();
+            }
+        }
+
         private sealed class GroupLockObservingOrderProvider :
             OrderProvider,
             IOrderProvider
@@ -2228,6 +2342,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
         }
 
+        /// <summary>
+        /// Exercises LEAN submission through the real FA admission and conversion methods,
+        /// stopping immediately before the Interactive Brokers socket write.
+        /// </summary>
         private sealed class FinancialAdvisorOrderBrokerage : BacktestingBrokerage
         {
             private readonly InteractiveBrokersBrokerage _interactiveBrokersBrokerage;
