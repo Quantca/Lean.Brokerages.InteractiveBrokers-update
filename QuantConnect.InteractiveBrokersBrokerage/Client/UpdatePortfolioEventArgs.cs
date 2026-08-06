@@ -116,7 +116,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <returns>A string that represents the current object.</returns>
         public override string ToString()
         {
-            return $"Contract: {Contract}, ConId: {Contract.ConId}, Position: {Position}, MarketPrice: {MarketPrice}, MarketValue: {MarketValue}, AverageCost: {AverageCost}, UnrealisedPnl: {UnrealisedPnl}, RealisedPnl: {RealisedPnl}, AccountName: {AccountName}";
+            return $"Contract: {Contract}, ConId: {Contract.ConId}, Position: {PositionQuantity}, MarketPrice: {MarketPrice}, MarketValue: {MarketValue}, AverageCost: {AverageCost}, UnrealisedPnl: {UnrealisedPnl}, RealisedPnl: {RealisedPnl}, AccountName: {AccountName}";
         }
     }
 }

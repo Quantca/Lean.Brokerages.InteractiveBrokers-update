@@ -207,11 +207,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void FractionalOptionPortfolioCallbacksPreserveExactQuantityAndFilterServiceRowsTest()
+        public void OutOfRangeFractionalOptionPortfolioCallbacksPreserveExactQuantityAndFilterServiceRowsTest()
         {
             using var scenario = LegacyAccountScenario.CreateConfigured(
                 GroupName,
                 unifiedGroupsEnabled: true);
+            var exactPosition = (decimal)int.MaxValue + 0.5m;
             var notificationCount = 0;
             var notificationPosition = 0m;
             scenario.Brokerage.OptionNotification += (_, eventArgs) =>
@@ -220,14 +221,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 notificationPosition = eventArgs.Position;
             };
 
-            scenario.EmitNonServiceFractionalOptionRow();
+            scenario.EmitNonServiceFractionalOptionRow(exactPosition);
             scenario.EmitServiceFractionalOptionRow();
 
             Assert.Multiple(() =>
             {
-                Assert.AreEqual(ExactPosition, scenario.GetHoldingQuantity());
+                Assert.AreEqual(exactPosition, scenario.GetHoldingQuantity());
                 Assert.AreEqual(1, notificationCount);
-                Assert.AreEqual(ExactPosition, notificationPosition);
+                Assert.AreEqual(exactPosition, notificationPosition);
             });
         }
 
@@ -448,11 +449,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     Currencies.USD);
             }
 
-            public void EmitNonServiceFractionalOptionRow()
+            public void EmitNonServiceFractionalOptionRow(decimal position)
             {
                 Client.updatePortfolio(
                     CreateOptionContract(),
-                    ExactPosition,
+                    position,
                     101,
                     176.75,
                     100.5,

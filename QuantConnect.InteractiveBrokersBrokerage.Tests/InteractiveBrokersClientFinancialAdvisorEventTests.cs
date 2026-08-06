@@ -15,6 +15,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using IBApi;
 using NUnit.Framework;
 using QuantConnect.Brokerages.InteractiveBrokers.Client;
@@ -495,6 +496,33 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
             Assert.Throws<OverflowException>(() => _ = updates[0].Position);
             Assert.Throws<OverflowException>(() => _ = updates[1].Position);
+        }
+
+        private static readonly decimal[] DiagnosticPositionQuantities =
+        {
+            (decimal)int.MaxValue + 0.5m,
+            (decimal)int.MinValue - 0.5m,
+            1.25m
+        };
+
+        [TestCaseSource(nameof(DiagnosticPositionQuantities))]
+        public void PortfolioEventDiagnosticsUseExactPositionQuantity(decimal position)
+        {
+            var update = new UpdatePortfolioEventArgs(
+                new Contract(),
+                position,
+                2,
+                3,
+                4,
+                5,
+                6,
+                "DU123");
+            string diagnostic = null;
+
+            Assert.DoesNotThrow(() => diagnostic = update.ToString());
+            StringAssert.Contains(
+                $"Position: {position.ToString(CultureInfo.CurrentCulture)}, MarketPrice:",
+                diagnostic);
         }
     }
 }
