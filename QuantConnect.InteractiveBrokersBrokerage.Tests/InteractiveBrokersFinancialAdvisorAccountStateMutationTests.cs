@@ -474,7 +474,102 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public async Task MalformedFreshMutationTopologyInvalidatesAuthority()
+        public async Task FinalMemberAssignmentFailureKeepsReadyAuthority()
+        {
+            const string groups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <defaultMethod>Ratio</defaultMethod>
+                    <ListOfAccts>
+                      <Account><acct>ACC1</acct><amount>1</amount></Account>
+                    </ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Beta</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts><String>ACC2</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new MutationScenario();
+            scenario.SetTopology("MASTER,ACC1,ACC2", groups);
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(state.RequestGroupAssignment(
+                "ACC1",
+                "Beta",
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            var failed = await AssignmentTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAssignmentStatus.Failed,
+                    failed.Status);
+                StringAssert.Contains("final account", failed.ErrorMessage);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreSame(ready, state.Snapshot);
+                Assert.AreEqual(
+                    ready.MembershipHash,
+                    state.Snapshot.MembershipHash);
+                Assert.AreEqual(
+                    ready.GroupConfigurationVersion,
+                    state.Snapshot.GroupConfigurationVersion);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
+        public async Task UnsupportedTargetTemplateFailureKeepsReadyAuthority()
+        {
+            const string groups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Beta</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts>
+                      <Account custom="preserve"><acct>ACC2</acct></Account>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new MutationScenario();
+            scenario.SetTopology("MASTER,ACC1,ACC2", groups);
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(state.RequestGroupAssignment(
+                "ACC1",
+                "Beta",
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
+            var failed = await AssignmentTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAssignmentStatus.Failed,
+                    failed.Status);
+                StringAssert.Contains("unsupported metadata", failed.ErrorMessage);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreSame(ready, state.Snapshot);
+                Assert.AreEqual(
+                    ready.MembershipHash,
+                    state.Snapshot.MembershipHash);
+                Assert.AreEqual(
+                    ready.GroupConfigurationVersion,
+                    state.Snapshot.GroupConfigurationVersion);
+                Assert.IsFalse(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [TestCase(1)]
+        [TestCase(2)]
+        public async Task MalformedMutationTopologyReadInvalidatesAuthority(
+            int groupsReadOffset)
         {
             const string malformedGroups = """
                 <ListOfGroups>
@@ -490,9 +585,54 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             using var scenario = new MutationScenario();
             using var state = scenario.CreateState();
             var ready = await ReadyAsync(state);
-            scenario.SetCurrentGroupsXml(malformedGroups);
+            scenario.OverrideGroupsResponse(
+                scenario.GroupsRequestCount + groupsReadOffset,
+                malformedGroups);
 
             Assert.IsTrue(RequestChangedAllocation(state, ready));
+            var failed = await AllocationTerminalAsync(state);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                    failed.Status);
+                StringAssert.Contains("contained no allocation method", failed.ErrorMessage);
+                StringAssert.Contains("reconciliation", failed.ErrorMessage);
+                Assert.AreEqual(0, scenario.ReplaceCount);
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Stale,
+                    state.Snapshot.Status);
+                Assert.IsTrue(state.IsGroupTradingBlocked);
+            });
+        }
+
+        [Test]
+        public async Task MalformedNoOpConfirmationReadInvalidatesAuthority()
+        {
+            const string malformedGroups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>Alpha</name>
+                    <ListOfAccts>
+                      <Account><acct>ACC1</acct><amount>1</amount></Account>
+                      <Account><acct>ACC2</acct><amount>2</amount></Account>
+                    </ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new MutationScenario();
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+            scenario.OverrideGroupsResponse(
+                scenario.GroupsRequestCount + 2,
+                malformedGroups);
+
+            Assert.IsTrue(state.RequestGroupAllocationUpdate(
+                "Alpha",
+                MutationScenario.CurrentAllocation(),
+                ready.MembershipHash,
+                ready.GroupConfigurationVersion));
             var failed = await AllocationTerminalAsync(state);
 
             Assert.Multiple(() =>
@@ -1634,6 +1774,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             private int _accountSummaryRequestCount;
             private int _accountSummaryCancellationCount;
             private int _accountUpdateRequestCount;
+            private int _overrideGroupsRequestNumber;
+            private string _overrideGroupsXml;
             private string _managedAccounts = "MASTER,ACC1,ACC2";
             private string _aliasesXml = EmptyAliasesXml;
             private FamilyCode[] _familyCodes = Array.Empty<FamilyCode>();
@@ -1673,7 +1815,16 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             {
                                 if (faDataType == 1)
                                 {
-                                    Interlocked.Increment(ref _groupsRequestCount);
+                                    var requestNumber = Interlocked.Increment(
+                                        ref _groupsRequestCount);
+                                    if (requestNumber == Volatile.Read(
+                                            ref _overrideGroupsRequestNumber))
+                                    {
+                                        Client.receiveFA(
+                                            faDataType,
+                                            Volatile.Read(ref _overrideGroupsXml));
+                                        return;
+                                    }
                                     var replacementXml =
                                         Volatile.Read(ref _replacementXml);
                                     if (replacementXml != null)
@@ -1776,6 +1927,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             internal void SetCurrentGroupsXml(string groupsXml) =>
                 Volatile.Write(ref _currentGroupsXml, groupsXml);
+
+            internal void OverrideGroupsResponse(int requestNumber, string groupsXml)
+            {
+                Volatile.Write(ref _overrideGroupsXml, groupsXml);
+                Volatile.Write(ref _overrideGroupsRequestNumber, requestNumber);
+            }
 
             internal void SetManagedAccounts(string managedAccounts) =>
                 _managedAccounts = managedAccounts;

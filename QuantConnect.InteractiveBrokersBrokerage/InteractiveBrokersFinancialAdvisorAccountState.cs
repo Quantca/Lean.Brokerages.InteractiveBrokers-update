@@ -1060,6 +1060,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             item.BrokerStateInvalidated = true;
             var topology = await ReadMutationTopologyAsync(item.Scope).ConfigureAwait(false);
             VerifyMutationVersions(item, topology);
+            item.BrokerStateInvalidated = false;
             var accountId = GetCanonicalManagedAccountId(
                 topology.ManagedAccountIds, item.AccountId);
             ValidateMutationScope(
@@ -1097,9 +1098,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 StringComparison.Ordinal);
             if (changed)
             {
+                item.BrokerStateInvalidated = true;
                 topology = await ReadMutationTopologyAsync(item.Scope)
                     .ConfigureAwait(false);
                 VerifyMutationVersions(item, topology);
+                item.BrokerStateInvalidated = false;
                 accountId = GetCanonicalManagedAccountId(
                     topology.ManagedAccountIds, item.AccountId);
                 ValidateMutationScope(
@@ -1130,11 +1133,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 expectedMembershipHash = ComputeMembershipHash(
                     expectedSelectedGroups, topology.ManagedAccountIds,
                     topology.Aliases, topology.FamilyCodes);
-                item.BrokerStateInvalidated = false;
                 EnsureNoOpenFinancialAdvisorOrders("account-group assignment");
                 await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
                 item.BrokerStateInvalidated = true;
             }
+            item.BrokerStateInvalidated = true;
             var confirmedXml = changed
                 ? await RequestExpectedGroupsXmlAsync(
                     item.Scope, expectedConfigurationVersion).ConfigureAwait(false)
@@ -1215,6 +1218,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             item.BrokerStateInvalidated = true;
             var topology = await ReadMutationTopologyAsync(item.Scope).ConfigureAwait(false);
             VerifyMutationVersions(item, topology);
+            item.BrokerStateInvalidated = false;
             ValidateMutationScope(
                 item.Scope, topology.AllGroups, null, item.GroupName);
             ValidateGroupAllocationUpdate(
@@ -1232,9 +1236,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 StringComparison.Ordinal);
             if (changed)
             {
+                item.BrokerStateInvalidated = true;
                 topology = await ReadMutationTopologyAsync(item.Scope)
                     .ConfigureAwait(false);
                 VerifyMutationVersions(item, topology);
+                item.BrokerStateInvalidated = false;
                 ValidateMutationScope(
                     item.Scope, topology.AllGroups, null, item.GroupName);
                 ValidateGroupAllocationUpdate(
@@ -1245,11 +1251,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 updatedXml = UpdateAccountGroupAllocationsXml(
                     topology.GroupsXml, item.GroupName, item.Allocations);
                 expectedConfigurationVersion = ComputeConfigurationHash(updatedXml);
-                item.BrokerStateInvalidated = false;
                 EnsureNoOpenFinancialAdvisorOrders("group allocation update");
                 await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
                 item.BrokerStateInvalidated = true;
             }
+            item.BrokerStateInvalidated = true;
             var confirmedXml = changed
                 ? await RequestExpectedGroupsXmlAsync(
                     item.Scope, expectedConfigurationVersion).ConfigureAwait(false)
