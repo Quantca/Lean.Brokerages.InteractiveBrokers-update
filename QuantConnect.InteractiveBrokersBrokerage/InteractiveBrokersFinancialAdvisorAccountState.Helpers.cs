@@ -419,6 +419,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             decimal? targetAllocationValue = null)
         {
             var document = XDocument.Parse(xml, LoadOptions.PreserveWhitespace);
+            foreach (var accountElement in document.Descendants()
+                .Where(IsAccountContainer)
+                .SelectMany(container => container.Elements().Where(IsAccountElement)))
+            {
+                ValidateAccountScalarFields(accountElement);
+            }
             CanonicalizeKnownGroupAllocationMethods(document);
             var groupElements = document.Descendants()
                 .Where(element => NameEquals(element, "Group"))
@@ -1414,6 +1420,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             XElement accountElement,
             bool throwOnFailure = true)
         {
+            var hasStructuredIdentifier = NameEquals(accountElement, "Account") &&
+                (accountElement.Attributes().Any(IsAccountIdentifierAttribute) ||
+                 accountElement.Elements().Any(IsAccountIdentifierElement));
+            var hasDirectTextIdentifier = accountElement.Nodes()
+                .OfType<XText>()
+                .Any(text => !string.IsNullOrWhiteSpace(text.Value));
+            if (hasStructuredIdentifier && hasDirectTextIdentifier)
+            {
+                if (throwOnFailure)
+                {
+                    throw new InvalidOperationException(
+                        "The Financial Advisor account element combines a structured account identifier with direct text.");
+                }
+                return false;
+            }
             var unsupportedField =
                 (NameEquals(accountElement, "String") || NameEquals(accountElement, "AccountId")) &&
                 accountElement.HasElements

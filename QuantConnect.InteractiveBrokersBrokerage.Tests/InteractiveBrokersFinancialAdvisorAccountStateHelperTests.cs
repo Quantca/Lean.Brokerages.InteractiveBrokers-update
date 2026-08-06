@@ -582,6 +582,60 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.IsFalse(account.Elements().Any());
         }
 
+        [TestCase("<Account acct=\"PaperA\">PaperA</Account>")]
+        [TestCase("<Account><acct>PaperA</acct>PaperA</Account>")]
+        public void MixedStructuredAndDirectTextAccountIdentifiersAreRejected(string accountElement)
+        {
+            var xml = $"""
+                <ListOfGroups><Group><name>Group</name><defaultMethod>NetLiq</defaultMethod>
+                  <ListOfAccts>{accountElement}</ListOfAccts>
+                </Group></ListOfGroups>
+                """;
+
+            var exception = Assert.Throws<InvalidOperationException>(() =>
+                InteractiveBrokersFinancialAdvisorAccountState.ParseGroups(xml));
+
+            StringAssert.Contains("structured account identifier with direct text", exception.Message);
+        }
+
+        [TestCase("<Account acct=\"PaperA\">\n  </Account>")]
+        [TestCase("<Account>\n  <acct>PaperA</acct>\n</Account>")]
+        public void StructuredAccountIdentifiersAllowFormattingWhitespace(string accountElement)
+        {
+            var xml = $"""
+                <ListOfGroups><Group><name>Group</name><defaultMethod>NetLiq</defaultMethod>
+                  <ListOfAccts>{accountElement}</ListOfAccts>
+                </Group></ListOfGroups>
+                """;
+
+            var group = InteractiveBrokersFinancialAdvisorAccountState.ParseGroups(xml)["Group"];
+
+            CollectionAssert.AreEqual(new[] { "PaperA" }, group.AccountIds);
+        }
+
+        [Test]
+        public void AssignmentPreflightRejectsMixedAccountIdentifiersOutsideTheMutationTarget()
+        {
+            const string xml = """
+                <ListOfGroups>
+                  <Group><name>Source</name><defaultMethod>NetLiq</defaultMethod><ListOfAccts>
+                    <Account acct="PaperA">PaperA</Account><String>PaperB</String>
+                  </ListOfAccts></Group>
+                  <Group><name>Destination</name><defaultMethod>NetLiq</defaultMethod><ListOfAccts>
+                    <String>PaperC</String>
+                  </ListOfAccts></Group>
+                </ListOfGroups>
+                """;
+
+            var exception = Assert.Throws<InvalidOperationException>(() =>
+                InteractiveBrokersFinancialAdvisorAccountState.UpdateAccountGroupAssignmentXml(
+                    xml,
+                    "PaperB",
+                    "Destination"));
+
+            StringAssert.Contains("structured account identifier with direct text", exception.Message);
+        }
+
         [Test]
         public void AssignmentRejectsUnsupportedSiblingMetadataForANewAccount()
         {
