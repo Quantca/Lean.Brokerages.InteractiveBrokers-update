@@ -3108,8 +3108,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
-        [Test]
-        public async Task OverlappingGroupValidatesAlreadyResolvedMemberBaseCurrencyTest()
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task FailedOverlappingGroupFallsBackEveryInScopeMemberTest(
+            bool rejectSecondSummary)
         {
             const string overlappingGroups = """
                 <ListOfGroups>
@@ -3147,6 +3149,16 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 }
                 else
                 {
+                    if (rejectSecondSummary)
+                    {
+                        scenario.Client.error(
+                            requestId,
+                            0,
+                            321,
+                            "simulated overlapping-group summary rejection",
+                            string.Empty);
+                        return;
+                    }
                     scenario.EmitValidSummaryAccount(requestId, "ACC2", "USD");
                     scenario.EmitValidSummaryAccount(requestId, "ACC3", "EUR");
                     scenario.EmitAggregateCash(
@@ -3164,11 +3176,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
                 Assert.AreEqual(2, scenario.SummaryRequests.Count);
                 CollectionAssert.AreEqual(
-                    new[] { "ACC3" },
+                    new[] { "ACC2", "ACC3" },
                     scenario.Requests.Where(request => request.StartsWith("account:"))
                         .Select(request => request[8..]));
                 Assert.AreEqual(1100.25m, snapshot.Accounts["ACC1"].NetLiquidation);
-                Assert.AreEqual(1100.25m, snapshot.Accounts["ACC2"].NetLiquidation);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC2"].NetLiquidation);
                 Assert.AreEqual(1000.25m, snapshot.Accounts["ACC3"].NetLiquidation);
             });
         }

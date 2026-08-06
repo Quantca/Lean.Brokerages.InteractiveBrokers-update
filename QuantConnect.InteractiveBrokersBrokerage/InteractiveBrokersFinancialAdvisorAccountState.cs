@@ -1656,6 +1656,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 StringComparer.OrdinalIgnoreCase);
             var summaryIneligibleAccounts = new HashSet<string>(
                 StringComparer.OrdinalIgnoreCase);
+            void ResetGroupToExactCollection(BrokerageAccountGroup group)
+            {
+                foreach (var accountId in group.AccountIds.Where(builders.ContainsKey))
+                {
+                    summaryIneligibleAccounts.Add(accountId);
+                    unresolvedAccounts.Add(accountId);
+                    builders[accountId] = new AccountValueBuilder(
+                        accountId, GetAccountGroupNames(allGroups, accountId));
+                }
+            }
             var summaryFallbacks = new List<string>();
             var summaryFallbackCount = 0;
             if (_requests.RequestAccountSummary != null &&
@@ -1694,6 +1704,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             group.Name,
                             $"RequestFailure ({exception.GetType().Name}): " +
                             exception.Message);
+                        ResetGroupToExactCollection(group);
                         break;
                     }
 
@@ -1711,7 +1722,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             ref summaryFallbackCount,
                             group.Name,
                             fallback);
-                        summaryIneligibleAccounts.UnionWith(membersToCollect);
+                        ResetGroupToExactCollection(group);
                         continue;
                     }
                     foreach (var pair in summaryBuilders)
