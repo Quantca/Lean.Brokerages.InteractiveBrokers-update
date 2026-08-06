@@ -425,10 +425,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="currency">The currency in which the parameter value is denominated.</param>
         public override void accountUpdateMulti(int requestId, string account, string modelCode, string key, string value, string currency)
         {
-            var args = new AccountUpdateMultiEventArgs(requestId, account, modelCode, key, value, currency);
+            var accountUpdateMultiWithRequestId = AccountUpdateMultiWithRequestId;
             try
             {
-                OnAccountUpdateMultiWithRequestId(args);
+                accountUpdateMultiWithRequestId?.Invoke(
+                    this,
+                    new AccountUpdateMultiEventArgs(
+                        requestId,
+                        account,
+                        modelCode,
+                        key,
+                        value,
+                        currency));
             }
             finally
             {
@@ -470,16 +478,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <param name="averageCost">The average cost of the position.</param>
         public override void positionMulti(int requestId, string account, string modelCode, Contract contract, decimal position, double averageCost)
         {
-            var args = new PositionMultiEventArgs(
-                requestId,
-                account,
-                modelCode,
-                contract,
-                position,
-                averageCost);
+            var positionMulti = PositionMulti;
             try
             {
-                OnPositionMulti(args);
+                positionMulti?.Invoke(
+                    this,
+                    new PositionMultiEventArgs(
+                        requestId,
+                        account,
+                        modelCode,
+                        contract,
+                        position,
+                        averageCost));
             }
             finally
             {
@@ -1031,29 +1041,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         }
 
         /// <summary>
-        /// AccountUpdateMultiWithRequestId event invocator
-        /// </summary>
-        /// <param name="e">Event arguments preserving the IB request and model identifiers.</param>
-        private void OnAccountUpdateMultiWithRequestId(AccountUpdateMultiEventArgs e)
-        {
-            AccountUpdateMultiWithRequestId?.Invoke(this, e);
-        }
-
-        /// <summary>
         /// AccountUpdateMultiEnd event invocator
         /// </summary>
         protected void OnAccountUpdateMultiEnd(AccountUpdateMultiEndEventArgs e)
         {
             AccountUpdateMultiEnd?.Invoke(this, e);
-        }
-
-        /// <summary>
-        /// PositionMulti event invocator
-        /// </summary>
-        /// <param name="e">Position update event arguments.</param>
-        private void OnPositionMulti(PositionMultiEventArgs e)
-        {
-            PositionMulti?.Invoke(this, e);
         }
 
         /// <summary>

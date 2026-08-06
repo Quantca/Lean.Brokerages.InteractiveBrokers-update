@@ -2556,6 +2556,153 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [Test]
+        [NonParallelizable]
+        public async Task GroupAccountNameCollisionFallsBackToExactPositionsTest()
+        {
+            const string collisionGroups = """
+                <ListOfGroups>
+                  <Group>
+                    <name>acc1</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts>
+                      <String>ACC2</String>
+                      <String>ACC3</String>
+                    </ListOfAccts>
+                  </Group>
+                  <Group>
+                    <name>Beta</name>
+                    <defaultMethod>Equal</defaultMethod>
+                    <ListOfAccts><String>ACC3</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            var originalLogHandler = Log.LogHandler;
+            var logHandler = new QueueLogHandler();
+            Log.LogHandler = logHandler;
+            try
+            {
+                using var scenario = new Scenario
+                {
+                    GroupsDocument = collisionGroups,
+                    EndingGroupsDocument = collisionGroups
+                };
+                scenario.Actions.RequestPositions =
+                    (requestId, accountOrGroup, authorize) =>
+                        scenario.RunAuthorized(authorize, () =>
+                        {
+                            scenario.Requests.Add($"positions:{accountOrGroup}");
+                            scenario.KeyedRequestIds.Add(requestId);
+                            if (accountOrGroup == "Beta")
+                            {
+                                scenario.Client.positionMulti(
+                                    requestId,
+                                    "ACC3",
+                                    "Model-B",
+                                    Scenario.MappedContract(),
+                                    3m,
+                                    103d);
+                            }
+                            else if (accountOrGroup == "ACC2")
+                            {
+                                scenario.Client.positionMulti(
+                                    requestId,
+                                    "ACC2",
+                                    "Model-A",
+                                    Scenario.MappedContract(),
+                                    2m,
+                                    102d);
+                            }
+                            scenario.Client.positionMultiEnd(requestId);
+                        });
+                using var state = scenario.CreateState();
+
+                var snapshot = await RunRefreshAsync(
+                    state,
+                    () => state.RequestRefresh(new[] { "ACC1", "Beta" }));
+                var positionRequests = scenario.Requests.Where(request =>
+                    request.StartsWith("positions:", StringComparison.Ordinal)).ToArray();
+                var fallbackMessage = logHandler.Logs.Single(entry =>
+                    entry.MessageType == LogType.Error && entry.Message.Contains(
+                        "FA group 'acc1' conflicts with managed account 'ACC1'",
+                        StringComparison.Ordinal)).Message;
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                    CollectionAssert.AreEqual(
+                        new[] { "positions:Beta", "positions:ACC2" },
+                        positionRequests);
+                    Assert.AreEqual(
+                        2m, snapshot.Accounts["ACC2"].Positions.Single().Quantity);
+                    Assert.AreEqual(
+                        3m, snapshot.Accounts["ACC3"].Positions.Single().Quantity);
+                    Assert.IsNull(state.UnsupportedConfigurationError);
+                    StringAssert.Contains(
+                        "members not covered by another selected group will use " +
+                        "per-account collection", fallbackMessage);
+                });
+            }
+            finally
+            {
+                Log.LogHandler = originalLogHandler;
+                logHandler.Dispose();
+            }
+        }
+
+        [Test]
+        public async Task GroupAccountNameCollisionExactPositionsRejectForeignRowsTest()
+        {
+            const string collisionGroup = """
+                <ListOfGroups>
+                  <Group>
+                    <name>aCc1</name>
+                    <defaultMethod>NetLiq</defaultMethod>
+                    <ListOfAccts><String>ACC2</String></ListOfAccts>
+                  </Group>
+                </ListOfGroups>
+                """;
+            using var scenario = new Scenario
+            {
+                GroupsDocument = collisionGroup,
+                EndingGroupsDocument = collisionGroup
+            };
+            scenario.Actions.RequestPositions =
+                (requestId, accountOrGroup, authorize) =>
+                    scenario.RunAuthorized(authorize, () =>
+                    {
+                        scenario.Requests.Add($"positions:{accountOrGroup}");
+                        scenario.KeyedRequestIds.Add(requestId);
+                        scenario.Client.positionMulti(
+                            requestId,
+                            "ACC3",
+                            "Model-A",
+                            Scenario.MappedContract(),
+                            1m,
+                            100d);
+                        scenario.Client.positionMultiEnd(requestId);
+                    });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "aCC1" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(
+                    BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
+                StringAssert.Contains(
+                    "Position response for 'ACC2' contained account 'ACC3'",
+                    snapshot.ErrorMessage);
+                CollectionAssert.AreEqual(
+                    new[] { "positions:ACC2" },
+                    scenario.Requests.Where(request =>
+                        request.StartsWith("positions:", StringComparison.Ordinal)));
+                Assert.IsNull(state.UnsupportedConfigurationError);
+            });
+        }
+
         [TestCase(true)]
         [TestCase(false)]
         public async Task PositionRowsMustMatchTheirRequestedGroupOrAccountTest(

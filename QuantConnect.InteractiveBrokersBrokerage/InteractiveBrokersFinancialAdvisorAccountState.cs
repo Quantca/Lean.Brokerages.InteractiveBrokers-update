@@ -889,7 +889,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             internal string ExpectedConfigurationVersion;
             internal BrokerageAccountGroupAssignment Assignment;
             internal BrokerageAccountGroupAllocationUpdate Allocation;
-            internal bool ReplacementStarted;
+            internal volatile bool ReplacementStarted;
             internal bool ReplacementRejected;
             internal bool BrokerStateInvalidated;
             internal long PhysicalConnectionEpoch;
@@ -1416,13 +1416,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             pending.WireSent = true;
                             return true;
                         }),
-                    cancellation: false);
+                    cancellation: false,
+                    replacementItem: item);
                 if (!sent)
                 {
                     await pending.Completion.Task.ConfigureAwait(false);
                     return;
                 }
-                item.ReplacementStarted = true;
                 await AwaitPendingAsync(
                     pending,
                     "Financial Advisor configuration replacement",
@@ -1430,7 +1430,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             catch
             {
-                item.ReplacementStarted = pending.WireSent;
                 item.ReplacementRejected = pending.ExplicitlyRejected;
                 throw;
             }
@@ -1621,6 +1620,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             foreach (var group in selectedGroups.Values
                 .OrderBy(group => group.Name, StringComparer.OrdinalIgnoreCase))
             {
+                if (managed.Contains(group.Name))
+                {
+                    var conflictingAccountId = GetCanonicalManagedAccountId(
+                        managedAccountIds, group.Name);
+                    Log.Error(
+                        $"InteractiveBrokersFinancialAdvisorAccountState: FA group " +
+                        $"'{group.Name}' conflicts with managed account " +
+                        $"'{conflictingAccountId}'; " +
+                        "skipping the ambiguous group-position request; members not " +
+                        "covered by another selected group will use per-account collection.");
+                    continue;
+                }
                 var expected = group.AccountIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
                 foreach (var row in await RequestPositionsAsync(scope, group.Name)
                     .ConfigureAwait(false))
@@ -2572,7 +2583,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         private bool PaceAndInvoke(
-            PendingRequest pending, WireAction action, bool cancellation)
+            PendingRequest pending,
+            WireAction action,
+            bool cancellation,
+            WorkItem replacementItem = null)
         {
             _disposeTokenSource.Token.ThrowIfCancellationRequested();
             _requestRateGate.WaitToProceed();
@@ -2605,6 +2619,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         return false;
                     }
                     authorizationGranted = true;
+                    if (replacementItem != null)
+                    {
+                        // Serialize replacement ambiguity with disposal at authorization.
+                        replacementItem.ReplacementStarted = true;
+                    }
                     return true;
                 }
             }

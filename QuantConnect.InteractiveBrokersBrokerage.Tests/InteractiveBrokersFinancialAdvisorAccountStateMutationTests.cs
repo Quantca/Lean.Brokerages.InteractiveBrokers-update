@@ -108,7 +108,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public async Task ReplacementAmbiguityStartsAfterWireCallTest()
+        public async Task ReplacementAmbiguityStartsAtAuthorizationTest()
         {
             using (var preWireScenario = new MutationScenario
             {
@@ -187,6 +187,45 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     reconciled.Status);
                 Assert.IsFalse(postWireState.IsGroupTradingBlocked);
             }
+        }
+
+        [Test]
+        public async Task DisposeAfterReplacementAuthorizationPreservesAmbiguityTest()
+        {
+            using var scenario = new MutationScenario
+            {
+                Replacement = ReplacementBehavior.BlockAfterAuthorization
+            };
+            using var state = scenario.CreateState();
+            var ready = await ReadyAsync(state);
+
+            Assert.IsTrue(RequestChangedAllocation(state, ready));
+            Assert.IsTrue(
+                scenario.ReplacementAuthorized.Wait(TimeSpan.FromSeconds(10)));
+            var worker = GetWorker(state);
+            try
+            {
+                state.Dispose();
+                var failed = state.GroupAllocationUpdate;
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(
+                        BrokerageAccountGroupAllocationUpdateStatus.Failed,
+                        failed.Status);
+                    StringAssert.Contains(
+                        "replaceFA may have applied", failed.ErrorMessage);
+                    Assert.AreEqual(
+                        BrokerageAccountSnapshotStatus.Stale,
+                        state.Snapshot.Status);
+                    Assert.IsTrue(state.IsGroupTradingBlocked);
+                });
+            }
+            finally
+            {
+                scenario.ReleaseReplacement();
+            }
+            await worker.WaitAsync(TimeSpan.FromSeconds(5));
         }
 
         [Test]
@@ -1676,6 +1715,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             WrongIdsThenSuccess,
             ThrowBeforeAuthorization,
             ThrowAfterAuthorization,
+            BlockAfterAuthorization,
             ReturnWithoutCompletion,
             EndWithoutApplying,
             InvalidAccountsError,
@@ -1724,6 +1764,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
             internal object CallbackStateLock { get; set; }
             internal ManualResetEventSlim ManagedRequestEntered { get; } = new();
+            internal ManualResetEventSlim ReplacementAuthorized { get; } = new();
             internal ManualResetEventSlim WrongReplacementCallbacksSent { get; } = new();
             internal int ManagedRequestCount => Volatile.Read(ref _managedRequestCount);
             internal int GroupsRequestCount => Volatile.Read(ref _groupsRequestCount);
@@ -1780,6 +1821,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             private string _aliasesXml = EmptyAliasesXml;
             private FamilyCode[] _familyCodes = Array.Empty<FamilyCode>();
             private readonly ManualResetEventSlim _releaseManagedRequest = new(true);
+            private readonly ManualResetEventSlim _releaseReplacement = new();
 
             internal MutationScenario()
             {
@@ -1981,6 +2023,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             internal void ReleaseManagedRequest() => _releaseManagedRequest.Set();
 
+            internal void ReleaseReplacement() => _releaseReplacement.Set();
+
             internal void CompleteExactReplacement()
             {
                 var replacementXml = Volatile.Read(ref _replacementXml);
@@ -2034,6 +2078,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         case ReplacementBehavior.ThrowAfterAuthorization:
                             throw new InvalidOperationException(
                                 "replaceFA failed after authorization.");
+
+                        case ReplacementBehavior.BlockAfterAuthorization:
+                            ReplacementAuthorized.Set();
+                            if (!_releaseReplacement.Wait(TimeSpan.FromSeconds(10)))
+                            {
+                                throw new TimeoutException(
+                                    "Test replacement request was not released.");
+                            }
+                            break;
 
                         case ReplacementBehavior.ReturnWithoutCompletion:
                             break;
@@ -2212,9 +2265,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             public void Dispose()
             {
                 _releaseManagedRequest.Set();
+                _releaseReplacement.Set();
                 ManagedRequestEntered.Dispose();
+                ReplacementAuthorized.Dispose();
                 WrongReplacementCallbacksSent.Dispose();
                 _releaseManagedRequest.Dispose();
+                _releaseReplacement.Dispose();
                 Client.Dispose();
             }
         }

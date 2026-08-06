@@ -131,6 +131,35 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void PublicKeyedCallbacksRemainAvailableWithoutInternalSubscribers()
+        {
+            using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
+            UpdateAccountValueEventArgs accountUpdate = null;
+            UpdatePortfolioEventArgs positionUpdate = null;
+            client.AccountUpdateMulti += (_, args) => accountUpdate = args;
+            client.UpdatePortfolio += (_, args) => positionUpdate = args;
+
+            var contract = new Contract { ConId = 756733, Symbol = "SPY", SecType = "STK" };
+            client.accountUpdateMulti(17, "DU123", "ModelA", "NetLiquidation", "1000", "USD");
+            client.positionMulti(18, "DU123", "ModelA", contract, 1.25m, 100.5);
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual("NetLiquidation", accountUpdate.Key);
+                Assert.AreEqual("1000", accountUpdate.Value);
+                Assert.AreEqual("USD", accountUpdate.Currency);
+                Assert.AreEqual("DU123", accountUpdate.AccountName);
+                Assert.AreEqual(17, accountUpdate.AccountUpdatesMultiRequestId);
+
+                Assert.AreSame(contract, positionUpdate.Contract);
+                Assert.AreEqual(1.25m, positionUpdate.PositionQuantity);
+                Assert.AreEqual(100.5, positionUpdate.AverageCost);
+                Assert.AreEqual("DU123", positionUpdate.AccountName);
+                Assert.AreEqual(18, positionUpdate.PositionsMultiRequestId);
+            });
+        }
+
+        [Test]
         public void UnkeyedCallbacksPreservePublicEventsAndAddInternalEvents()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
