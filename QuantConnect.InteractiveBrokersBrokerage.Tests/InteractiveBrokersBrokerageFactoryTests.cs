@@ -20,6 +20,7 @@ using System.Reflection;
 using NUnit.Framework;
 using QuantConnect.Algorithm;
 using QuantConnect.Brokerages.InteractiveBrokers;
+using QuantConnect.Configuration;
 using QuantConnect.Interfaces;
 using QuantConnect.Packets;
 using QuantConnect.Securities;
@@ -223,6 +224,27 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var exception = Assert.Throws<Exception>(() => factory.CreateBrokerage(job, AlgorithmDependency));
 
             StringAssert.Contains("requires 'ib-financial-advisors-unified-groups-enabled=true'", exception.Message);
+        }
+
+        [TestCase("true")]
+        [TestCase("false")]
+        [NonParallelizable]
+        public void ExportsFinancialAdvisorUnifiedGroupsSettingInBrokerageData(string value)
+        {
+            const string key = "ib-financial-advisors-unified-groups-enabled";
+            var originalValue = Config.Get(key);
+
+            try
+            {
+                Config.Set(key, value);
+                using var factory = new InteractiveBrokersBrokerageFactory();
+
+                Assert.AreEqual(value, factory.BrokerageData[key]);
+            }
+            finally
+            {
+                Config.Set(key, originalValue);
+            }
         }
 
         class InteractiveBrokersBrokerageFactoryAlgorithmDependency : QCAlgorithm
