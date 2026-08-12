@@ -309,9 +309,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         internal bool IsExpectedGroupsReadbackRetry(ErrorEventArgs error)
         {
-            if (error == null ||
-                error.Code != FinancialAdvisorUnsavedChangesErrorCode ||
-                error.Id is not (-1 or 0))
+            if (!IsFinancialAdvisorUnsavedChangesError(error))
             {
                 return false;
             }
@@ -327,6 +325,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 };
             }
         }
+
+        private static bool IsFinancialAdvisorUnsavedChangesError(
+            ErrorEventArgs error) =>
+                error != null &&
+                error.Code == FinancialAdvisorUnsavedChangesErrorCode &&
+                (error.Id is -1 or 0 || error.Id == int.MaxValue);
 
         private static bool IsServiceRequestIdInAllocatorRange(int requestId) =>
             requestId <= -2;
@@ -1593,11 +1597,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 throw new UnsupportedFinancialAdvisorConfigurationException(
                     exception.Message + " Correct the group membership in TWS and refresh.");
             }
-            var topologyDirectory = BuildAccountDirectory(
-                primaryAccountId, managedAccountIds, allGroups, familyCodes,
-                new Dictionary<string, BrokerageAccountState>(), aliases);
-            ValidateSupportedGroupAccountRelationships(selectedGroups, topologyDirectory);
-
             var managed = managedAccountIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
             var accountsToCollect = (scope.CompleteDiscovery
                     ? managedAccountIds
@@ -1932,11 +1931,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _ => new List<AccountSummaryEventArgs>(),
                 StringComparer.OrdinalIgnoreCase);
             var detectorRows = new List<AccountSummaryEventArgs>();
-            var detectorAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var unexpectedRows = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Only group-member rows can populate child builders. Eligible non-member cash rows
-            // are isolated as aggregate detector input; no non-member row is applied to a child.
+            // Only group-member rows can populate child builders. Only CashBalance rows attributed
+            // to All are eligible detector input; no nonmember row is applied to a child.
             foreach (var row in rows ?? Array.Empty<AccountSummaryEventArgs>())
             {
                 var accountId = row?.Account?.Trim() ?? string.Empty;
@@ -1955,29 +1953,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     continue;
                 }
-                if (IsRequiredAccountSummaryTag(tag))
+                if (accountId.Equals("All", StringComparison.OrdinalIgnoreCase))
                 {
-                    unexpectedRows.Add($"{accountId}:{tag}");
+                    if (tag.Equals("CashBalance", StringComparison.OrdinalIgnoreCase))
+                    {
+                        detectorRows.Add(row);
+                    }
                     continue;
                 }
-                detectorAccounts.Add(accountId);
-                if (tag.Equals("CashBalance", StringComparison.OrdinalIgnoreCase))
-                {
-                    detectorRows.Add(row);
-                }
+                unexpectedRows.Add($"{accountId}:{tag}");
             }
 
             if (unexpectedRows.Count != 0)
             {
                 fallback = "UnexpectedAccounts rows=[" + string.Join(",", unexpectedRows
                     .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)) + "]";
-                return false;
-            }
-            if (detectorAccounts.Count > 1)
-            {
-                fallback = "InconsistentAggregateAttribution accounts=[" +
-                    string.Join(",", detectorAccounts.OrderBy(
-                        accountId => accountId, StringComparer.OrdinalIgnoreCase)) + "]";
                 return false;
             }
 
@@ -2271,9 +2261,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 NumberStyles.Float,
                 CultureInfo.InvariantCulture,
                 out _);
-
-        private static bool IsRequiredAccountSummaryTag(string tag) =>
-            RequiredAccountSummaryTags.Contains(tag, StringComparer.OrdinalIgnoreCase);
 
         private async Task<string> RequestManagedAccountsAsync(
             SnapshotScope scope, bool useHandshakeCache = true)
@@ -3041,8 +3028,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
             var retryUnsavedChanges =
-                args.Code == FinancialAdvisorUnsavedChangesErrorCode &&
-                args.Id is -1 or 0;
+                IsFinancialAdvisorUnsavedChangesError(args);
             if (args.Id is -1 or 0 && !retryUnsavedChanges)
             {
                 return;

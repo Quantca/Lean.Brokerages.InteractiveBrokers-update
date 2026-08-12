@@ -17,6 +17,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using QuantConnect.Algorithm;
 using QuantConnect.Brokerages.InteractiveBrokers;
@@ -160,6 +161,21 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             return parameters;
         }
 
+        private static LiveNodePacket CreateJob()
+        {
+            return new LiveNodePacket
+            {
+                BrokerageData = new Dictionary<string, string>
+                {
+                    ["ib-account"] = "DU1234567",
+                    ["ib-user-name"] = "user",
+                    ["ib-password"] = "password",
+                    ["ib-trading-mode"] = "paper",
+                    ["ib-agent-description"] = "I"
+                }
+            };
+        }
+
         [Test]
         public void InitializesInstanceFromComposer()
         {
@@ -203,6 +219,64 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             StringAssert.Contains("must be either 'true' or 'false'", exception.Message);
         }
 
+        [TestCase(null, null, null, null, false, false)]
+        [TestCase("  Group Name  ", "", " ", "  Group Name  ", false, false)]
+        [TestCase("Group", "false", "true", "Group", false, true)]
+        [TestCase("Group", "true", "true", "Group", true, true)]
+        public void ParsesFinancialAdvisorSettings(
+            string filter,
+            string groupManagement,
+            string unifiedGroups,
+            string expectedFilter,
+            bool expectedGroupManagement,
+            bool expectedUnifiedGroups)
+        {
+            var brokerageData = new Dictionary<string, string>();
+            if (filter != null)
+            {
+                brokerageData["ib-financial-advisors-group-filter"] = filter;
+            }
+            if (groupManagement != null)
+            {
+                brokerageData["ib-financial-advisors-group-management-enabled"] = groupManagement;
+            }
+            if (unifiedGroups != null)
+            {
+                brokerageData["ib-financial-advisors-unified-groups-enabled"] = unifiedGroups;
+            }
+            var errors = new List<string>();
+
+            InteractiveBrokersBrokerageFactory.ParseFinancialAdvisorSettings(
+                brokerageData,
+                errors,
+                out var parsedFilter,
+                out var parsedGroupManagement,
+                out var parsedUnifiedGroups);
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsEmpty(errors);
+                Assert.AreEqual(expectedFilter, parsedFilter);
+                Assert.AreEqual(expectedGroupManagement, parsedGroupManagement);
+                Assert.AreEqual(expectedUnifiedGroups, parsedUnifiedGroups);
+            });
+        }
+
+        [TestCase("ib-financial-advisors-group-management-enabled")]
+        [TestCase("ib-financial-advisors-unified-groups-enabled")]
+        public void RejectsInvalidFinancialAdvisorBooleanBeforeSetJobInitialization(
+            string setting)
+        {
+            using var brokerage = new InteractiveBrokersBrokerage();
+            var job = CreateJob();
+            job.BrokerageData[setting] = "not-a-boolean";
+
+            var exception = Assert.Throws<ArgumentException>(() =>
+                brokerage.SetJob(job));
+
+            StringAssert.Contains("must be either 'true' or 'false'", exception.Message);
+        }
+
         [Test]
         public void RejectsFinancialAdvisorGroupManagementWithoutUnifiedGroups()
         {
@@ -226,24 +300,90 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             StringAssert.Contains("requires 'ib-financial-advisors-unified-groups-enabled=true'", exception.Message);
         }
 
+        [Test]
+        public void RejectsFinancialAdvisorGroupManagementWithoutUnifiedGroupsBeforeSetJobInitialization()
+        {
+            using var brokerage = new InteractiveBrokersBrokerage();
+            var job = CreateJob();
+            job.BrokerageData["ib-financial-advisors-group-management-enabled"] = "true";
+            job.BrokerageData["ib-financial-advisors-unified-groups-enabled"] = "false";
+
+            var exception = Assert.Throws<ArgumentException>(() =>
+                brokerage.SetJob(job));
+
+            StringAssert.Contains(
+                "requires 'ib-financial-advisors-unified-groups-enabled=true'",
+                exception.Message);
+        }
+
         [TestCase("true")]
         [TestCase("false")]
         [NonParallelizable]
         public void ExportsFinancialAdvisorUnifiedGroupsSettingInBrokerageData(string value)
         {
             const string key = "ib-financial-advisors-unified-groups-enabled";
-            var originalValue = Config.Get(key);
+            using var configScope = new ConfigValueScope(key);
 
-            try
+            Config.Set(key, value);
+            using var factory = new InteractiveBrokersBrokerageFactory();
+
+            Assert.AreEqual(value, factory.BrokerageData[key]);
+        }
+
+        [Test]
+        [NonParallelizable]
+        public void ConfigValueScopeRestoresMissingAndExplicitlyEmptyValues()
+        {
+            const string key = "interactive-brokers-factory-test-setting";
+            using var originalScope = new ConfigValueScope(key);
+            RemoveConfigValue(key);
+
+            using (new ConfigValueScope(key))
             {
-                Config.Set(key, value);
-                using var factory = new InteractiveBrokersBrokerageFactory();
-
-                Assert.AreEqual(value, factory.BrokerageData[key]);
+                Config.Set(key, "temporary");
             }
-            finally
+            Assert.IsNull(Config.GetToken(key));
+
+            Config.Set(key, "");
+            using (new ConfigValueScope(key))
             {
-                Config.Set(key, originalValue);
+                Config.Set(key, "temporary");
+            }
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(JTokenType.String, Config.GetToken(key)?.Type);
+                Assert.AreEqual(string.Empty, Config.Get(key));
+            });
+        }
+
+        private static void RemoveConfigValue(string key)
+        {
+            Config.GetToken(key)?.Parent?.Remove();
+        }
+
+        private sealed class ConfigValueScope : IDisposable
+        {
+            private readonly Dictionary<string, JToken> _originalValues;
+
+            public ConfigValueScope(params string[] keys)
+            {
+                _originalValues = keys.ToDictionary(key => key, key => Config.GetToken(key)?.DeepClone());
+            }
+
+            public void Dispose()
+            {
+                foreach (var pair in _originalValues)
+                {
+                    if (pair.Value == null)
+                    {
+                        RemoveConfigValue(pair.Key);
+                    }
+                    else
+                    {
+                        Config.Set(pair.Key, pair.Value.DeepClone());
+                    }
+                }
             }
         }
 

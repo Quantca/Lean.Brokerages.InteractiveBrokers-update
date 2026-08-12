@@ -2020,14 +2020,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             unsupportedOrder,
                             snapshot)).Message);
                 StringAssert.Contains(
-                    "requires explicit order-level routing",
-                    Assert.Throws<InvalidOperationException>(() =>
+                    "not supported",
+                    Assert.Throws<NotSupportedException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             savedPctChangeOrder,
                             snapshot)).Message);
                 savedPctChangeOrder.FaMethod = "PctChange";
                 savedPctChangeOrder.FaPercentage = "25";
-                Assert.DoesNotThrow(() =>
+                Assert.Throws<NotSupportedException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         savedPctChangeOrder,
                         snapshot));
@@ -2087,8 +2087,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         new IBApi.Order { FaGroup = "Monetary" },
                         snapshot));
                 StringAssert.Contains(
-                    "requires explicit order-level routing",
-                    Assert.Throws<InvalidOperationException>(() =>
+                    "not supported",
+                    Assert.Throws<NotSupportedException>(() =>
                         InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                             new IBApi.Order { FaGroup = "SavedPctChange" },
                             snapshot)).Message);
@@ -2183,21 +2183,24 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "An injected request, pacing, mapping, or publication callback ran under the callback-state lock.");
         }
 
-        [Test]
-        public async Task SemanticTopologyFailureIsBrokerageExceptionTest()
+        [TestCase("MASTER")]
+        [TestCase("MASTERA")]
+        [TestCase("NOT_MANAGED")]
+        public async Task SemanticTopologyFailureIsBrokerageExceptionTest(
+            string invalidAccountId)
         {
-            const string primaryInGroup = """
+            var invalidGroup = $"""
                 <ListOfGroups>
                   <Group>
                     <name>Invalid</name>
                     <defaultMethod>NetLiq</defaultMethod>
-                    <ListOfAccts><String>MASTER</String></ListOfAccts>
+                    <ListOfAccts><String>{invalidAccountId}</String></ListOfAccts>
                   </Group>
                 </ListOfGroups>
                 """;
             using var scenario = Scenario.SingleAccount();
-            scenario.GroupsDocument = primaryInGroup;
-            scenario.EndingGroupsDocument = primaryInGroup;
+            scenario.GroupsDocument = invalidGroup;
+            scenario.EndingGroupsDocument = invalidGroup;
             string reported = null;
             object callbackStateLock = null;
             var reporterCalledUnderLock = false;
@@ -2225,6 +2228,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(snapshot.ErrorMessage, state.UnsupportedConfigurationError);
                 Assert.IsFalse(reporterCalledUnderLock);
                 StringAssert.Contains("not a managed subaccount", snapshot.ErrorMessage);
+                StringAssert.Contains(invalidAccountId, snapshot.ErrorMessage);
                 StringAssert.Contains("Correct the group membership in TWS",
                     snapshot.ErrorMessage);
                 Assert.IsTrue(typeof(InteractiveBrokersFinancialAdvisorAccountState
@@ -3196,6 +3200,33 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 }
                 scenario.EmitAggregateCash(
                     requestId, ("BASE", "350.50"), ("USD", "350.50"));
+                scenario.Client.accountSummaryEnd(requestId);
+            });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state, () => state.RequestRefresh(new[] { "Alpha" }));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(1, scenario.AccountRequestIds.Count);
+                Assert.AreEqual(1000.25m, snapshot.Accounts["ACC1"].NetLiquidation);
+                Assert.AreEqual(250.50m, snapshot.Accounts["ACC1"].CashBalances["USD"]);
+            });
+        }
+
+        [Test]
+        public async Task UnexpectedAccountCannotSupplyAggregateCashDetectorTest()
+        {
+            using var scenario = new Scenario();
+            scenario.EnableAccountSummaries((requestId, _) =>
+            {
+                scenario.EmitValidSummaryAccount(requestId, "ACC1");
+                scenario.Client.accountSummary(
+                    requestId, "OTHER", "CashBalance", "350.50", "BASE");
+                scenario.Client.accountSummary(
+                    requestId, "OTHER", "CashBalance", "350.50", "USD");
                 scenario.Client.accountSummaryEnd(requestId);
             });
             using var state = scenario.CreateState();

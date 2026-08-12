@@ -165,6 +165,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     _account,
                     _financialAdvisorsGroupFilter,
                     hasOpenFinancialAdvisorOrders: () =>
+                        _orderProvider != null &&
                         _orderProvider.GetOpenOrders(order =>
                             FAState.IsFinancialAdvisorGroupOrder(
                                 order,
@@ -278,10 +279,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     properties.FaPercentage = (int)percentage;
                 }
-                else
-                {
-                    properties.ExactFaPercentage = percentage;
-                }
             }
             return properties;
         }
@@ -302,6 +299,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 !string.IsNullOrWhiteSpace(properties?.Account);
             if (!isDirectAccountOrder)
             {
+                RejectUnifiedFinancialAdvisorPctChange(
+                    properties?.FaMethod,
+                    !string.IsNullOrWhiteSpace(properties?.FaGroup)
+                        ? properties.FaGroup
+                        : _financialAdvisorsGroupFilter);
                 var unsupportedConfigurationError =
                     _financialAdvisorAccountState?.UnsupportedConfigurationError;
                 if (!isUpdate &&
@@ -380,7 +382,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     throw new InvalidOperationException(
                         "All combo legs must use the same effective Financial Advisor " +
-                        "Account, FaGroup, FaMethod, and percentage.");
+                        "Account, FaGroup, and FaMethod.");
                 }
             }
         }
@@ -394,6 +396,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 return;
             }
+            RejectUnifiedFinancialAdvisorPctChange(
+                properties?.FaMethod,
+                !string.IsNullOrWhiteSpace(properties?.FaGroup)
+                    ? properties.FaGroup
+                    : _financialAdvisorsGroupFilter);
             if (!string.IsNullOrWhiteSpace(properties?.FaProfile))
             {
                 throw new NotSupportedException(
@@ -424,19 +431,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 string.Equals(
                     first.FaMethod ?? string.Empty,
                     second.FaMethod ?? string.Empty,
-                    StringComparison.OrdinalIgnoreCase) &&
-                ParseFinancialAdvisorPercentage(first.FaPercentage) ==
-                    ParseFinancialAdvisorPercentage(second.FaPercentage);
-        }
-
-        private static decimal ParseFinancialAdvisorPercentage(string value)
-        {
-            decimal.TryParse(
-                value,
-                NumberStyles.Float,
-                CultureInfo.InvariantCulture,
-                out var percentage);
-            return percentage;
+                    StringComparison.OrdinalIgnoreCase);
         }
 
         private void ConfigureFinancialAdvisorOrder(
@@ -474,14 +469,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             ibOrder.FaGroup = ibOrder.FaGroup.Trim();
             ibOrder.TotalQuantity = Math.Abs(
                 leanOrder.GroupOrderManager?.Quantity ?? leanOrder.Quantity);
-            if (ibOrder.FaMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
-            {
-                // IB carries the requested change in FaPercentage and requires a zero parent quantity for PctChange.
-                ibOrder.FaMethod = "PctChange";
-                ibOrder.FaPercentage =
-                    (properties.ExactFaPercentage ?? properties.FaPercentage).ToStringInvariant();
-                ibOrder.TotalQuantity = 0m;
-            }
         }
 
         private static string ResolveFinancialAdvisorAllocationMethod(Order order)
@@ -500,10 +487,32 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             Symbol symbol = null,
             decimal lotSize = 0m)
         {
-            if (string.IsNullOrWhiteSpace(order?.FaGroup) ||
-                snapshot?.Status != BrokerageAccountSnapshotStatus.Ready ||
-                !snapshot.AllGroups.TryGetValue(order.FaGroup.Trim(), out var group))
+            if (string.IsNullOrWhiteSpace(order?.FaGroup))
             {
+                return;
+            }
+
+            var groupName = order.FaGroup.Trim();
+            var requestedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
+            RejectUnifiedFinancialAdvisorPctChange(requestedMethod, groupName);
+            if (requestedMethod.Length != 0 &&
+                !IsSupportedUnifiedFinancialAdvisorAllocationMethod(requestedMethod))
+            {
+                throw new NotSupportedException(
+                    $"Financial Advisor group '{groupName}' uses unsupported order allocation method " +
+                    $"'{order.FaMethod}'. Supported order allocation methods are ContractsOrShares, " +
+                    "Ratio, Percent, NetLiq, AvailableEquity, and Equal.");
+            }
+            if (snapshot?.Status != BrokerageAccountSnapshotStatus.Ready ||
+                !snapshot.AllGroups.TryGetValue(groupName, out var group))
+            {
+                if (requestedMethod.Length == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Financial Advisor group '{groupName}' uses an implicit saved allocation method, " +
+                        "but unified routing requires a Ready snapshot containing that group. Request a " +
+                        "brokerage account snapshot refresh and retry the order after the group is Ready.");
+                }
                 return;
             }
 
@@ -513,14 +522,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 throw new InvalidOperationException($"Financial Advisor group '{group.Name}' contains an account that is not classified as managed; refresh after correcting the group membership in TWS.");
             }
             var savedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(group.AllocationMethod);
-            var requestedMethod = FAState.NormalizeFinancialAdvisorAllocationMethod(order.FaMethod);
-            if (savedMethod is not ("ContractsOrShares" or "Ratio" or "Percent" or
-                "NetLiq" or "AvailableEquity" or "Equal" or "PctChange"))
+            RejectUnifiedFinancialAdvisorPctChange(savedMethod, group.Name);
+            if (!IsSupportedUnifiedFinancialAdvisorAllocationMethod(savedMethod))
             {
                 throw new NotSupportedException(
                     $"Financial Advisor group '{group.Name}' uses unsupported saved allocation method " +
                     $"'{group.AllocationMethod}'. Supported saved allocation methods are ContractsOrShares, " +
-                    "Ratio, Percent, NetLiq, AvailableEquity, Equal, and explicitly routed PctChange.");
+                    "Ratio, Percent, NetLiq, AvailableEquity, and Equal.");
             }
             var isUserSpecifiedSavedMethod =
                 FAState.IsSupportedUserSpecifiedAllocationMethod(savedMethod);
@@ -530,24 +538,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     group.Name,
                     group.AccountAllocationValues,
                     snapshot.AllGroups);
-            }
-            if (savedMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase) &&
-                !requestedMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException(
-                    $"Financial Advisor group '{group.Name}' uses saved allocation method 'PctChange'. " +
-                    "Paper TWS can save this method, but LEAN requires explicit order-level routing so fill " +
-                    $"accounting remains on the placeholder-quantity path. Set FaGroup='{group.Name}', " +
-                    "FaMethod='PctChange', and a valid FaPercentage explicitly.");
-            }
-            if (requestedMethod.Equals("PctChange", StringComparison.OrdinalIgnoreCase))
-            {
-                if (!decimal.TryParse(order.FaPercentage, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
-                {
-                    throw new InvalidOperationException(
-                        $"Financial Advisor PctChange order for group '{group.Name}' requires a valid FaPercentage.");
-                }
-                return;
             }
             if (isUserSpecifiedSavedMethod)
             {
@@ -588,6 +578,31 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     $"Saved Financial Advisor group '{group.Name}' uses '{group.AllocationMethod}', " +
                     $"so it cannot execute an order using '{order.FaMethod}'. Leave FaMethod empty or use the saved method.");
             }
+        }
+
+        private static bool IsSupportedUnifiedFinancialAdvisorAllocationMethod(
+            string allocationMethod) =>
+            allocationMethod is "ContractsOrShares" or "Ratio" or "Percent" or
+                "NetLiq" or "AvailableEquity" or "Equal";
+
+        private static void RejectUnifiedFinancialAdvisorPctChange(
+            string allocationMethod,
+            string groupName)
+        {
+            if (string.IsNullOrWhiteSpace(groupName) ||
+                !FAState.NormalizeFinancialAdvisorAllocationMethod(allocationMethod)
+                    .Equals("PctChange", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            throw new NotSupportedException(
+                $"Financial Advisor PctChange orders for group '{groupName.Trim()}' are not supported " +
+                "when unified Financial Advisor groups are enabled because IB resolves their aggregate " +
+                "quantity after submission and LEAN cannot safely account for split fills. Use a supported " +
+                "saved allocation method, or disable unified groups (and group management, if enabled) " +
+                "to retain LEAN's legacy integer " +
+                "PctChange behavior.");
         }
 
         // Keep this decision independent of mutable snapshot state so it remains stable across partial fills.

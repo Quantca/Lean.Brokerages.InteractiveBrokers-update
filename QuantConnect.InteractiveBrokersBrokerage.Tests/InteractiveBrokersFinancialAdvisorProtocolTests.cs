@@ -237,14 +237,18 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                             .Distinct(StringComparer.OrdinalIgnoreCase).Count());
                 }
 
+                var allowedSummaryAccounts = group.AccountIds
+                    .Concat(new[] { "All", masterAccount, masterAccount + "A" })
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                Assert.IsEmpty(rows.Where(row =>
+                    !allowedSummaryAccounts.Contains(row.Account.Trim())));
+
                 var aggregateCashRows = rows.Where(row =>
-                    !group.AccountIds.Contains(
-                        row.Account, StringComparer.OrdinalIgnoreCase) &&
+                    row.Account.Trim().Equals(
+                        "All", StringComparison.OrdinalIgnoreCase) &&
                     row.Tag.Equals(
                         "CashBalance", StringComparison.OrdinalIgnoreCase)).ToArray();
                 Assert.IsNotEmpty(aggregateCashRows);
-                Assert.IsTrue(aggregateCashRows.All(row =>
-                    !snapshot.Accounts.ContainsKey(row.Account)));
             }
             finally
             {

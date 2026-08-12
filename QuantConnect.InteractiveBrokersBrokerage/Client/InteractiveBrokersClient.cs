@@ -213,7 +213,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<AccountUpdateMultiEndEventArgs> AccountUpdateMultiEnd;
 
         /// <summary>
-        /// Occurs when an internal account-update request has completed, preserving its request identifier.
+        /// Occurs when an account-updates-multi request has completed, preserving its request identifier.
         /// </summary>
         internal event EventHandler<AccountUpdateMultiEndEventArgs> AccountUpdateMultiEndWithRequestId;
 

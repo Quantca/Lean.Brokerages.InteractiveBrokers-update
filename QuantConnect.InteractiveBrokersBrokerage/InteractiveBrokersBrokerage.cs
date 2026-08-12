@@ -2850,7 +2850,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var orderProperties = order.Properties as InteractiveBrokersOrderProperties;
             if (orderProperties == null)
-                return true;
+            {
+                return !_financialAdvisorUnifiedGroupsEnabled ||
+                    !InteractiveBrokersFinancialAdvisorAccountState.IsFinancialAdvisorGroupOrder(
+                        order,
+                        _financialAdvisorsGroupFilter) ||
+                    execution.AcctNumber == _account;
+            }
 
             return
                 // FA master orders for groups/profiles
@@ -4260,6 +4266,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var password = job.BrokerageData["ib-password"];
             var tradingMode = job.BrokerageData["ib-trading-mode"];
             var agentDescription = job.BrokerageData["ib-agent-description"];
+            var financialAdvisorErrors = new List<string>();
+            InteractiveBrokersBrokerageFactory.ParseFinancialAdvisorSettings(
+                job.BrokerageData,
+                financialAdvisorErrors,
+                out var financialAdvisorsGroupFilter,
+                out var financialAdvisorGroupManagementEnabled,
+                out var financialAdvisorUnifiedGroupsEnabled);
+            if (financialAdvisorErrors.Count != 0)
+            {
+                throw new ArgumentException(string.Join(Environment.NewLine, financialAdvisorErrors));
+            }
 
             var loadExistingHoldings = Config.GetBool("load-existing-holdings", true);
             if (job.BrokerageData.ContainsKey("load-existing-holdings"))
@@ -4279,7 +4296,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 password,
                 tradingMode,
                 agentDescription,
-                loadExistingHoldings);
+                loadExistingHoldings,
+                financialAdvisorsGroupFilter: financialAdvisorsGroupFilter,
+                financialAdvisorGroupManagementEnabled: financialAdvisorGroupManagementEnabled,
+                financialAdvisorUnifiedGroupsEnabled: financialAdvisorUnifiedGroupsEnabled);
 
             if (!IsConnected)
             {

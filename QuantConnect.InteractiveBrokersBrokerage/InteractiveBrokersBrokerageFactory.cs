@@ -83,34 +83,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var password = Read<string>(job.BrokerageData, "ib-password", errors);
             var tradingMode = Read<string>(job.BrokerageData, "ib-trading-mode", errors);
             var agentDescription = Read<string>(job.BrokerageData, "ib-agent-description", errors);
-            job.BrokerageData.TryGetValue("ib-financial-advisors-group-filter", out var financialAdvisorsGroupFilter);
-            var financialAdvisorGroupManagementEnabled = false;
-            if (job.BrokerageData.TryGetValue(
-                    "ib-financial-advisors-group-management-enabled",
-                    out var financialAdvisorGroupManagementEnabledValue) &&
-                !string.IsNullOrWhiteSpace(financialAdvisorGroupManagementEnabledValue) &&
-                !bool.TryParse(financialAdvisorGroupManagementEnabledValue, out financialAdvisorGroupManagementEnabled))
-            {
-                errors.Add(
-                    "The 'ib-financial-advisors-group-management-enabled' setting must be either 'true' or 'false'.");
-            }
-            var financialAdvisorUnifiedGroupsEnabled = false;
-            if (job.BrokerageData.TryGetValue(
-                    "ib-financial-advisors-unified-groups-enabled",
-                    out var financialAdvisorUnifiedGroupsEnabledValue) &&
-                !string.IsNullOrWhiteSpace(financialAdvisorUnifiedGroupsEnabledValue) &&
-                !bool.TryParse(financialAdvisorUnifiedGroupsEnabledValue, out financialAdvisorUnifiedGroupsEnabled))
-            {
-                errors.Add(
-                    "The 'ib-financial-advisors-unified-groups-enabled' setting must be either 'true' or 'false'.");
-            }
-            if (financialAdvisorGroupManagementEnabled &&
-                !financialAdvisorUnifiedGroupsEnabled)
-            {
-                errors.Add(
-                    "The 'ib-financial-advisors-group-management-enabled' setting requires " +
-                    "'ib-financial-advisors-unified-groups-enabled=true'.");
-            }
+            ParseFinancialAdvisorSettings(
+                job.BrokerageData,
+                errors,
+                out var financialAdvisorsGroupFilter,
+                out var financialAdvisorGroupManagementEnabled,
+                out var financialAdvisorUnifiedGroupsEnabled);
 
             var loadExistingHoldings = true;
             if (job.BrokerageData.ContainsKey("load-existing-holdings"))
@@ -157,6 +135,52 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             Composer.Instance.AddPart<IDataQueueHandler>(ib);
 
             return ib;
+        }
+
+        internal static void ParseFinancialAdvisorSettings(
+            IReadOnlyDictionary<string, string> brokerageData,
+            ICollection<string> errors,
+            out string financialAdvisorsGroupFilter,
+            out bool financialAdvisorGroupManagementEnabled,
+            out bool financialAdvisorUnifiedGroupsEnabled)
+        {
+            brokerageData.TryGetValue(
+                "ib-financial-advisors-group-filter",
+                out financialAdvisorsGroupFilter);
+            financialAdvisorGroupManagementEnabled = ParseFinancialAdvisorBoolean(
+                brokerageData,
+                "ib-financial-advisors-group-management-enabled",
+                errors);
+            financialAdvisorUnifiedGroupsEnabled = ParseFinancialAdvisorBoolean(
+                brokerageData,
+                "ib-financial-advisors-unified-groups-enabled",
+                errors);
+            if (financialAdvisorGroupManagementEnabled &&
+                !financialAdvisorUnifiedGroupsEnabled)
+            {
+                errors.Add(
+                    "The 'ib-financial-advisors-group-management-enabled' setting requires " +
+                    "'ib-financial-advisors-unified-groups-enabled=true'.");
+            }
+        }
+
+        private static bool ParseFinancialAdvisorBoolean(
+            IReadOnlyDictionary<string, string> brokerageData,
+            string key,
+            ICollection<string> errors)
+        {
+            if (!brokerageData.TryGetValue(key, out var value) ||
+                string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+            if (bool.TryParse(value, out var parsed))
+            {
+                return parsed;
+            }
+
+            errors.Add($"The '{key}' setting must be either 'true' or 'false'.");
+            return false;
         }
 
         /// <summary>

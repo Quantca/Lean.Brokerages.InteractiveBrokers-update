@@ -224,35 +224,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 StringComparer.OrdinalIgnoreCase);
         }
 
-        internal static void ValidateSupportedGroupAccountRelationships(
-            IReadOnlyDictionary<string, BrokerageAccountGroup> groups,
-            IReadOnlyDictionary<string, BrokerageAccountDirectoryEntry> accountDirectory)
-        {
-            foreach (var group in groups.Values)
-            {
-                foreach (var accountId in group.AccountIds)
-                {
-                    if (!accountDirectory.TryGetValue(accountId, out var account) ||
-                        account.Relationship is not (
-                            BrokerageAccountRelationship.Primary or
-                            BrokerageAccountRelationship.Aggregate))
-                    {
-                        continue;
-                    }
-
-                    var relationship = account.Relationship ==
-                        BrokerageAccountRelationship.Primary
-                            ? "primary"
-                            : "aggregate";
-                    throw new UnsupportedFinancialAdvisorConfigurationException(
-                        $"Financial Advisor group '{group.Name}' contains {relationship} account " +
-                        $"'{account.AccountId}'. Unified Financial Advisor groups used by LEAN must " +
-                        "contain managed subaccounts only. Remove this account from the group in TWS " +
-                        "and refresh the brokerage account snapshot.");
-                }
-            }
-        }
-
         private static bool SupportsValueFreeMembership(string allocationMethod)
         {
             return allocationMethod.Equals("NetLiq", StringComparison.OrdinalIgnoreCase) ||

@@ -68,6 +68,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         [TestCase(-1)]
         [TestCase(0)]
+        [TestCase(int.MaxValue)]
         public void ExpectedGroupsReadbackRetrySuppressesOnlyBrokerageMessage(int requestId)
         {
             using var client = new IB.InteractiveBrokersClient(new IBApi.EReaderMonitorSignal());
@@ -129,8 +130,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
         }
 
-        [Test]
-        public void UnsavedChangesWithoutPendingGroupsReadbackIsNotSuppressed()
+        [TestCase(-1)]
+        [TestCase(int.MaxValue)]
+        public void UnsavedChangesWithoutPendingGroupsReadbackIsNotSuppressed(int requestId)
         {
             using var client = new IB.InteractiveBrokersClient(new IBApi.EReaderMonitorSignal());
             using var accountState = new InteractiveBrokersFinancialAdvisorAccountState(
@@ -148,7 +150,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 brokerage.Message += (_, message) => messages.Add(message);
                 client.Error += brokerage.HandleError;
 
-                client.error(-1, 0, 10230, "Unowned unsaved changes", string.Empty);
+                client.error(
+                    requestId, 0, 10230, "Unowned unsaved changes", string.Empty);
 
                 Assert.Multiple(() =>
                 {
@@ -163,8 +166,89 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
         }
 
+        [Test]
+        public void UnsavedChangesBeforeGroupsReadbackWireAuthorizationIsNotSuppressed()
+        {
+            using var client = new IB.InteractiveBrokersClient(new IBApi.EReaderMonitorSignal());
+            using var accountState = new InteractiveBrokersFinancialAdvisorAccountState(
+                client,
+                () => { },
+                () => true,
+                _ => Symbol.Empty,
+                "F-MASTER");
+            using var brokerage = new InteractiveBrokersBrokerage();
+            SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", accountState);
+            var pending = InstallGroupsReadbackPending(accountState, wireSent: false);
+
+            try
+            {
+                var messages = new List<BrokerageMessageEvent>();
+                brokerage.Message += (_, message) => messages.Add(message);
+                client.Error += brokerage.HandleError;
+
+                client.error(
+                    int.MaxValue,
+                    0,
+                    10230,
+                    "Pre-wire unsaved changes",
+                    string.Empty);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(1, messages.Count);
+                    Assert.AreEqual("10230", messages[0].Code);
+                    Assert.IsFalse(GetPendingBoolean(pending, "Finished"));
+                });
+            }
+            finally
+            {
+                SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", null);
+            }
+        }
+
+        [Test]
+        public void OtherErrorsWithMaximumRequestIdAreNotSuppressed()
+        {
+            using var client = new IB.InteractiveBrokersClient(new IBApi.EReaderMonitorSignal());
+            using var accountState = new InteractiveBrokersFinancialAdvisorAccountState(
+                client,
+                () => { },
+                () => true,
+                _ => Symbol.Empty,
+                "F-MASTER");
+            using var brokerage = new InteractiveBrokersBrokerage();
+            SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", accountState);
+            var pending = InstallGroupsReadbackPending(accountState);
+
+            try
+            {
+                var messages = new List<BrokerageMessageEvent>();
+                brokerage.Message += (_, message) => messages.Add(message);
+                client.Error += brokerage.HandleError;
+
+                client.error(
+                    int.MaxValue,
+                    0,
+                    10231,
+                    "Unrelated maximum-id error",
+                    string.Empty);
+
+                Assert.Multiple(() =>
+                {
+                    Assert.AreEqual(1, messages.Count);
+                    Assert.AreEqual("10231", messages[0].Code);
+                    Assert.IsFalse(GetPendingBoolean(pending, "Finished"));
+                });
+            }
+            finally
+            {
+                SetPrivateFieldValue(brokerage, "_financialAdvisorAccountState", null);
+            }
+        }
+
         private static object InstallGroupsReadbackPending(
-            InteractiveBrokersFinancialAdvisorAccountState accountState)
+            InteractiveBrokersFinancialAdvisorAccountState accountState,
+            bool wireSent = true)
         {
             var stateType = typeof(InteractiveBrokersFinancialAdvisorAccountState);
             var pendingType = stateType.GetNestedType(
@@ -184,7 +268,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
             pendingType.GetProperty(
                     "WireSent", BindingFlags.Instance | BindingFlags.NonPublic)
-                .SetValue(pending, true);
+                .SetValue(pending, wireSent);
             SetPrivateFieldValue(accountState, "_pendingRequest", pending);
             return pending;
         }

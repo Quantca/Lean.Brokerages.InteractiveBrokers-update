@@ -83,6 +83,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             typeof(InteractiveBrokersBrokerage).GetField("_pendingOrderResponse", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo RequestInformationField =
             typeof(InteractiveBrokersBrokerage).GetField("_requestInformation", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly FieldInfo FirstFinancialAdvisorOrderClaimedField =
+            typeof(InteractiveBrokersBrokerage).GetField("_financialAdvisorFirstOrderClaimed", BindingFlags.Instance | BindingFlags.NonPublic);
         private static readonly FieldInfo GroupTradingBlockedField =
             typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
                 "_groupTradingBlocked",
@@ -113,6 +115,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         private static readonly MethodInfo ConfigureFinancialAdvisorOrderMethod =
             typeof(InteractiveBrokersBrokerage).GetMethod(
                 "ConfigureFinancialAdvisorOrder",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+        private static readonly MethodInfo CanEmitFillMethod =
+            typeof(InteractiveBrokersBrokerage).GetMethod(
+                "CanEmitFill",
                 BindingFlags.Instance | BindingFlags.NonPublic);
 
         /// <summary>
@@ -362,6 +368,77 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void UnifiedFilterDrivenOrderEmitsOnlyMasterExecutionsAcrossPartialFillsTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var order = CreateOrder(new OrderProperties());
+
+            Assert.IsFalse(CanEmitFill(brokerage, order, "DU1234567"));
+            Assert.IsTrue(CanEmitFill(brokerage, order, FaMasterAccount));
+            order.Status = OrderStatus.PartiallyFilled;
+            Assert.IsFalse(CanEmitFill(brokerage, order, "DU7654321"));
+            Assert.IsTrue(CanEmitFill(brokerage, order, FaMasterAccount));
+            order.Status = OrderStatus.Filled;
+            Assert.IsFalse(CanEmitFill(brokerage, order, FaMasterAccount));
+        }
+
+        [TestCase(false, FaGroupName, "DU1234567", true,
+            TestName = "UnifiedDisabledPreservesPlainOrderChildExecution")]
+        [TestCase(true, "", "DU1234567", true,
+            TestName = "NoFilterPreservesPlainOrderChildExecution")]
+        [TestCase(true, FaGroupName, FaMasterAccount, true,
+            TestName = "UnifiedFilterDrivenOrderAcceptsMasterOnlyExecution")]
+        public void PlainOrderFillClassificationCompatibilityTest(
+            bool unifiedGroupsEnabled,
+            string groupFilter,
+            string executionAccount,
+            bool expected)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, unifiedGroupsEnabled);
+            FaFilterField.SetValue(brokerage, groupFilter);
+
+            Assert.AreEqual(
+                expected,
+                CanEmitFill(
+                    brokerage,
+                    CreateOrder(new OrderProperties()),
+                    executionAccount));
+        }
+
+        [Test]
+        public void UnifiedFillClassificationPreservesOptionAndExplicitRoutesTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            FaFilterField.SetValue(brokerage, FaGroupName);
+            var optionExercise = new OptionExerciseOrder(
+                Symbols.SPY_C_192_Feb19_2016,
+                1m,
+                new DateTime(2026, 1, 1, 15, 0, 0, DateTimeKind.Utc),
+                properties: new OrderProperties());
+            var directOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                Account = "DU1234567"
+            });
+            var explicitGroupOrder = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName
+            });
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsTrue(CanEmitFill(brokerage, optionExercise, "DU1234567"));
+                Assert.IsTrue(CanEmitFill(brokerage, directOrder, "DU1234567"));
+                Assert.IsFalse(CanEmitFill(brokerage, directOrder, FaMasterAccount));
+                Assert.IsFalse(CanEmitFill(brokerage, explicitGroupOrder, "DU1234567"));
+                Assert.IsTrue(CanEmitFill(brokerage, explicitGroupOrder, FaMasterAccount));
+            });
+        }
+
+        [Test]
         public void OptionExerciseBypassesUnifiedFinancialAdvisorOrderPathsTest()
         {
             const string unsupportedReason =
@@ -382,7 +459,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 properties: new InteractiveBrokersOrderProperties
                 {
                     FaGroup = FaGroupName,
-                    FaMethod = "Percent"
+                    FaMethod = "PctChange"
                 });
             var ibOrder = new IBApi.Order
             {
@@ -448,6 +525,16 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
             FaFilterField.SetValue(brokerage, FaGroupName);
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            SnapshotField.SetValue(
+                stateFixture.State,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    new BrokerageAccountGroup(
+                        FaGroupName,
+                        "Equal",
+                        new[] { "ManagedAccount" })));
+            AccountStateField.SetValue(brokerage, stateFixture.State);
             var orders = CreateComboOrders(
                 brokerage,
                 new InteractiveBrokersOrderProperties(),
@@ -464,7 +551,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [TestCase("NormalizedMethod")]
-        [TestCase("NumericPercentage")]
         [TestCase("IgnoredDirectFields")]
         public void EquivalentComboLegRoutingFormsAreAcceptedTest(string equivalence)
         {
@@ -473,18 +559,42 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var first = new InteractiveBrokersOrderProperties
             {
                 FaGroup = equivalence == "IgnoredDirectFields" ? "FirstIgnoredGroup" : FaGroupName,
-                FaMethod = equivalence == "NumericPercentage" ? "PctChange" : "EqualQuantity",
+                FaMethod = "EqualQuantity",
                 FaPercentage = 12,
                 Account = equivalence == "IgnoredDirectFields" ? "ManagedAccount" : string.Empty
             };
             var second = new InteractiveBrokersOrderProperties
             {
                 FaGroup = equivalence == "IgnoredDirectFields" ? "SecondIgnoredGroup" : FaGroupName,
-                FaMethod = equivalence == "NumericPercentage" ? "PctChange" : "Equal",
-                ExactFaPercentage = 12m,
+                FaMethod = "Equal",
+                FaPercentage = 12,
                 Account = equivalence == "IgnoredDirectFields" ? "ManagedAccount" : string.Empty
             };
             var orders = CreateComboOrders(brokerage, first, second);
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
+        }
+
+        [Test]
+        public void SupportedComboRoutingIgnoresIrrelevantFaPercentageTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var orders = CreateComboOrders(
+                brokerage,
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = "NetLiq",
+                    FaPercentage = 12
+                },
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = "NetLiq",
+                    FaPercentage = 34
+                });
 
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(orders[0]));
@@ -509,14 +619,16 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
                 case "FaGroup":
                     first.FaGroup = "TargetGroup";
+                    first.FaMethod = "Equal";
                     second.FaGroup = "targetgroup";
+                    second.FaMethod = "Equal";
                     break;
 
                 case "FaMethod":
                     first.FaGroup = FaGroupName;
-                    first.FaMethod = "FutureMethod";
+                    first.FaMethod = "NetLiq";
                     second.FaGroup = FaGroupName;
-                    second.FaMethod = "futuremethod";
+                    second.FaMethod = "netliq";
                     break;
             }
             var orders = CreateComboOrders(brokerage, first, second);
@@ -547,6 +659,34 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.Throws<NotSupportedException>(() =>
                     brokerage.ValidateFinancialAdvisorOrderAdmission(
                         orders[0])).Message);
+        }
+
+        [Test]
+        public void ComboAdmissionRejectsPctChangeOnLaterLegBeforeWireTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var orders = CreateComboOrders(
+                brokerage,
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = "NetLiq"
+                },
+                new InteractiveBrokersOrderProperties
+                {
+                    FaGroup = FaGroupName,
+                    FaMethod = "PctChange",
+                    FaPercentage = 25
+                });
+
+            StringAssert.Contains(
+                "cannot safely account for split fills",
+                Assert.Throws<NotSupportedException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        orders[0])).Message);
+            Assert.IsEmpty(orders[0].BrokerId);
+            Assert.IsEmpty(orders[1].BrokerId);
         }
 
         [Test]
@@ -584,7 +724,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         [TestCase("Account")]
         [TestCase("FaGroup")]
         [TestCase("FaMethod")]
-        [TestCase("Percentage")]
         public void DivergentComboLegRoutingIsRejectedTest(string divergence)
         {
             var brokerage = CreateOfflineBrokerage();
@@ -592,14 +731,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var first = new InteractiveBrokersOrderProperties
             {
                 FaGroup = FaGroupName,
-                FaMethod = "PctChange",
-                ExactFaPercentage = 12.5m
+                FaMethod = "NetLiq"
             };
             var second = new InteractiveBrokersOrderProperties
             {
                 FaGroup = divergence == "FaGroup" ? "AnotherGroup" : FaGroupName,
-                FaMethod = divergence == "FaMethod" ? "Equal" : "PctChange",
-                ExactFaPercentage = divergence == "Percentage" ? 11m : 12.5m,
+                FaMethod = divergence == "FaMethod" ? "Equal" : "NetLiq",
                 Account = divergence == "Account" ? "ManagedAccount" : string.Empty
             };
             var orders = CreateComboOrders(brokerage, first, second);
@@ -627,7 +764,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 group,
                 properties: new InteractiveBrokersOrderProperties
                 {
-                    FaGroup = FaGroupName
+                    FaGroup = FaGroupName,
+                    FaMethod = "Equal"
                 });
             var provider = new OrderProvider();
             provider.Add(order);
@@ -645,7 +783,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             UnifiedGroupsField.SetValue(brokerage, true);
             var properties = new InteractiveBrokersOrderProperties
             {
-                FaGroup = FaGroupName
+                FaGroup = FaGroupName,
+                FaMethod = "Equal"
             };
             var orders = CreateComboOrders(brokerage, properties, properties);
             var provider = new GroupLockObservingOrderProvider(
@@ -737,6 +876,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     implicitFilterOrder).Message);
 
             UnsupportedConfigurationErrorField.SetValue(state, null);
+            SnapshotField.SetValue(
+                state,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    new BrokerageAccountGroup(
+                        FaGroupName,
+                        "Equal",
+                        new[] { "ManagedAccount" })));
             Assert.DoesNotThrow(() =>
                 brokerage.ValidateFinancialAdvisorOrderAdmission(groupOrder));
             Assert.DoesNotThrow(() => ConvertOrder(brokerage, groupOrder));
@@ -756,7 +903,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             AccountStateField.SetValue(brokerage, state);
             var order = CreateOrder(new InteractiveBrokersOrderProperties
             {
-                FaGroup = FaGroupName
+                FaGroup = FaGroupName,
+                FaMethod = "Equal"
             });
 
             Assert.DoesNotThrow(() =>
@@ -789,7 +937,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 brokerage.ValidateFinancialAdvisorOrderAdmission(
                     CreateOrder(new InteractiveBrokersOrderProperties
                     {
-                        FaGroup = FaGroupName
+                        FaGroup = FaGroupName,
+                        FaMethod = "Equal"
                     }),
                     isUpdate: true));
             Assert.IsInstanceOf<NotSupportedException>(
@@ -1014,7 +1163,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         [TestCase(BrokerageAccountSnapshotStatus.Refreshing)]
         [TestCase(BrokerageAccountSnapshotStatus.Failed)]
         [TestCase(BrokerageAccountSnapshotStatus.Stale)]
-        public void GroupOrderUpdatesFailOpenWithoutReadyAuthorityTest(
+        public void ExplicitGroupOrderUpdatesFailOpenWithoutReadyAuthorityTest(
             BrokerageAccountSnapshotStatus status)
         {
             var brokerage = CreateOfflineBrokerage();
@@ -1043,7 +1192,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     CreateOrder(
                         new InteractiveBrokersOrderProperties
                         {
-                            FaGroup = FaGroupName
+                            FaGroup = FaGroupName,
+                            FaMethod = "Equal"
                         },
                         quantity: 12m),
                     isUpdate: true));
@@ -1118,11 +1268,156 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.Throws<InvalidOperationException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         conflictingOrder,
-                        CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup))).Message);
+                    CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup))).Message);
+        }
+
+        [TestCase("ContractsOrShares")]
+        [TestCase("Ratio")]
+        [TestCase("Percent")]
+        [TestCase("NetLiq")]
+        [TestCase("AvailableEquity")]
+        [TestCase("Equal")]
+        [TestCase("EqualQuantity")]
+        public void SupportedExplicitAllocationMethodsFailOpenWithoutReadyAuthorityTest(
+            string allocationMethod)
+        {
+            var order = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                FaMethod = allocationMethod,
+                TotalQuantity = 1m
+            };
+
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    order,
+                    null));
+            foreach (var status in Enum.GetValues<BrokerageAccountSnapshotStatus>()
+                .Where(status => status != BrokerageAccountSnapshotStatus.Ready))
+            {
+                Assert.DoesNotThrow(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        CreateSnapshot(status)));
+            }
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    order,
+                    CreateSnapshot(
+                        BrokerageAccountSnapshotStatus.Ready,
+                        new BrokerageAccountGroup(
+                            "OtherGroup",
+                            "Equal",
+                            new[] { "ManagedAccount" }))));
+        }
+
+        [TestCase("MonetaryAmount")]
+        [TestCase("TypoMethod")]
+        public void UnsupportedExplicitAllocationMethodFailsClosedWithoutReadyAuthorityTest(
+            string allocationMethod)
+        {
+            var order = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                FaMethod = allocationMethod,
+                TotalQuantity = 1m
+            };
+
+            AssertUnsupportedExplicitAllocationMethod(order, null, allocationMethod);
+            foreach (var status in Enum.GetValues<BrokerageAccountSnapshotStatus>()
+                .Where(status => status != BrokerageAccountSnapshotStatus.Ready))
+            {
+                AssertUnsupportedExplicitAllocationMethod(
+                    order,
+                    CreateSnapshot(status),
+                    allocationMethod);
+            }
+            AssertUnsupportedExplicitAllocationMethod(
+                order,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    new BrokerageAccountGroup(
+                        "OtherGroup",
+                        "Equal",
+                        new[] { "ManagedAccount" })),
+                allocationMethod);
+        }
+
+        [TestCase("MonetaryAmount", false)]
+        [TestCase("MonetaryAmount", true)]
+        [TestCase("TypoMethod", false)]
+        [TestCase("TypoMethod", true)]
+        public void UnsupportedExplicitAllocationMethodAdmissionFailsBeforeWireTest(
+            string allocationMethod,
+            bool isUpdate)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var order = CreateOrder(new InteractiveBrokersOrderProperties
+            {
+                FaGroup = FaGroupName,
+                FaMethod = allocationMethod
+            });
+
+            var exception = Assert.Throws<NotSupportedException>(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(order, isUpdate));
+
+            Assert.Multiple(() =>
+            {
+                StringAssert.Contains(allocationMethod, exception.Message);
+                StringAssert.Contains("Supported order allocation methods", exception.Message);
+                Assert.IsEmpty(order.BrokerId);
+            });
         }
 
         [Test]
-        public void SavedPctChangeRequiresExplicitOrderLevelRoutingWithReadyAuthorityTest()
+        public void ImplicitSavedMethodRequiresReadySnapshotContainingGroupTest()
+        {
+            var order = new IBApi.Order
+            {
+                FaGroup = FaGroupName,
+                TotalQuantity = 1m
+            };
+            var savedGroup = new BrokerageAccountGroup(
+                FaGroupName,
+                "Equal",
+                new[] { "ManagedAccount" });
+
+            StringAssert.Contains(
+                "requires a Ready snapshot",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        null)).Message);
+            foreach (var status in Enum.GetValues<BrokerageAccountSnapshotStatus>()
+                .Where(status => status != BrokerageAccountSnapshotStatus.Ready))
+            {
+                StringAssert.Contains(
+                    "requires a Ready snapshot",
+                    Assert.Throws<InvalidOperationException>(() =>
+                        InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                            order,
+                            CreateSnapshot(status, savedGroup))).Message);
+            }
+            StringAssert.Contains(
+                "requires a Ready snapshot",
+                Assert.Throws<InvalidOperationException>(() =>
+                    InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                        order,
+                        CreateSnapshot(
+                            BrokerageAccountSnapshotStatus.Ready,
+                            new BrokerageAccountGroup(
+                                "OtherGroup",
+                                "Equal",
+                                new[] { "ManagedAccount" })))).Message);
+            Assert.DoesNotThrow(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    order,
+                    CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, savedGroup)));
+        }
+
+        [Test]
+        public void UnifiedPctChangeAndUnknownImplicitRoutesFailClosedTest()
         {
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
@@ -1145,58 +1440,65 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 CreateOrder(new InteractiveBrokersOrderProperties
                 {
                     FaMethod = "PctChange",
-                    ExactFaPercentage = -25.5m
+                    FaPercentage = -25
                 });
             var explicitMethodOrder =
                 CreateOrder(new InteractiveBrokersOrderProperties
                 {
                     FaGroup = FaGroupName,
                     FaMethod = "PctChange",
-                    ExactFaPercentage = -25.5m
+                    FaPercentage = -25
                 });
 
             foreach (var order in new[]
             {
                 savedMethodOrder,
-                methodOnlyOrder
+                methodOnlyOrder,
+                explicitMethodOrder
             })
             {
-                var message = Assert.Throws<InvalidOperationException>(() =>
+                var message = Assert.Throws<NotSupportedException>(() =>
                     brokerage.ValidateFinancialAdvisorOrderAdmission(order)).Message;
                 Assert.Multiple(() =>
                 {
-                    StringAssert.Contains("Paper TWS can save this method", message);
-                    StringAssert.Contains("explicit order-level routing", message);
-                    StringAssert.Contains("FaGroup", message);
-                    StringAssert.Contains("FaMethod='PctChange'", message);
-                    StringAssert.Contains("valid FaPercentage", message);
-                    StringAssert.Contains("placeholder-quantity", message);
+                    StringAssert.Contains("PctChange orders", message);
+                    StringAssert.Contains("not supported", message);
+                    StringAssert.Contains("cannot safely account for split fills", message);
+                    StringAssert.Contains("disable unified groups", message);
                 });
+                Assert.Throws<NotSupportedException>(() =>
+                    brokerage.ValidateFinancialAdvisorOrderAdmission(
+                        order,
+                        isUpdate: true));
             }
-            Assert.DoesNotThrow(() =>
-                brokerage.ValidateFinancialAdvisorOrderAdmission(
-                    explicitMethodOrder));
 
-            SnapshotField.SetValue(
-                state,
-                CreateSnapshot(
-                    BrokerageAccountSnapshotStatus.Stale,
-                    savedGroup));
-            Assert.DoesNotThrow(() =>
-                brokerage.ValidateFinancialAdvisorOrderAdmission(
-                    savedMethodOrder));
-            Assert.DoesNotThrow(() =>
-                brokerage.ValidateFinancialAdvisorOrderAdmission(
-                    methodOnlyOrder));
-            Assert.DoesNotThrow(() =>
-                brokerage.ValidateFinancialAdvisorOrderAdmission(
-                    explicitMethodOrder));
+            foreach (var status in Enum.GetValues<BrokerageAccountSnapshotStatus>()
+                .Where(status => status != BrokerageAccountSnapshotStatus.Ready))
+            {
+                SnapshotField.SetValue(
+                    state,
+                    CreateSnapshot(status, savedGroup));
+                StringAssert.Contains(
+                    "requires a Ready snapshot",
+                    Assert.Throws<InvalidOperationException>(() =>
+                        brokerage.ValidateFinancialAdvisorOrderAdmission(
+                            savedMethodOrder)).Message);
+                foreach (var order in new[] { methodOnlyOrder, explicitMethodOrder })
+                {
+                    Assert.Throws<NotSupportedException>(() =>
+                        brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+                    Assert.Throws<NotSupportedException>(() =>
+                        brokerage.ValidateFinancialAdvisorOrderAdmission(
+                            order,
+                            isUpdate: true));
+                }
+            }
         }
 
         [TestCase("ContractsOrShares")]
         [TestCase("Ratio")]
         [TestCase("Percent")]
-        public void ExplicitPctChangeRejectsInconsistentSavedAllocationVectorTest(
+        public void UnifiedPctChangeRejectionPrecedesSavedAllocationVectorValidationTest(
             string savedMethod)
         {
             var group = new BrokerageAccountGroup(
@@ -1216,8 +1518,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             };
 
             StringAssert.Contains(
-                "allocation keys must exactly match",
-                Assert.Throws<InvalidOperationException>(() =>
+                "cannot safely account for split fills",
+                Assert.Throws<NotSupportedException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         order,
                         CreateSnapshot(
@@ -1309,8 +1611,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var order = new IBApi.Order
             {
                 FaGroup = FaGroupName,
-                FaMethod = "PctChange",
-                FaPercentage = "1"
+                FaMethod = "Equal"
             };
 
             foreach (var status in Enum.GetValues<BrokerageAccountSnapshotStatus>()
@@ -1351,7 +1652,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var order = CreateOrder(new InteractiveBrokersOrderProperties
             {
                 FaGroup = FaGroupName,
-                FaMethod = "Equal"
+                FaMethod = "PctChange",
+                FaPercentage = 25
             });
             var client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
             var connectedField = FindSocketConnectedField(client.ClientSocket);
@@ -1364,6 +1666,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsEmpty(order.BrokerId);
                 Assert.AreEqual(0, GetCollectionCount(RequestInformationField.GetValue(brokerage)));
                 Assert.AreEqual(0, GetCollectionCount(PendingOrderResponseField.GetValue(brokerage)));
+                Assert.AreEqual(0, FirstFinancialAdvisorOrderClaimedField.GetValue(brokerage));
             }
             finally
             {
@@ -1379,11 +1682,21 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
             FaFilterField.SetValue(brokerage, FaGroupName);
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            SnapshotField.SetValue(
+                stateFixture.State,
+                CreateSnapshot(
+                    BrokerageAccountSnapshotStatus.Ready,
+                    new BrokerageAccountGroup(
+                        FaGroupName,
+                        "Equal",
+                        new[] { "ManagedAccount" })));
+            AccountStateField.SetValue(brokerage, stateFixture.State);
             var directOrder = CreateOrder(new InteractiveBrokersOrderProperties
             {
                 Account = "ManagedAccount",
                 FaGroup = "AnotherGroup",
-                FaMethod = "Equal"
+                FaMethod = "PctChange"
             });
             var outsideGroupOrder = CreateOrder(new InteractiveBrokersOrderProperties
             {
@@ -1400,6 +1713,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
 
             Assert.DoesNotThrow(() => brokerage.ValidateFinancialAdvisorOrderAdmission(directOrder));
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    directOrder,
+                    isUpdate: true));
             var ibOrder = ConvertOrder(brokerage, directOrder);
             Assert.AreEqual("ManagedAccount", ibOrder.Account);
             Assert.IsEmpty(ibOrder.FaGroup);
@@ -1420,22 +1737,27 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void UnifiedPctChangeUsesExactPercentagePrecedenceTest()
+        public void UnifiedDisabledPctChangeRetainsLegacyIntegerConversionTest()
         {
             var brokerage = CreateOfflineBrokerage();
-            UnifiedGroupsField.SetValue(brokerage, true);
-            var ibOrder = ConvertOrder(
-                brokerage,
-                CreateOrder(new InteractiveBrokersOrderProperties
+            UnifiedGroupsField.SetValue(brokerage, false);
+            var order = CreateOrder(new InteractiveBrokersOrderProperties
                 {
                     FaGroup = FaGroupName,
-                    FaMethod = " pctchange ",
-                    FaPercentage = 25,
-                    ExactFaPercentage = 12.5m
-                }));
+                    FaMethod = "PctChange",
+                    FaPercentage = 25
+                });
+
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(order));
+            Assert.DoesNotThrow(() =>
+                brokerage.ValidateFinancialAdvisorOrderAdmission(
+                    order,
+                    isUpdate: true));
+            var ibOrder = ConvertOrder(brokerage, order);
 
             Assert.AreEqual("PctChange", ibOrder.FaMethod);
-            Assert.AreEqual("12.5", ibOrder.FaPercentage);
+            Assert.AreEqual("25", ibOrder.FaPercentage);
             Assert.AreEqual(0m, ibOrder.TotalQuantity);
         }
 
@@ -1638,7 +1960,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         Account = FaMasterAccount,
                         FaGroup = FaGroupName,
                         FaMethod = "NetLiq",
-                        FaPercentage = "12.5",
+                        FaPercentage = "12",
                         TotalQuantity = 19.75m,
                         Action = "BUY",
                         OrderType = "LMT",
@@ -1681,7 +2003,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                         Assert.AreEqual(FaGroupName, groupProperties.FaGroup, recoveryPass);
                         Assert.IsEmpty(groupProperties.Account, recoveryPass);
                         Assert.AreEqual("NetLiq", groupProperties.FaMethod, recoveryPass);
-                        Assert.AreEqual(12.5m, groupProperties.ExactFaPercentage, recoveryPass);
+                        Assert.AreEqual(12, groupProperties.FaPercentage, recoveryPass);
                         Assert.AreEqual(TimeInForce.GoodTilCanceled.GetType(),
                             groupProperties.TimeInForce.GetType(), recoveryPass);
                         Assert.IsTrue(
@@ -1736,8 +2058,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
-        [Test]
-        public void RecoveredPctChangeOrderKeepsPercentageAndZeroWireQuantityTest()
+        [TestCase("-25", -25)]
+        [TestCase("-25.5", 0)]
+        public void RecoveredPctChangeOrderRetainsOnlyLegacyIntegerPercentageTest(
+            string wirePercentage,
+            int expectedPercentage)
         {
             var algorithm = new AlgorithmStub();
             algorithm.AddEquity("SPY");
@@ -1748,7 +2073,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Account = FaMasterAccount,
                 FaGroup = FaGroupName,
                 FaMethod = "PctChange",
-                FaPercentage = "-25.5",
+                FaPercentage = wirePercentage,
                 TotalQuantity = 0m,
                 Action = "SELL",
                 OrderType = "LMT",
@@ -1763,10 +2088,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 Assert.AreEqual(FaGroupName, properties.FaGroup);
                 Assert.AreEqual("PctChange", properties.FaMethod);
-                Assert.AreEqual(-25.5m, properties.ExactFaPercentage);
+                Assert.AreEqual(expectedPercentage, properties.FaPercentage);
                 Assert.AreEqual(0m, converted.TotalQuantity);
                 Assert.AreEqual("PctChange", converted.FaMethod);
-                Assert.AreEqual("-25.5", converted.FaPercentage);
+                Assert.AreEqual(expectedPercentage.ToStringInvariant(), converted.FaPercentage);
             });
         }
 
@@ -1926,15 +2251,20 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             }
             else
             {
-                Assert.Throws<InvalidOperationException>(() =>
+                var exception = Assert.Catch(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         order,
                         snapshot));
+                Assert.IsInstanceOf(
+                    savedMethod == "PctChange" || requestedMethod == "PctChange"
+                        ? typeof(NotSupportedException)
+                        : typeof(InvalidOperationException),
+                    exception);
             }
         }
 
         [Test]
-        public void PctChangeAndMonetaryAmountValidationIsActionable()
+        public void UnsupportedPctChangeAndMonetaryAmountValidationIsActionable()
         {
             var netLiq = new BrokerageAccountGroup(
                 FaGroupName,
@@ -1949,13 +2279,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var snapshot = CreateSnapshot(BrokerageAccountSnapshotStatus.Ready, netLiq);
 
             StringAssert.Contains(
-                "valid FaPercentage",
-                Assert.Throws<InvalidOperationException>(() =>
+                "cannot safely account for split fills",
+                Assert.Throws<NotSupportedException>(() =>
                     InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                         pctChangeOrder,
                         snapshot)).Message);
             pctChangeOrder.FaPercentage = "-100.5";
-            Assert.DoesNotThrow(() =>
+            Assert.Throws<NotSupportedException>(() =>
                 InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
                     pctChangeOrder,
                     snapshot));
@@ -1966,6 +2296,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 new[] { "ManagedAccount" },
                 new Dictionary<string, decimal> { ["ManagedAccount"] = 100m });
             pctChangeOrder.FaGroup = monetary.Name;
+            pctChangeOrder.FaMethod = string.Empty;
             StringAssert.Contains(
                 "unsupported saved allocation method 'MonetaryAmount'",
                 Assert.Throws<NotSupportedException>(() =>
@@ -2002,8 +2333,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 foreach (var requestedMethod in requestedMethods)
                 {
-                    var expectedAllowed = requestedMethod == "PctChange" ||
-                        savedMethod != "PctChange" &&
+                    var expectedAllowed = savedMethod != "PctChange" &&
+                        requestedMethod != "PctChange" &&
                         (requestedMethod.Length == 0 ||
                             (savedMethod is "NetLiq" or "AvailableEquity" or "Equal") &&
                             requestedMethod == savedMethod);
@@ -2018,7 +2349,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         private static LimitOrder CreateOrder(
-            InteractiveBrokersOrderProperties properties,
+            IOrderProperties properties,
             decimal quantity = 10m,
             decimal limitPrice = 100m)
         {
@@ -2094,6 +2425,34 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.IsNotNull(admissionException);
             Assert.DoesNotThrow(() => ConvertOrder(brokerage, order));
             return admissionException;
+        }
+
+        private static bool CanEmitFill(
+            InteractiveBrokersBrokerage brokerage,
+            LeanOrder order,
+            string account) =>
+            (bool)CanEmitFillMethod.Invoke(
+                brokerage,
+                new object[]
+                {
+                    order,
+                    new Execution { AcctNumber = account }
+                });
+
+        private static void AssertUnsupportedExplicitAllocationMethod(
+            IBApi.Order order,
+            BrokerageAccountSnapshot snapshot,
+            string allocationMethod)
+        {
+            var exception = Assert.Throws<NotSupportedException>(() =>
+                InteractiveBrokersBrokerage.ValidateFinancialAdvisorAllocationMethod(
+                    order,
+                    snapshot));
+            Assert.Multiple(() =>
+            {
+                StringAssert.Contains(allocationMethod, exception.Message);
+                StringAssert.Contains("Supported order allocation methods", exception.Message);
+            });
         }
 
         private static BrokerageAccountSnapshot CreateSnapshot(

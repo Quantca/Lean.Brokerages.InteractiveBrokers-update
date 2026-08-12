@@ -228,12 +228,15 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             await worker.WaitAsync(TimeSpan.FromSeconds(5));
         }
 
-        [Test]
-        public async Task UnsavedChangesReadbackRetriesUntilXmlConfirmsMutationTest()
+        [TestCase(-1)]
+        [TestCase(int.MaxValue)]
+        public async Task UnsavedChangesReadbackRetriesUntilXmlConfirmsMutationTest(
+            int requestId)
         {
             using var scenario = new MutationScenario
             {
-                UnsavedChangesReadbacksBeforeApply = 2
+                UnsavedChangesReadbacksBeforeApply = 2,
+                UnsavedChangesRequestId = requestId
             };
             using var state = scenario.CreateState();
             var ready = await ReadyAsync(state);
@@ -248,6 +251,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     BrokerageAccountGroupAllocationUpdateStatus.Succeeded,
                     completed.Status);
                 Assert.AreEqual(2, scenario.UnsavedChangesReadbackCount);
+                Assert.AreEqual(1, scenario.ReplaceCount);
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, refreshed.Status);
                 Assert.IsFalse(state.IsGroupTradingBlocked);
             });
@@ -258,7 +262,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             using var scenario = new MutationScenario
             {
-                UnsavedChangesReadbacksBeforeApply = int.MaxValue
+                UnsavedChangesReadbacksBeforeApply = int.MaxValue,
+                UnsavedChangesRequestId = int.MaxValue
             };
             using var state = scenario.CreateState(TimeSpan.FromMilliseconds(700));
             var ready = await ReadyAsync(state);
@@ -272,6 +277,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     BrokerageAccountGroupAllocationUpdateStatus.Failed,
                     failed.Status);
                 Assert.GreaterOrEqual(scenario.UnsavedChangesReadbackCount, 2);
+                Assert.AreEqual(1, scenario.ReplaceCount);
                 StringAssert.Contains("replaceFA may have applied", failed.ErrorMessage);
                 Assert.AreEqual(
                     BrokerageAccountSnapshotStatus.Stale, state.Snapshot.Status);
@@ -1762,6 +1768,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 get => Volatile.Read(ref _unsavedChangesReadbacksRemaining);
                 set => Volatile.Write(ref _unsavedChangesReadbacksRemaining, value);
             }
+            internal int UnsavedChangesRequestId { get; set; } = -1;
             internal object CallbackStateLock { get; set; }
             internal ManualResetEventSlim ManagedRequestEntered { get; } = new();
             internal ManualResetEventSlim ReplacementAuthorized { get; } = new();
@@ -1879,7 +1886,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                                             Interlocked.Increment(
                                                 ref _unsavedChangesReadbackCount);
                                             Client.error(
-                                                -1, 0, 10230,
+                                                UnsavedChangesRequestId, 0, 10230,
                                                 "unsaved FA changes", string.Empty);
                                             return;
                                         }

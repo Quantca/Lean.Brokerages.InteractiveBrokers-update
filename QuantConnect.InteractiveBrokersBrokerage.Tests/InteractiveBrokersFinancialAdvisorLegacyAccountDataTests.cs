@@ -69,6 +69,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 "NextRequestId", InstanceNonPublic)
             ?? throw new InvalidOperationException(
                 "Missing Financial Advisor service request ID allocator.");
+        private static readonly FieldInfo HasOpenFinancialAdvisorOrdersField =
+            typeof(InteractiveBrokersFinancialAdvisorAccountState).GetField(
+                "_hasOpenFinancialAdvisorOrders",
+                InstanceNonPublic)
+            ?? throw new InvalidOperationException(
+                "Missing Financial Advisor open-order predicate.");
 
         [Test]
         public void UnifiedGroupsAffectOnlyFinancialAdvisorAccountsTest()
@@ -295,6 +301,21 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     new[] { GroupName },
                     new[] { AccountId }));
             Assert.IsFalse(accepted);
+        }
+
+        [Test]
+        public void FinancialAdvisorOpenOrderPredicateHandlesMissingOrderProviderTest()
+        {
+            using var scenario = LegacyAccountScenario.CreateConfigured(
+                GroupName,
+                unifiedGroupsEnabled: true);
+            var state = (InteractiveBrokersFinancialAdvisorAccountState)
+                FinancialAdvisorAccountStateField.GetValue(scenario.Brokerage);
+            var hasOpenOrders = (Func<bool>)
+                HasOpenFinancialAdvisorOrdersField.GetValue(state);
+
+            Assert.DoesNotThrow(() => hasOpenOrders());
+            Assert.IsFalse(hasOpenOrders());
         }
 
         private static FieldInfo GetRequiredField(string name)
