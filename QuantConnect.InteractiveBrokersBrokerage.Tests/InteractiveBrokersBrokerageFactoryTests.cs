@@ -22,6 +22,7 @@ using NUnit.Framework;
 using QuantConnect.Algorithm;
 using QuantConnect.Brokerages.InteractiveBrokers;
 using QuantConnect.Configuration;
+using QuantConnect.IBAutomater;
 using QuantConnect.Interfaces;
 using QuantConnect.Packets;
 using QuantConnect.Securities;
@@ -146,6 +147,46 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [Test]
+        public void IBAutomaterApiSupportsFinancialAdvisorSettingWithoutChangingExistingConstructor()
+        {
+            var constructors = typeof(QuantConnect.IBAutomater.IBAutomater)
+                .GetConstructors(BindingFlags.Instance | BindingFlags.Public)
+                .Select(constructor => constructor.GetParameters())
+                .ToList();
+
+            Assert.Multiple(() =>
+            {
+                Assert.IsTrue(HasConstructor(constructors,
+                    typeof(string), typeof(string), typeof(string), typeof(string), typeof(string), typeof(int), typeof(bool)));
+                Assert.IsTrue(HasConstructor(constructors,
+                    typeof(string), typeof(string), typeof(string), typeof(string), typeof(string), typeof(int), typeof(bool), typeof(bool)));
+            });
+
+            var expectedErrorCodes = new[]
+            {
+                ErrorCode.None,
+                ErrorCode.ProcessStartFailed,
+                ErrorCode.IbGatewayVersionNotInstalled,
+                ErrorCode.JavaNotFound,
+                ErrorCode.JavaException,
+                ErrorCode.LoginFailed,
+                ErrorCode.ExistingSessionDetected,
+                ErrorCode.SecurityDialogDetected,
+                ErrorCode.TwoFactorConfirmationTimeout,
+                ErrorCode.InitializationTimeout,
+                ErrorCode.UnsupportedVersion,
+                ErrorCode.ApiSupportNotAvailable,
+                ErrorCode.RestartedProcessNotFound,
+                ErrorCode.UnknownMessageWindowDetected,
+                ErrorCode.SoftRestartTimeout,
+                ErrorCode.LoginFailedAccountTasksRequired,
+                ErrorCode.FinancialAdvisorAllocationGroupsConfigurationUnavailable
+            };
+            CollectionAssert.AreEqual(Enumerable.Range(0, expectedErrorCodes.Length), expectedErrorCodes.Select(value => (int)value));
+            CollectionAssert.AreEqual(expectedErrorCodes, Enum.GetValues<ErrorCode>());
+        }
+
         private static ParameterInfo[] AssertConstructor(
             IEnumerable<ConstructorInfo> constructors,
             Type[] parameterTypes,
@@ -159,6 +200,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             CollectionAssert.AreEqual(parameterNames, parameters.Select(parameter => parameter.Name));
             return parameters;
+        }
+
+        private static bool HasConstructor(IEnumerable<ParameterInfo[]> constructors, params Type[] parameterTypes)
+        {
+            return constructors.Any(parameters => parameters
+                .Select(parameter => parameter.ParameterType)
+                .SequenceEqual(parameterTypes));
         }
 
         private static LiveNodePacket CreateJob()
