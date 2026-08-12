@@ -1450,6 +1450,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="loadExistingHoldings">False will ignore existing security holdings from being loaded.</param>
         /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)</param>
         /// <param name="financialAdvisorsGroupFilter">The name of the financial advisors group associated with this client.</param>
+        /// <param name="financialAdvisorGroupManagementEnabled">True to enable algorithm-driven Financial Advisor group management.</param>
+        /// <param name="financialAdvisorUnifiedGroupsEnabled">True to enable unified Financial Advisor group handling.</param>
         private void Initialize(
             IAlgorithm algorithm,
             IOrderProvider orderProvider,

@@ -1139,7 +1139,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     topology.Aliases, topology.FamilyCodes);
                 EnsureNoOpenFinancialAdvisorOrders("account-group assignment");
                 await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
-                item.BrokerStateInvalidated = true;
             }
             item.BrokerStateInvalidated = true;
             var confirmedXml = changed
@@ -1257,7 +1256,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 expectedConfigurationVersion = ComputeConfigurationHash(updatedXml);
                 EnsureNoOpenFinancialAdvisorOrders("group allocation update");
                 await ReplaceGroupsAsync(item, updatedXml).ConfigureAwait(false);
-                item.BrokerStateInvalidated = true;
             }
             item.BrokerStateInvalidated = true;
             var confirmedXml = changed
