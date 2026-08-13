@@ -72,6 +72,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private const string BrokerageName = "Interactive Brokers Brokerage";
 
+        internal const string TwoFactorAuthenticationMethodConfigKey = "ib-two-factor-authentication-method";
+        internal const string MobileAuthenticatorSecretConfigKey = "ib-mobile-authenticator-secret";
+
         /// <summary>
         /// Prefix of the IBAutomater log line emitted when an order confirmation/warning
         /// window is auto-accepted. The text after the prefix is the message shown to the user.
@@ -111,6 +114,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         public static string DefaultVersion { get; } = "1034";
 
         private IBAutomater.IBAutomater _ibAutomater;
+        private TwoFactorAuthenticationMethod _twoFactorAuthenticationMethod = TwoFactorAuthenticationMethod.IbKey;
 
         // Existing orders created in TWS can *only* be cancelled/modified when connected with ClientId = 0
         private const int ClientId = 0;
@@ -366,7 +370,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 weeklyRestartUtcTime: null,
                 financialAdvisorsGroupFilter: Config.Get("ib-financial-advisors-group-filter"),
                 financialAdvisorGroupManagementEnabled: Config.GetBool("ib-financial-advisors-group-management-enabled"),
-                financialAdvisorUnifiedGroupsEnabled: Config.GetBool("ib-financial-advisors-unified-groups-enabled")
+                financialAdvisorUnifiedGroupsEnabled: Config.GetBool("ib-financial-advisors-unified-groups-enabled"),
+                twoFactorAuthenticationMethod: Config.Get(TwoFactorAuthenticationMethodConfigKey),
+                mobileAuthenticatorSecret: Config.Get(MobileAuthenticatorSecretConfigKey)
                 )
         {
         }
@@ -422,7 +428,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 weeklyRestartUtcTime,
                 financialAdvisorsGroupFilter,
                 false,
-                false)
+                false,
+                null,
+                null)
         {
         }
 
@@ -469,6 +477,49 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string financialAdvisorsGroupFilter,
             bool financialAdvisorGroupManagementEnabled,
             bool financialAdvisorUnifiedGroupsEnabled)
+            : this(
+                algorithm,
+                orderProvider,
+                securityProvider,
+                account,
+                host,
+                port,
+                ibDirectory,
+                ibVersion,
+                userName,
+                password,
+                tradingMode,
+                agentDescription,
+                loadExistingHoldings,
+                weeklyRestartUtcTime,
+                financialAdvisorsGroupFilter,
+                financialAdvisorGroupManagementEnabled,
+                financialAdvisorUnifiedGroupsEnabled,
+                null,
+                null)
+        {
+        }
+
+        internal InteractiveBrokersBrokerage(
+            IAlgorithm algorithm,
+            IOrderProvider orderProvider,
+            ISecurityProvider securityProvider,
+            string account,
+            string host,
+            int port,
+            string ibDirectory,
+            string ibVersion,
+            string userName,
+            string password,
+            string tradingMode,
+            string agentDescription,
+            bool loadExistingHoldings,
+            TimeSpan? weeklyRestartUtcTime,
+            string financialAdvisorsGroupFilter,
+            bool financialAdvisorGroupManagementEnabled,
+            bool financialAdvisorUnifiedGroupsEnabled,
+            string twoFactorAuthenticationMethod,
+            string mobileAuthenticatorSecret)
             : base(BrokerageName)
         {
             Initialize(
@@ -488,7 +539,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 weeklyRestartUtcTime,
                 financialAdvisorsGroupFilter,
                 financialAdvisorGroupManagementEnabled,
-                financialAdvisorUnifiedGroupsEnabled);
+                financialAdvisorUnifiedGroupsEnabled,
+                twoFactorAuthenticationMethod,
+                mobileAuthenticatorSecret);
         }
 
         /// <summary>
@@ -1452,6 +1505,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="financialAdvisorsGroupFilter">The name of the financial advisors group associated with this client.</param>
         /// <param name="financialAdvisorGroupManagementEnabled">True to enable algorithm-driven Financial Advisor group management.</param>
         /// <param name="financialAdvisorUnifiedGroupsEnabled">True to enable unified Financial Advisor group handling.</param>
+        /// <param name="twoFactorAuthenticationMethod">The two-factor authentication method used by IBAutomater.</param>
+        /// <param name="mobileAuthenticatorSecret">The Mobile Authenticator setup key used by IBAutomater.</param>
         private void Initialize(
             IAlgorithm algorithm,
             IOrderProvider orderProvider,
@@ -1469,13 +1524,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             TimeSpan? weeklyRestartUtcTime = null,
             string financialAdvisorsGroupFilter = default,
             bool financialAdvisorGroupManagementEnabled = false,
-            bool financialAdvisorUnifiedGroupsEnabled = false)
+            bool financialAdvisorUnifiedGroupsEnabled = false,
+            string twoFactorAuthenticationMethod = default,
+            string mobileAuthenticatorSecret = default)
         {
             if (_isInitialized)
             {
                 return;
             }
 
+            _twoFactorAuthenticationMethod = ParseTwoFactorAuthenticationSettings(twoFactorAuthenticationMethod, mobileAuthenticatorSecret);
             ValidateSubscription();
 
             _isInitialized = true;
@@ -1529,7 +1587,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             // start IB Gateway
             var exportIbGatewayLogs = true; // Config.GetBool("ib-export-ibgateway-logs");
-            _ibAutomater = new IBAutomater.IBAutomater(ibDirectory, ibVersion, userName, password, tradingMode, port, exportIbGatewayLogs, financialAdvisorUnifiedGroupsEnabled);
+            _ibAutomater = new IBAutomater.IBAutomater(
+                ibDirectory,
+                ibVersion,
+                userName,
+                password,
+                tradingMode,
+                port,
+                exportIbGatewayLogs,
+                financialAdvisorUnifiedGroupsEnabled,
+                _twoFactorAuthenticationMethod,
+                mobileAuthenticatorSecret);
             _ibAutomater.OutputDataReceived += OnIbAutomaterOutputDataReceived;
             _ibAutomater.ErrorDataReceived += OnIbAutomaterErrorDataReceived;
             _ibAutomater.Exited += OnIbAutomaterExited;
@@ -4268,6 +4336,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var password = job.BrokerageData["ib-password"];
             var tradingMode = job.BrokerageData["ib-trading-mode"];
             var agentDescription = job.BrokerageData["ib-agent-description"];
+            job.BrokerageData.TryGetValue(TwoFactorAuthenticationMethodConfigKey, out var twoFactorAuthenticationMethod);
+            job.BrokerageData.TryGetValue(MobileAuthenticatorSecretConfigKey, out var mobileAuthenticatorSecret);
             var financialAdvisorErrors = new List<string>();
             InteractiveBrokersBrokerageFactory.ParseFinancialAdvisorSettings(
                 job.BrokerageData,
@@ -4301,7 +4371,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 loadExistingHoldings,
                 financialAdvisorsGroupFilter: financialAdvisorsGroupFilter,
                 financialAdvisorGroupManagementEnabled: financialAdvisorGroupManagementEnabled,
-                financialAdvisorUnifiedGroupsEnabled: financialAdvisorUnifiedGroupsEnabled);
+                financialAdvisorUnifiedGroupsEnabled: financialAdvisorUnifiedGroupsEnabled,
+                twoFactorAuthenticationMethod: twoFactorAuthenticationMethod,
+                mobileAuthenticatorSecret: mobileAuthenticatorSecret);
 
             if (!IsConnected)
             {
@@ -5407,14 +5479,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
-            if (e.Data.Contains("Waiting for 2FA confirmation", StringComparison.InvariantCultureIgnoreCase))
+            if (_twoFactorAuthenticationMethod == TwoFactorAuthenticationMethod.IbKey &&
+                e.Data.Contains("Waiting for 2FA confirmation", StringComparison.InvariantCultureIgnoreCase))
             {
                 // composer get IResultHandler send message
                 var resultHandler = Composer.Instance.GetPart<IResultHandler>();
                 resultHandler?.DebugMessage("Logging into account. Check phone for two-factor authentication verification...");
             }
-            else if (e.Data.Contains("2FA maximum attempts reached", StringComparison.InvariantCultureIgnoreCase) ||
-                     e.Data.Contains("IB Automater initialization timeout", StringComparison.InvariantCultureIgnoreCase))
+            else if (_twoFactorAuthenticationMethod == TwoFactorAuthenticationMethod.IbKey &&
+                     (e.Data.Contains("2FA maximum attempts reached", StringComparison.InvariantCultureIgnoreCase) ||
+                      e.Data.Contains("IB Automater initialization timeout", StringComparison.InvariantCultureIgnoreCase)))
             {
                 Task.Factory.StartNew(() =>
                 {
@@ -5794,12 +5868,46 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private bool IsRecuperable2FATimeout(StartResult result)
         {
-            if (_pastFirstConnection && (result.ErrorCode == ErrorCode.TwoFactorConfirmationTimeout || result.ErrorCode == ErrorCode.InitializationTimeout))
+            if (_twoFactorAuthenticationMethod == TwoFactorAuthenticationMethod.IbKey &&
+                _pastFirstConnection &&
+                (result.ErrorCode == ErrorCode.TwoFactorConfirmationTimeout || result.ErrorCode == ErrorCode.InitializationTimeout))
             {
                 Log.Trace($"InteractiveBrokersBrokerage.IsRecuperable2FATimeout(): will trigger user action request");
                 return true;
             }
             return false;
+        }
+
+        internal static TwoFactorAuthenticationMethod ParseTwoFactorAuthenticationSettings(
+            string twoFactorAuthenticationMethod,
+            string mobileAuthenticatorSecret)
+        {
+            var method = twoFactorAuthenticationMethod?.Trim();
+            if (string.IsNullOrEmpty(method) ||
+                method.Equals("ib-key", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(mobileAuthenticatorSecret))
+                {
+                    throw new ArgumentException(
+                        $"The '{MobileAuthenticatorSecretConfigKey}' setting must be empty when using IB Key.");
+                }
+
+                return TwoFactorAuthenticationMethod.IbKey;
+            }
+
+            if (method.Equals("mobile-authenticator", StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(mobileAuthenticatorSecret))
+                {
+                    throw new ArgumentException(
+                        $"The '{MobileAuthenticatorSecretConfigKey}' setting is required when using Mobile Authenticator.");
+                }
+
+                return TwoFactorAuthenticationMethod.MobileAuthenticator;
+            }
+
+            throw new ArgumentException(
+                $"The '{TwoFactorAuthenticationMethodConfigKey}' setting must be either 'ib-key' or 'mobile-authenticator'.");
         }
 
         private void HandleAccountSummary(object sender, IB.AccountSummaryEventArgs e)

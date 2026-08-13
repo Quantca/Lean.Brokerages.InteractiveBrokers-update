@@ -42,6 +42,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var constructors = typeof(InteractiveBrokersBrokerage)
                 .GetConstructors(BindingFlags.Instance | BindingFlags.Public);
 
+            Assert.AreEqual(5, constructors.Length);
+
             AssertConstructor(constructors, Array.Empty<Type>(), Array.Empty<string>());
             AssertConstructor(
                 constructors,
@@ -148,7 +150,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void IBAutomaterApiSupportsFinancialAdvisorSettingWithoutChangingExistingConstructor()
+        public void IBAutomaterApiSupportsMobileAuthenticatorWithoutChangingExistingConstructors()
         {
             var constructors = typeof(QuantConnect.IBAutomater.IBAutomater)
                 .GetConstructors(BindingFlags.Instance | BindingFlags.Public)
@@ -161,6 +163,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     typeof(string), typeof(string), typeof(string), typeof(string), typeof(string), typeof(int), typeof(bool)));
                 Assert.IsTrue(HasConstructor(constructors,
                     typeof(string), typeof(string), typeof(string), typeof(string), typeof(string), typeof(int), typeof(bool), typeof(bool)));
+                Assert.IsTrue(HasConstructor(constructors,
+                    typeof(string), typeof(string), typeof(string), typeof(string), typeof(string), typeof(int), typeof(bool), typeof(bool),
+                    typeof(TwoFactorAuthenticationMethod), typeof(string)));
             });
 
             var expectedErrorCodes = new[]
@@ -181,10 +186,102 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 ErrorCode.UnknownMessageWindowDetected,
                 ErrorCode.SoftRestartTimeout,
                 ErrorCode.LoginFailedAccountTasksRequired,
-                ErrorCode.FinancialAdvisorAllocationGroupsConfigurationUnavailable
+                ErrorCode.FinancialAdvisorAllocationGroupsConfigurationUnavailable,
+                ErrorCode.MobileAuthenticatorAuthenticationFailed
             };
             CollectionAssert.AreEqual(Enumerable.Range(0, expectedErrorCodes.Length), expectedErrorCodes.Select(value => (int)value));
             CollectionAssert.AreEqual(expectedErrorCodes, Enum.GetValues<ErrorCode>());
+        }
+
+        [TestCase(null, null, TwoFactorAuthenticationMethod.IbKey)]
+        [TestCase("", "", TwoFactorAuthenticationMethod.IbKey)]
+        [TestCase("  IB-KEY  ", "  ", TwoFactorAuthenticationMethod.IbKey)]
+        [TestCase("  MOBILE-AUTHENTICATOR  ", "JBSWY3DPEHPK3PXP", TwoFactorAuthenticationMethod.MobileAuthenticator)]
+        public void ParsesTwoFactorAuthenticationSettings(
+            string method,
+            string secret,
+            TwoFactorAuthenticationMethod expected)
+        {
+            Assert.AreEqual(
+                expected,
+                InteractiveBrokersBrokerage.ParseTwoFactorAuthenticationSettings(method, secret));
+        }
+
+        [TestCase("unknown", null)]
+        [TestCase("mobile-authenticator", null)]
+        [TestCase("mobile-authenticator", " ")]
+        public void RejectsInvalidTwoFactorAuthenticationSettings(string method, string secret)
+        {
+            Assert.Throws<ArgumentException>(() =>
+                InteractiveBrokersBrokerage.ParseTwoFactorAuthenticationSettings(method, secret));
+        }
+
+        [Test]
+        public void RejectsUnusedMobileAuthenticatorSecretWithoutLeakingIt()
+        {
+            const string secret = "JBSWY3DPEHPK3PXP";
+
+            var exception = Assert.Throws<ArgumentException>(() =>
+                InteractiveBrokersBrokerage.ParseTwoFactorAuthenticationSettings("ib-key", secret));
+
+            StringAssert.DoesNotContain(secret, exception.Message);
+        }
+
+        [Test]
+        public void RejectsInvalidTwoFactorAuthenticationBeforeFactoryInitialization()
+        {
+            using var factory = new InteractiveBrokersBrokerageFactory();
+            var job = CreateJob("ib-key", "JBSWY3DPEHPK3PXP");
+
+            Assert.Throws<ArgumentException>(() => factory.CreateBrokerage(job, AlgorithmDependency));
+        }
+
+        [Test]
+        [NonParallelizable]
+        public void RejectsInvalidTwoFactorAuthenticationBeforeConfigurationInitialization()
+        {
+            using var configScope = new ConfigValueScope(
+                InteractiveBrokersBrokerage.TwoFactorAuthenticationMethodConfigKey,
+                InteractiveBrokersBrokerage.MobileAuthenticatorSecretConfigKey);
+
+            Config.Set(InteractiveBrokersBrokerage.TwoFactorAuthenticationMethodConfigKey, "mobile-authenticator");
+            Config.Set(InteractiveBrokersBrokerage.MobileAuthenticatorSecretConfigKey, "");
+
+            Assert.Throws<ArgumentException>(() => new InteractiveBrokersBrokerage(
+                AlgorithmDependency,
+                AlgorithmDependency.Transactions,
+                AlgorithmDependency.Portfolio));
+        }
+
+        [Test]
+        public void RejectsInvalidTwoFactorAuthenticationBeforeSetJobInitialization()
+        {
+            using var brokerage = new InteractiveBrokersBrokerage();
+            var job = CreateJob("mobile-authenticator", null);
+
+            Assert.Throws<ArgumentException>(() => brokerage.SetJob(job));
+        }
+
+        [TestCase(TwoFactorAuthenticationMethod.IbKey, ErrorCode.TwoFactorConfirmationTimeout, true)]
+        [TestCase(TwoFactorAuthenticationMethod.IbKey, ErrorCode.InitializationTimeout, true)]
+        [TestCase(TwoFactorAuthenticationMethod.MobileAuthenticator, ErrorCode.TwoFactorConfirmationTimeout, false)]
+        [TestCase(TwoFactorAuthenticationMethod.MobileAuthenticator, ErrorCode.InitializationTimeout, false)]
+        [TestCase(TwoFactorAuthenticationMethod.MobileAuthenticator, ErrorCode.MobileAuthenticatorAuthenticationFailed, false)]
+        public void OnlyIbKeyTimeoutsAreRecoverable(
+            TwoFactorAuthenticationMethod method,
+            ErrorCode errorCode,
+            bool expected)
+        {
+            using var brokerage = new InteractiveBrokersBrokerage();
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            typeof(InteractiveBrokersBrokerage).GetField("_twoFactorAuthenticationMethod", flags).SetValue(brokerage, method);
+            typeof(InteractiveBrokersBrokerage).GetField("_pastFirstConnection", flags).SetValue(brokerage, true);
+
+            var result = (bool)typeof(InteractiveBrokersBrokerage)
+                .GetMethod("IsRecuperable2FATimeout", flags)
+                .Invoke(brokerage, new object[] { new StartResult(errorCode) });
+
+            Assert.AreEqual(expected, result);
         }
 
         private static ParameterInfo[] AssertConstructor(
@@ -209,19 +306,27 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 .SequenceEqual(parameterTypes));
         }
 
-        private static LiveNodePacket CreateJob()
+        private static LiveNodePacket CreateJob(string method, string secret)
         {
-            return new LiveNodePacket
+            var brokerageData = new Dictionary<string, string>
             {
-                BrokerageData = new Dictionary<string, string>
-                {
-                    ["ib-account"] = "DU1234567",
-                    ["ib-user-name"] = "user",
-                    ["ib-password"] = "password",
-                    ["ib-trading-mode"] = "paper",
-                    ["ib-agent-description"] = "I"
-                }
+                ["ib-account"] = "DU1234567",
+                ["ib-user-name"] = "user",
+                ["ib-password"] = "password",
+                ["ib-trading-mode"] = "paper",
+                ["ib-agent-description"] = "I"
             };
+
+            if (method != null)
+            {
+                brokerageData[InteractiveBrokersBrokerage.TwoFactorAuthenticationMethodConfigKey] = method;
+            }
+            if (secret != null)
+            {
+                brokerageData[InteractiveBrokersBrokerage.MobileAuthenticatorSecretConfigKey] = secret;
+            }
+
+            return new LiveNodePacket { BrokerageData = brokerageData };
         }
 
         [Test]
@@ -316,7 +421,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             string setting)
         {
             using var brokerage = new InteractiveBrokersBrokerage();
-            var job = CreateJob();
+            var job = CreateJob(null, null);
             job.BrokerageData[setting] = "not-a-boolean";
 
             var exception = Assert.Throws<ArgumentException>(() =>
@@ -352,7 +457,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         public void RejectsFinancialAdvisorGroupManagementWithoutUnifiedGroupsBeforeSetJobInitialization()
         {
             using var brokerage = new InteractiveBrokersBrokerage();
-            var job = CreateJob();
+            var job = CreateJob(null, null);
             job.BrokerageData["ib-financial-advisors-group-management-enabled"] = "true";
             job.BrokerageData["ib-financial-advisors-unified-groups-enabled"] = "false";
 
@@ -370,6 +475,19 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         public void ExportsFinancialAdvisorUnifiedGroupsSettingInBrokerageData(string value)
         {
             const string key = "ib-financial-advisors-unified-groups-enabled";
+            using var configScope = new ConfigValueScope(key);
+
+            Config.Set(key, value);
+            using var factory = new InteractiveBrokersBrokerageFactory();
+
+            Assert.AreEqual(value, factory.BrokerageData[key]);
+        }
+
+        [TestCase("ib-two-factor-authentication-method", "mobile-authenticator")]
+        [TestCase("ib-mobile-authenticator-secret", "JBSWY3DPEHPK3PXP")]
+        [NonParallelizable]
+        public void ExportsTwoFactorAuthenticationSettingsInBrokerageData(string key, string value)
+        {
             using var configScope = new ConfigValueScope(key);
 
             Config.Set(key, value);

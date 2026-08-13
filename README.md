@@ -129,6 +129,17 @@ If you already have a live environment configured in your Lean configuration fil
 
 The IB API does not support the IBKR LITE plan. You need an IBKR PRO plan. Individual and Financial Advisor (FA) accounts are available. IB supports cash and margin accounts.
 
+### Two-Factor Authentication
+
+IB Key remains the default authentication method. Self-hosted LEAN deployments configured directly through `config.json` can instead use a standard Mobile Authenticator setup key:
+
+| Setting | Description |
+| --- | --- |
+| `ib-two-factor-authentication-method` | `ib-key` (the default) or `mobile-authenticator`. |
+| `ib-mobile-authenticator-secret` | The permanent Base32 setup key for Mobile Authenticator. Required only when `ib-two-factor-authentication-method` is `mobile-authenticator`. This is not a rotating one-time code. |
+
+Keep the setup key in a protected deployment configuration and synchronize the host clock. Before writing credentials, IBAutomater secures its transient Java-agent handoff with owner-only mode `0600` on Linux or a managed current-user-only access-control list on Windows, and it deletes the handoff after startup and on failure. Mobile Authenticator submits at most one generated code per login attempt and fails closed if authentication is rejected. The current LEAN CLI deployment wizard supports IB Key only; it does not securely collect or persist Mobile Authenticator setup keys.
+
 ### Financial Advisor Groups
 
 LEAN supports IB's current unified Allocation Groups model, configured in TWS as **Use Account Groups with Allocation Methods**. The following settings are optional and default to an empty value or `false`:

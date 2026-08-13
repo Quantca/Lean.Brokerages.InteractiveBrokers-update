@@ -51,6 +51,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             { "ib-trading-mode", Config.Get("ib-trading-mode") },
             { "ib-agent-description", Config.Get("ib-agent-description") },
             { "ib-weekly-restart-utc-time", Config.Get("ib-weekly-restart-utc-time") },
+            { InteractiveBrokersBrokerage.TwoFactorAuthenticationMethodConfigKey, Config.Get(InteractiveBrokersBrokerage.TwoFactorAuthenticationMethodConfigKey) },
+            { InteractiveBrokersBrokerage.MobileAuthenticatorSecretConfigKey, Config.Get(InteractiveBrokersBrokerage.MobileAuthenticatorSecretConfigKey) },
             { "ib-financial-advisors-group-filter", Config.Get("ib-financial-advisors-group-filter") },
             { "ib-financial-advisors-group-management-enabled", Config.Get("ib-financial-advisors-group-management-enabled") },
             { "ib-financial-advisors-unified-groups-enabled", Config.Get("ib-financial-advisors-unified-groups-enabled") }
@@ -83,6 +85,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var password = Read<string>(job.BrokerageData, "ib-password", errors);
             var tradingMode = Read<string>(job.BrokerageData, "ib-trading-mode", errors);
             var agentDescription = Read<string>(job.BrokerageData, "ib-agent-description", errors);
+            job.BrokerageData.TryGetValue(InteractiveBrokersBrokerage.TwoFactorAuthenticationMethodConfigKey, out var twoFactorAuthenticationMethod);
+            job.BrokerageData.TryGetValue(InteractiveBrokersBrokerage.MobileAuthenticatorSecretConfigKey, out var mobileAuthenticatorSecret);
             ParseFinancialAdvisorSettings(
                 job.BrokerageData,
                 errors,
@@ -131,7 +135,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 weeklyRestartUtcTime,
                 financialAdvisorsGroupFilter,
                 financialAdvisorGroupManagementEnabled,
-                financialAdvisorUnifiedGroupsEnabled);
+                financialAdvisorUnifiedGroupsEnabled,
+                twoFactorAuthenticationMethod,
+                mobileAuthenticatorSecret);
             Composer.Instance.AddPart<IDataQueueHandler>(ib);
 
             return ib;
