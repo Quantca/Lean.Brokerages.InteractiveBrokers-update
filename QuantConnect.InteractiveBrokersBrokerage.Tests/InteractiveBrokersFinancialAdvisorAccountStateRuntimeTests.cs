@@ -16,6 +16,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -1742,6 +1743,115 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public async Task TimedOutPositionsRequestRetriesOnceWithFreshIdTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            var clock = Stopwatch.StartNew();
+            var firstRequestId = 0;
+            var requestCount = 0;
+            var firstCancellationElapsed = TimeSpan.Zero;
+            var retryRequestElapsed = TimeSpan.Zero;
+            scenario.Actions.RequestPositions =
+                (requestId, accountOrGroup, authorize) =>
+                    scenario.RunAuthorized(authorize, () =>
+                    {
+                        scenario.Requests.Add($"positions:{accountOrGroup}");
+                        scenario.KeyedRequestIds.Add(requestId);
+                        if (Interlocked.Increment(ref requestCount) == 1)
+                        {
+                            firstRequestId = requestId;
+                            return;
+                        }
+
+                        retryRequestElapsed = clock.Elapsed;
+                        scenario.Client.positionMulti(
+                            firstRequestId,
+                            accountOrGroup,
+                            string.Empty,
+                            Scenario.MappedContract(),
+                            99m,
+                            42);
+                        scenario.Client.positionMultiEnd(firstRequestId);
+                        scenario.Client.positionMulti(
+                            requestId,
+                            accountOrGroup,
+                            string.Empty,
+                            Scenario.MappedContract(),
+                            1.25m,
+                            42);
+                        scenario.Client.positionMultiEnd(requestId);
+                    });
+            scenario.Actions.CancelPositions = (requestId, authorize) =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.CanceledPositionIds.Add(requestId);
+                    if (requestId == firstRequestId)
+                    {
+                        firstCancellationElapsed = clock.Elapsed;
+                    }
+                });
+            using var state = scenario.CreateState(
+                requestTimeout: TimeSpan.FromMilliseconds(50));
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var positionRequestIds = scenario.KeyedRequestIds
+                .Except(scenario.AccountRequestIds)
+                .ToArray();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.AreEqual(2, positionRequestIds.Length);
+                Assert.AreEqual(2, positionRequestIds.Distinct().Count());
+                CollectionAssert.AreEqual(
+                    positionRequestIds,
+                    scenario.CanceledPositionIds);
+                Assert.GreaterOrEqual(
+                    retryRequestElapsed - firstCancellationElapsed,
+                    TimeSpan.FromMilliseconds(200));
+                Assert.AreEqual(
+                    1.25m,
+                    snapshot.Accounts["ACC1"].Positions.Single().Quantity,
+                    "Late rows from the canceled request must not enter the retry result.");
+            });
+        }
+
+        [Test]
+        public async Task PositionsWireTimeoutIsNotRetriedTest()
+        {
+            using var scenario = Scenario.SingleAccount();
+            var attempts = 0;
+            var attemptedRequestId = 0;
+            scenario.Actions.RequestPositions =
+                (requestId, accountOrGroup, authorize) =>
+                    scenario.RunAuthorized(authorize, () =>
+                    {
+                        attemptedRequestId = requestId;
+                        Interlocked.Increment(ref attempts);
+                        throw new TimeoutException("simulated positions wire timeout");
+                    });
+            using var state = scenario.CreateState();
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, snapshot.Status);
+                StringAssert.Contains(
+                    "simulated positions wire timeout",
+                    snapshot.ErrorMessage);
+                Assert.AreEqual(1, attempts);
+                CollectionAssert.AreEqual(
+                    new[] { attemptedRequestId },
+                    scenario.CanceledPositionIds);
+            });
+        }
+
+        [Test]
         public async Task FaRowsRequireOwnedRequestIdTest()
         {
             using var positionScenario = Scenario.SingleAccount();
@@ -1776,11 +1886,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(BrokerageAccountSnapshotStatus.Failed, positionSnapshot.Status);
                 StringAssert.Contains("Timed out waiting for IB positions for 'ACC1'",
                     positionSnapshot.ErrorMessage);
-                Assert.AreEqual(1, positionScenario.CanceledPositionIds.Count);
-                Assert.AreEqual(positionScenario.KeyedRequestIds.Single(),
-                    positionScenario.CanceledPositionIds.Single());
-                Assert.IsTrue(positionState.IsServiceOwnedRequestId(
-                    positionScenario.CanceledPositionIds.Single()));
+                Assert.AreEqual(2, positionScenario.KeyedRequestIds.Count);
+                Assert.AreEqual(2, positionScenario.KeyedRequestIds.Distinct().Count());
+                CollectionAssert.AreEqual(
+                    positionScenario.KeyedRequestIds,
+                    positionScenario.CanceledPositionIds);
+                Assert.IsTrue(positionScenario.CanceledPositionIds.All(
+                    positionState.IsServiceOwnedRequestId));
                 Assert.IsEmpty(positionScenario.AccountRequestIds);
             });
 

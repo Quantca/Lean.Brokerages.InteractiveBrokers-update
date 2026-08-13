@@ -43,6 +43,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private const int QueueCapacity = 8;
         private const int MaximumAccountSummaryFallbackDetails = 10;
         private const int MaximumAccountSummaryFallbackDetailLength = 512;
+        private const int PositionRetryDelayMilliseconds = 250;
         private const string FinancialAdvisorAccountSummaryTags =
             "AccountType,NetLiquidation,TotalCashValue,AvailableFunds," +
             "ExcessLiquidity,BuyingPower,AccountReady,$LEDGER,$LEDGER:ALL";
@@ -2321,14 +2322,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private async Task<IReadOnlyList<PositionRow>> RequestPositionsAsync(
             SnapshotScope scope, string accountOrGroup)
         {
-            var requestId = NextRequestId();
-            var pending = await SendKeyedAsync(
-                scope, PendingKind.Positions, requestId,
-                authorize => _requests.RequestPositions(
-                    requestId, accountOrGroup, authorize),
-                authorize => _requests.CancelPositions(requestId, authorize),
-                $"positions for '{accountOrGroup}'").ConfigureAwait(false);
-            return pending.PositionRows.ToArray();
+            for (var attempt = 0; ; attempt++)
+            {
+                var requestId = NextRequestId();
+                try
+                {
+                    var pending = await SendKeyedAsync(
+                        scope, PendingKind.Positions, requestId,
+                        authorize => _requests.RequestPositions(
+                            requestId, accountOrGroup, authorize),
+                        authorize => _requests.CancelPositions(requestId, authorize),
+                        $"positions for '{accountOrGroup}'").ConfigureAwait(false);
+                    return pending.PositionRows.ToArray();
+                }
+                catch (PositionRequestTimeoutException) when (attempt == 0)
+                {
+                    // Let the canceled stream drain before one fresh-ID retry.
+                    await Task.Delay(
+                        PositionRetryDelayMilliseconds,
+                        _disposeTokenSource.Token).ConfigureAwait(false);
+                }
+            }
         }
 
         private async Task<IReadOnlyList<AccountUpdateMultiEventArgs>>
@@ -2436,8 +2450,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     return await pending.Completion.Task.ConfigureAwait(false);
                 }
-                return await AwaitPendingAsync(pending, description, poisonOnTimeout: false)
-                    .ConfigureAwait(false);
+                try
+                {
+                    return await AwaitPendingAsync(
+                        pending, description, poisonOnTimeout: false)
+                        .ConfigureAwait(false);
+                }
+                catch (TimeoutException exception) when (kind == PendingKind.Positions)
+                {
+                    throw new PositionRequestTimeoutException(
+                        exception.Message, exception);
+                }
             }
             finally
             {
@@ -3687,6 +3710,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private sealed class UnkeyedRequestTimeoutException : TimeoutException
         {
             internal UnkeyedRequestTimeoutException(string message, Exception inner)
+                : base(message, inner)
+            {
+            }
+        }
+
+        private sealed class PositionRequestTimeoutException : TimeoutException
+        {
+            internal PositionRequestTimeoutException(string message, Exception inner)
                 : base(message, inner)
             {
             }
