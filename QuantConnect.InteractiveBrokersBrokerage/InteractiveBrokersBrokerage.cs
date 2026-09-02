@@ -112,6 +112,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private IBAutomater.IBAutomater _ibAutomater;
 
+        // true when the IB Gateway runs on another host and is managed externally, IBAutomater won't be started or driven
+        private bool _isRemoteGateway;
+
         // Existing orders created in TWS can *only* be cancelled/modified when connected with ClientId = 0
         private const int ClientId = 0;
 
@@ -1360,8 +1363,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             _aggregator.DisposeSafely();
-            _ibAutomater?.Stop();
-            _ibAutomater.DisposeSafely();
+            if (!_isRemoteGateway)
+            {
+                _ibAutomater?.Stop();
+                _ibAutomater.DisposeSafely();
+            }
 
             _messagingRateLimiter.DisposeSafely();
             _concurrentHistoryRequests.DisposeSafely();
@@ -1459,9 +1465,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _subscriptionManager.SubscribeImpl += (s, t) => Subscribe(s);
             _subscriptionManager.UnsubscribeImpl += (s, t) => Unsubscribe(s);
 
-            Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Starting IB Automater...");
-
-            // start IB Gateway
+            // the automater instance is always created, it also provides the IB server reset times schedule
             var exportIbGatewayLogs = true; // Config.GetBool("ib-export-ibgateway-logs");
             _ibAutomater = new IBAutomater.IBAutomater(ibDirectory, ibVersion, userName, password, tradingMode, port, exportIbGatewayLogs);
             _ibAutomater.OutputDataReceived += OnIbAutomaterOutputDataReceived;
@@ -1469,21 +1473,34 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _ibAutomater.Exited += OnIbAutomaterExited;
             _ibAutomater.Restarted += OnIbAutomaterRestarted;
 
-            try
-            {
-                CheckIbAutomaterError(_ibAutomater.Start(false));
-            }
-            catch
-            {
-                // we are going the kill the deployment, let's clean up the automater
-                _ibAutomater.DisposeSafely();
-                throw;
-            }
-
             // default the weekly restart to one hour before FX market open (GetNextWeekendReconnectionTimeUtc)
             _weeklyRestartUtcTime = weeklyRestartUtcTime ?? _defaultWeeklyRestartUtcTime;
-            // schedule the weekly IB Gateway restart
-            StartGatewayWeeklyRestartTask();
+
+            _isRemoteGateway = !host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+                && !(IPAddress.TryParse(host, out var address) && IPAddress.IsLoopback(address));
+            if (_isRemoteGateway)
+            {
+                Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): remote IB Gateway host '{host}', skipping IB Automater");
+            }
+            else
+            {
+                Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Starting IB Automater...");
+
+                // start IB Gateway
+                try
+                {
+                    CheckIbAutomaterError(_ibAutomater.Start(false));
+                }
+                catch
+                {
+                    // we are going the kill the deployment, let's clean up the automater
+                    _ibAutomater.DisposeSafely();
+                    throw;
+                }
+
+                // schedule the weekly IB Gateway restart
+                StartGatewayWeeklyRestartTask();
+            }
 
             Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Host: {host}, Port: {port}, Account: {account}, AgentDescription: {agentDescription}");
 
@@ -5324,10 +5341,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                if (_isDisposeCalled || IsRestartInProgress())
+                if (_isDisposeCalled || _isRemoteGateway || IsRestartInProgress())
                 {
-                    // if we are disposed or we already triggered the restart skip a new call
-                    var message = _isDisposeCalled ? "we are disposed" : "restart task already scheduled";
+                    // if we are disposed, the gateway is remote or we already triggered the restart skip a new call
+                    var message = _isDisposeCalled ? "we are disposed" : _isRemoteGateway ? "gateway is remote" : "restart task already scheduled";
                     Log.Trace($"InteractiveBrokersBrokerage.StartGatewayRestartTask(): skipped request: {message}");
                     return;
                 }
