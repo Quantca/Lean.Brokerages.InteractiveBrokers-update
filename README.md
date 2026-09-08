@@ -193,7 +193,7 @@ During collection, LEAN reads managed accounts, FA groups, account aliases, and 
 
 IB does not provide an atomic operation that checks open orders and replaces FA configuration. Operate one configuration/order writer for each TWS user/session. While a `replaceFA` operation or its reconciliation is in progress, do not submit manual group orders or make manual group edits from TWS, Client Portal, or another API client. LEAN blocks its own conflicting group operations, but it cannot prevent an external client from racing the replacement.
 
-For `RequestBrokerageAccountGroupAssignment` and `RequestBrokerageAccountGroupAllocationUpdate`, `true` means the request was accepted for asynchronous processing while the algorithm is running. Do not request configuration mutations during `OnEndOfAlgorithm` or teardown: such a request may be accepted but is not guaranteed to reach the broker or publish a result.
+For `RequestBrokerageAccountGroupAssignment` and `RequestBrokerageAccountGroupAllocationUpdate`, `true` means the request was accepted for asynchronous processing while the algorithm is running. Both requests return `false` during algorithm initialization and warm-up; snapshot reads and refresh requests remain available. Do not request configuration mutations during `OnEndOfAlgorithm` or teardown: such a request may be accepted but is not guaranteed to reach the broker or publish a result.
 
 While a Financial Advisor configuration mutation or its reconciliation is active, LEAN rejects every update to an FA group order as well as new FA group orders. An update can change the aggregate parent quantity while its saved allocation vector is being rewritten, so algorithms should cancel rather than update during this interval.
 
