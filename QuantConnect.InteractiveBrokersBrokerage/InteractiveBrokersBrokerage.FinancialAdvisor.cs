@@ -161,7 +161,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     _client,
                     CheckRateLimiting,
                     () => IsConnected,
-                    MapSymbol,
+                    MapFinancialAdvisorPositionSymbol,
                     _account,
                     _financialAdvisorsGroupFilter,
                     hasOpenFinancialAdvisorOrders: () =>
@@ -177,6 +177,43 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             message)));
             Message += HandleFinancialAdvisorBrokerageMessage;
             _cancellationTokenSource.Token.Register(DisposeFinancialAdvisorAccountState);
+        }
+
+        private Symbol MapFinancialAdvisorPositionSymbol(IBApi.Contract contract)
+        {
+            var symbol = MapSymbol(contract);
+            var contractSecurityType = ConvertSecurityType(contract);
+            if (contractSecurityType != SecurityType.Equity)
+            {
+                return symbol;
+            }
+
+            var expectedQuoteCurrency = _symbolPropertiesDatabase.GetSymbolProperties(
+                symbol.ID.Market,
+                symbol,
+                symbol.SecurityType,
+                Currencies.USD).QuoteCurrency;
+            var expectedPrimaryExchange = _exchangeProvider?.GetPrimaryExchange(symbol.ID);
+            var actualPrimaryExchange = contract.PrimaryExch.GetPrimaryExchange(
+                SecurityType.Equity,
+                symbol.ID.Market);
+            if (symbol.SecurityType != contractSecurityType ||
+                string.IsNullOrWhiteSpace(expectedQuoteCurrency) ||
+                !string.Equals(contract.Currency, expectedQuoteCurrency,
+                    StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrEmpty(expectedPrimaryExchange?.Code) ||
+                string.IsNullOrEmpty(actualPrimaryExchange.Code) ||
+                !string.Equals(actualPrimaryExchange.Code, expectedPrimaryExchange.Code,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"IB equity contract '{contract.ConId}' " +
+                    $"('{contract.Symbol}', currency '{contract.Currency}', primary exchange '{contract.PrimaryExch}') " +
+                    $"does not match mapped LEAN symbol '{symbol}' " +
+                    $"(currency '{expectedQuoteCurrency}', primary exchange '{expectedPrimaryExchange?.Name}').");
+            }
+
+            return symbol;
         }
 
         private void DisposeFinancialAdvisorAccountState()

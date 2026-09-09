@@ -26,6 +26,8 @@ using NUnit.Framework;
 using QuantConnect.Brokerages;
 using QuantConnect.Brokerages.InteractiveBrokers;
 using QuantConnect.Brokerages.InteractiveBrokers.Client;
+using QuantConnect.Data.Auxiliary;
+using QuantConnect.Interfaces;
 using QuantConnect.Logging;
 
 namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
@@ -2672,6 +2674,96 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
+        [TestCase("EUR", "SBF")]
+        [TestCase("USD", "SBF")]
+        [TestCase("EUR", "NYSE")]
+        [TestCase("USD", "")]
+        public async Task ProductionMapperPreservesMismatchedEquityAsUnmappedTest(
+            string foreignCurrency,
+            string foreignPrimaryExchange)
+        {
+            using var brokerage = new InteractiveBrokersBrokerage();
+            var mapFileProvider = new AirMapFileProvider();
+            var brokerageType = typeof(InteractiveBrokersBrokerage);
+            brokerageType.GetField("_symbolMapper",
+                    BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(brokerage, new InteractiveBrokersSymbolMapper(mapFileProvider));
+            brokerageType.GetField("_exchangeProvider",
+                    BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(brokerage, new MapFilePrimaryExchangeProvider(mapFileProvider));
+            var mapMethod = brokerageType.GetMethod(
+                "MapFinancialAdvisorPositionSymbol",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.IsNotNull(mapMethod);
+            var mapSymbol = (Func<Contract, Symbol>)Delegate.CreateDelegate(
+                typeof(Func<Contract, Symbol>), brokerage, mapMethod);
+
+            using var scenario = new Scenario();
+            scenario.Actions.RequestPositions = (requestId, accountOrGroup, authorize) =>
+                scenario.RunAuthorized(authorize, () =>
+                {
+                    scenario.Requests.Add($"positions:{accountOrGroup}");
+                    scenario.KeyedRequestIds.Add(requestId);
+                    if (accountOrGroup == "Alpha")
+                    {
+                        scenario.Client.positionMulti(
+                            requestId,
+                            "ACC1",
+                            "Foreign",
+                            CreateAirContract(901, foreignCurrency, foreignPrimaryExchange),
+                            5m,
+                            42.25);
+                    }
+                    else if (accountOrGroup == "Beta")
+                    {
+                        scenario.Client.positionMulti(
+                            requestId,
+                            "ACC2",
+                            "US",
+                            CreateAirContract(902, Currencies.USD, "NYSE"),
+                            7m,
+                            81.5);
+                    }
+                    scenario.Client.positionMultiEnd(requestId);
+                });
+            using var state = scenario.CreateState(mapSymbol: mapSymbol);
+
+            var snapshot = await RunRefreshAsync(
+                state,
+                () => state.RequestRefresh(Array.Empty<string>()));
+            var foreignAccount = snapshot.Accounts["ACC1"];
+            var usAccount = snapshot.Accounts["ACC2"];
+            var unmapped = foreignAccount.UnmappedPositions.Single();
+            var mapped = usAccount.Positions.Single();
+
+            Assert.Multiple(() =>
+            {
+                Assert.AreEqual(BrokerageAccountSnapshotStatus.Ready, snapshot.Status);
+                Assert.IsTrue(snapshot.IsComplete);
+                Assert.IsTrue(snapshot.HasUnmappedPositions);
+                Assert.IsEmpty(foreignAccount.Positions);
+                Assert.IsEmpty(usAccount.UnmappedPositions);
+                Assert.AreEqual("AIR", mapped.Symbol.Value);
+                Assert.AreEqual(Market.USA, mapped.Symbol.ID.Market);
+                Assert.AreEqual(7m, mapped.Quantity);
+                Assert.AreEqual(81.5m, mapped.AveragePrice);
+                Assert.AreEqual("US", mapped.ModelCode);
+                Assert.AreEqual("901", unmapped.BrokerageContractId);
+                Assert.AreEqual("AIR", unmapped.BrokerageSymbol);
+                Assert.AreEqual("AIR", unmapped.LocalSymbol);
+                Assert.AreEqual("STK", unmapped.BrokerageSecurityType);
+                Assert.AreEqual(foreignCurrency, unmapped.Currency);
+                Assert.AreEqual("SMART", unmapped.Exchange);
+                Assert.AreEqual(foreignPrimaryExchange, unmapped.PrimaryExchange);
+                Assert.AreEqual("AIR", unmapped.TradingClass);
+                Assert.AreEqual("1", unmapped.Multiplier);
+                Assert.AreEqual(5m, unmapped.Quantity);
+                Assert.AreEqual(42.25m, unmapped.AveragePrice);
+                Assert.AreEqual("Foreign", unmapped.ModelCode);
+                StringAssert.Contains("does not match mapped LEAN symbol", unmapped.ErrorMessage);
+            });
+        }
+
         [Test]
         [NonParallelizable]
         public async Task GroupAccountNameCollisionFallsBackToExactPositionsTest()
@@ -4463,6 +4555,43 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 (bool)scopeType.GetProperty(
                     "CompleteDiscovery", BindingFlags.Instance | BindingFlags.NonPublic)
                     ?.GetValue(scope));
+        }
+
+        private static Contract CreateAirContract(
+            int contractId,
+            string currency,
+            string primaryExchange) => new()
+        {
+            ConId = contractId,
+            Symbol = "AIR",
+            LocalSymbol = "AIR",
+            SecType = "STK",
+            Currency = currency,
+            Exchange = "SMART",
+            PrimaryExch = primaryExchange,
+            TradingClass = "AIR",
+            Multiplier = "1"
+        };
+
+        private sealed class AirMapFileProvider : IMapFileProvider
+        {
+            private readonly MapFileResolver _resolver = new(new[]
+            {
+                new MapFile("air", new[]
+                {
+                    new MapFileRow(Time.BeginningOfTime, "air", Exchange.NYSE),
+                    new MapFileRow(Time.EndOfTime, "air", Exchange.NYSE)
+                })
+            });
+
+            public void Initialize(IDataProvider dataProvider)
+            {
+            }
+
+            public MapFileResolver Get(AuxiliaryDataKey auxiliaryDataKey) =>
+                auxiliaryDataKey.Equals(AuxiliaryDataKey.EquityUsa)
+                    ? _resolver
+                    : MapFileResolver.Empty;
         }
 
         private sealed class Scenario : IDisposable
