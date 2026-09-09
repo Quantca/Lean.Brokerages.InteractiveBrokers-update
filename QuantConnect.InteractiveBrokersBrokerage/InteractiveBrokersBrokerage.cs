@@ -112,6 +112,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private IBAutomater.IBAutomater _ibAutomater;
 
+        // true when the IB Gateway runs on another host and is managed externally, IBAutomater won't be started or driven
+        private bool _isRemoteGateway;
+
         // Existing orders created in TWS can *only* be cancelled/modified when connected with ClientId = 0
         private const int ClientId = 0;
 
@@ -159,6 +162,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         // tracks pending brokerage order responses. In some cases we've seen orders been placed and they never get through to IB
         private readonly ConcurrentDictionary<int, ManualResetEventSlim> _pendingOrderResponse = new();
+
+        // time of the last detected gateway restart, to explain response timeouts of requests the restart raced
+        private DateTime _lastGatewayRestartTimeUtc;
 
         // On a Financial Advisor account IBGateway confirms the first order of a deployment with a warning
         // dialog and silently drops every other order that reaches it while that dialog is unanswered,
@@ -610,7 +616,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!eventSlim.Wait(_responseTimeout))
                     {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {orderId} lean id {order.Id}"));
+                        if (_pendingOrderResponse.TryRemove(orderId, out _))
+                        {
+                            eventSlim.DisposeSafely();
+
+                            // IB holds the ack when it cannot act on the cancellation yet (order queued outside
+                            // regular trading hours, exchange session break): warn and carry on, the ack arrives on its own
+                            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse",
+                                $"Timeout waiting for brokerage response for cancellation of brokerage order id {orderId} lean id {order.Id}"));
+                        }
                     }
                     else
                     {
@@ -1424,8 +1438,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             _aggregator.DisposeSafely();
-            _ibAutomater?.Stop();
-            _ibAutomater.DisposeSafely();
+            if (!_isRemoteGateway)
+            {
+                _ibAutomater?.Stop();
+                _ibAutomater.DisposeSafely();
+            }
 
             _messagingRateLimiter.DisposeSafely();
             _concurrentHistoryRequests.DisposeSafely();
@@ -1525,9 +1542,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _subscriptionManager.SubscribeImpl += (s, t) => Subscribe(s);
             _subscriptionManager.UnsubscribeImpl += (s, t) => Unsubscribe(s);
 
-            Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Starting IB Automater...");
-
-            // start IB Gateway
+            // the automater instance is always created, it also provides the IB server reset times schedule
             var exportIbGatewayLogs = true; // Config.GetBool("ib-export-ibgateway-logs");
             _ibAutomater = new IBAutomater.IBAutomater(ibDirectory, ibVersion, userName, password, tradingMode, port, exportIbGatewayLogs, financialAdvisorUnifiedGroupsEnabled);
             _ibAutomater.OutputDataReceived += OnIbAutomaterOutputDataReceived;
@@ -1535,21 +1550,34 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _ibAutomater.Exited += OnIbAutomaterExited;
             _ibAutomater.Restarted += OnIbAutomaterRestarted;
 
-            try
-            {
-                CheckIbAutomaterError(_ibAutomater.Start(false));
-            }
-            catch
-            {
-                // we are going the kill the deployment, let's clean up the automater
-                _ibAutomater.DisposeSafely();
-                throw;
-            }
-
             // default the weekly restart to one hour before FX market open (GetNextWeekendReconnectionTimeUtc)
             _weeklyRestartUtcTime = weeklyRestartUtcTime ?? _defaultWeeklyRestartUtcTime;
-            // schedule the weekly IB Gateway restart
-            StartGatewayWeeklyRestartTask();
+
+            _isRemoteGateway = !host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+                && !(IPAddress.TryParse(host, out var address) && IPAddress.IsLoopback(address));
+            if (_isRemoteGateway)
+            {
+                Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): remote IB Gateway host '{host}', skipping IB Automater");
+            }
+            else
+            {
+                Log.Trace("InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Starting IB Automater...");
+
+                // start IB Gateway
+                try
+                {
+                    CheckIbAutomaterError(_ibAutomater.Start(false));
+                }
+                catch
+                {
+                    // we are going the kill the deployment, let's clean up the automater
+                    _ibAutomater.DisposeSafely();
+                    throw;
+                }
+
+                // schedule the weekly IB Gateway restart
+                StartGatewayWeeklyRestartTask();
+            }
 
             Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Host: {host}, Port: {port}, Account: {account}, AgentDescription: {agentDescription}");
 
@@ -1668,6 +1696,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var isFirstFinancialAdvisorOrder = WaitForFinancialAdvisorFirstOrder();
 
+            var requestTimeUtc = DateTime.UtcNow;
             int ibOrderId;
             ManualResetEventSlim orderSubmittedEvent = null;
 
@@ -1752,7 +1781,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         }
                         else
                         {
-                            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {ibOrderId} lean id {order.Id}"));
+                            var reason = $"Timeout waiting for brokerage response for brokerage order id {ibOrderId} lean id {order.Id}";
+                            if (_lastGatewayRestartTimeUtc >= requestTimeUtc || IsRestartInProgress())
+                            {
+                                reason += ". An IB Gateway restart overlapped the request, which likely never reached IB. " +
+                                    "Consider avoiding order requests around the gateway's scheduled restart time.";
+                            }
+                            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", reason));
                         }
                     }
                     else
@@ -5461,10 +5496,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                if (_isDisposeCalled || IsRestartInProgress())
+                if (_isDisposeCalled || _isRemoteGateway || IsRestartInProgress())
                 {
-                    // if we are disposed or we already triggered the restart skip a new call
-                    var message = _isDisposeCalled ? "we are disposed" : "restart task already scheduled";
+                    // if we are disposed, the gateway is remote or we already triggered the restart skip a new call
+                    var message = _isDisposeCalled ? "we are disposed" : _isRemoteGateway ? "gateway is remote" : "restart task already scheduled";
                     Log.Trace($"InteractiveBrokersBrokerage.StartGatewayRestartTask(): skipped request: {message}");
                     return;
                 }
@@ -5710,6 +5745,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private void OnIbAutomaterRestarted(object sender, EventArgs e)
         {
             Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterRestarted()");
+
+            _lastGatewayRestartTimeUtc = DateTime.UtcNow;
 
             _stateManager.Reset();
             StopGatewayRestartTask();
