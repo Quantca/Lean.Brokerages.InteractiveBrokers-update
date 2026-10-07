@@ -273,9 +273,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             IB.UpdatePortfolioEventArgs eventArgs,
             out decimal position)
         {
-            position = _financialAdvisorUnifiedGroupsEnabled && IsFinancialAdvisor
-                ? eventArgs.PositionQuantity
-                : eventArgs.Position;
+            position = eventArgs.Position;
             return !_financialAdvisorUnifiedGroupsEnabled ||
                 !IsFinancialAdvisor ||
                 !eventArgs.PositionsMultiRequestId.HasValue ||
@@ -283,41 +281,63 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     eventArgs.PositionsMultiRequestId.Value) != true;
         }
 
-        private IOrderProperties CreateRecoveredOrderProperties(IBApi.Order order)
+        private void ConfigureFinancialAdvisorRecoveredOrderProperties(
+            IBApi.Order order,
+            InteractiveBrokersOrderProperties properties)
         {
             if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor)
             {
-                return null;
+                return;
             }
 
-            var group = order?.FaGroup?.Trim() ?? string.Empty;
-            var account = order?.Account?.Trim() ?? string.Empty;
-            var isGroupOrder = group.Length != 0;
-            if (!isGroupOrder &&
-                (account.Length == 0 ||
-                    account.Equals(_account, StringComparison.OrdinalIgnoreCase)))
-            {
-                return null;
-            }
-
-            var properties = new InteractiveBrokersOrderProperties
-            {
-                Account = isGroupOrder ? string.Empty : account,
-                FaGroup = isGroupOrder ? group : string.Empty,
-                FaMethod = isGroupOrder ? order.FaMethod ?? string.Empty : string.Empty,
-                OutsideRegularTradingHours = order.OutsideRth
-            };
-            if (isGroupOrder &&
+            properties.FaGroup = order.FaGroup?.Trim() ?? string.Empty;
+            properties.Account = properties.FaGroup.Length != 0 ||
+                string.Equals(order.Account?.Trim(), _account, StringComparison.OrdinalIgnoreCase)
+                    ? string.Empty : order.Account?.Trim() ?? string.Empty;
+            properties.FaMethod = properties.FaGroup.Length != 0
+                ? order.FaMethod ?? string.Empty : string.Empty;
+            if (properties.FaGroup.Length != 0 &&
                 decimal.TryParse(order.FaPercentage, NumberStyles.Float,
-                    CultureInfo.InvariantCulture, out var percentage))
+                    CultureInfo.InvariantCulture, out var percentage) &&
+                percentage == decimal.Truncate(percentage) &&
+                percentage >= int.MinValue && percentage <= int.MaxValue)
             {
-                if (percentage == decimal.Truncate(percentage) &&
-                    percentage >= int.MinValue && percentage <= int.MaxValue)
+                properties.FaPercentage = (int)percentage;
+            }
+        }
+
+        private void ValidateFinancialAdvisorContingentOrders(List<Order> orders)
+        {
+            if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor)
+            {
+                return;
+            }
+
+            // Recheck the entire cached set before any order is written to IB.
+            foreach (var order in orders)
+            {
+                ValidateFinancialAdvisorOrderAdmission(order);
+            }
+            foreach (var unit in OrderContingency.GetUnits(orders))
+            {
+                if (unit.Count < 2)
                 {
-                    properties.FaPercentage = (int)percentage;
+                    continue;
+                }
+                var firstRoute = new IBApi.Order { Account = _account };
+                ConfigureFinancialAdvisorOrder(firstRoute, unit[0]);
+                foreach (var leg in unit.Skip(1))
+                {
+                    var legRoute = new IBApi.Order { Account = _account };
+                    ConfigureFinancialAdvisorOrder(legRoute, leg);
+                    if (!HaveEquivalentFinancialAdvisorRoutes(firstRoute, legRoute))
+                    {
+                        throw new InvalidOperationException(
+                            "All combo legs must use the same effective Financial Advisor " +
+                            "Account, FaGroup, and FaMethod.");
+                    }
                 }
             }
-            return properties;
         }
 
         internal void ValidateFinancialAdvisorOrderAdmission(Order order, bool isUpdate = false)
@@ -638,12 +658,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 "when unified Financial Advisor groups are enabled because IB resolves their aggregate " +
                 "quantity after submission and LEAN cannot safely account for split fills. Use a supported " +
                 "saved allocation method, or disable unified groups (and group management, if enabled) " +
-                "to retain LEAN's legacy integer " +
+                "to retain LEAN's upstream " +
                 "PctChange behavior.");
         }
 
         // Keep this decision independent of mutable snapshot state so it remains stable across partial fills.
-        private bool UsesExactFinancialAdvisorFillQuantity(Order order)
+        private bool UsesFinancialAdvisorFillResidualTolerance(Order order)
         {
             if (!_financialAdvisorUnifiedGroupsEnabled || !IsFinancialAdvisor)
             {

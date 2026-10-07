@@ -58,6 +58,7 @@ using System.Runtime.CompilerServices;
 using System.Net.Http;
 
 [assembly: InternalsVisibleTo("QuantConnect.Tests.Brokerages.InteractiveBrokers")]
+[assembly: InternalsVisibleTo("QuantConnect.Brokerages.InteractiveBrokers.Tests")]
 
 namespace QuantConnect.Brokerages.InteractiveBrokers
 {
@@ -77,6 +78,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// window is auto-accepted. The text after the prefix is the message shown to the user.
         /// </summary>
         private const string OrderConfirmationWindowMarker = "Order confirmation window: ";
+
+        /// <summary>
+        /// The allocation method of an account group order which takes the percentage in place of the order quantity
+        /// </summary>
+        private const string PercentChangeAllocationMethod = "PctChange";
 
         /// <summary>
         /// During market open there can be some extra delay and resource constraint so let's be generous
@@ -179,10 +185,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private readonly ConcurrentDictionary<int, StopLimitOrder> _preSubmittedStopLimitOrders = new();
 
-        /// <summary>
-        /// Provides a thread-safe service for caching and managing original orders when they are part of a group.
-        /// </summary>
-        private GroupOrderCacheManager _groupOrderCacheManager = new();
+        // the parent id, OCA group and OCA type IB reports for each contingent order, by IB order id. IB expects them back unchanged when the
+        // order is updated, anything else is rejected as a revision: for orders attached to a parent it assigns its own OCA group
+        private readonly ConcurrentDictionary<int, (int ParentId, string OcaGroup, int OcaType)> _contingentOrderAttributes = new();
 
         // tracks requested order updates, so we can flag Submitted order events as updates
         private readonly ConcurrentDictionary<int, int> _orderUpdates = new ConcurrentDictionary<int, int>();
@@ -366,7 +371,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Config.Get("ib-version", DefaultVersion),
                 Config.Get("ib-user-name"),
                 Config.Get("ib-password"),
-                Config.Get("ib-trading-mode"),
                 Config.GetValue("ib-agent-description", IB.AgentDescription.Individual),
                 loadExistingHoldings: true,
                 weeklyRestartUtcTime: null,
@@ -390,7 +394,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="ibVersion">The IB Gateway version</param>
         /// <param name="userName">The login user name</param>
         /// <param name="password">The login password</param>
-        /// <param name="tradingMode">The trading mode: 'live' or 'paper'</param>
         /// <param name="agentDescription">Used for Rule 80A describes the type of trader.</param>
         /// <param name="loadExistingHoldings">False will ignore existing security holdings from being loaded.</param>
         /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)</param>
@@ -406,7 +409,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string ibVersion,
             string userName,
             string password,
-            string tradingMode,
             string agentDescription = IB.AgentDescription.Individual,
             bool loadExistingHoldings = true,
             TimeSpan? weeklyRestartUtcTime = null,
@@ -422,7 +424,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ibVersion,
                 userName,
                 password,
-                tradingMode,
                 agentDescription,
                 loadExistingHoldings,
                 weeklyRestartUtcTime,
@@ -445,7 +446,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="ibVersion">The IB Gateway version</param>
         /// <param name="userName">The login user name</param>
         /// <param name="password">The login password</param>
-        /// <param name="tradingMode">The trading mode: 'live' or 'paper'</param>
+        /// <param name="tradingMode">Retained for compatibility; the account identifier determines paper or live mode.</param>
         /// <param name="agentDescription">Used for Rule 80A describes the type of trader.</param>
         /// <param name="loadExistingHoldings">False will ignore existing security holdings from being loaded.</param>
         /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)</param>
@@ -475,6 +476,54 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string financialAdvisorsGroupFilter,
             bool financialAdvisorGroupManagementEnabled,
             bool financialAdvisorUnifiedGroupsEnabled)
+            : this(algorithm, orderProvider, securityProvider, account, host, port,
+                ibDirectory, ibVersion, userName, password, agentDescription,
+                loadExistingHoldings, weeklyRestartUtcTime, financialAdvisorsGroupFilter,
+                financialAdvisorGroupManagementEnabled, financialAdvisorUnifiedGroupsEnabled)
+        {
+        }
+
+        /// <summary>
+        /// Creates a new InteractiveBrokersBrokerage with explicit Financial Advisor feature settings.
+        /// </summary>
+        /// <param name="algorithm">The algorithm instance</param>
+        /// <param name="orderProvider">An instance of IOrderProvider used to fetch Order objects by brokerage ID</param>
+        /// <param name="securityProvider">The security provider used to give access to algorithm securities</param>
+        /// <param name="account">The Interactive Brokers account name</param>
+        /// <param name="host">host name or IP address of the machine where TWS is running. Leave blank to connect to the local host.</param>
+        /// <param name="port">must match the port specified in TWS on the Configure&gt;API&gt;Socket Port field.</param>
+        /// <param name="ibDirectory">The IB Gateway root directory</param>
+        /// <param name="ibVersion">The IB Gateway version</param>
+        /// <param name="userName">The login user name</param>
+        /// <param name="password">The login password</param>
+        /// <param name="agentDescription">Used for Rule 80A describes the type of trader.</param>
+        /// <param name="loadExistingHoldings">False will ignore existing security holdings from being loaded.</param>
+        /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)</param>
+        /// <param name="financialAdvisorsGroupFilter">The name of the financial advisors group filter associated with this client.</param>
+        /// <param name="financialAdvisorGroupManagementEnabled">
+        /// Whether Financial Advisor group assignment and allocation management are enabled. Requires
+        /// <paramref name="financialAdvisorUnifiedGroupsEnabled"/>.
+        /// </param>
+        /// <param name="financialAdvisorUnifiedGroupsEnabled">
+        /// Whether unified Financial Advisor snapshots and group-order routing are enabled.
+        /// </param>
+        public InteractiveBrokersBrokerage(
+            IAlgorithm algorithm,
+            IOrderProvider orderProvider,
+            ISecurityProvider securityProvider,
+            string account,
+            string host,
+            int port,
+            string ibDirectory,
+            string ibVersion,
+            string userName,
+            string password,
+            string agentDescription,
+            bool loadExistingHoldings,
+            TimeSpan? weeklyRestartUtcTime,
+            string financialAdvisorsGroupFilter,
+            bool financialAdvisorGroupManagementEnabled,
+            bool financialAdvisorUnifiedGroupsEnabled)
             : base(BrokerageName)
         {
             Initialize(
@@ -488,7 +537,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ibVersion,
                 userName,
                 password,
-                tradingMode,
                 agentDescription,
                 loadExistingHoldings,
                 weeklyRestartUtcTime,
@@ -528,6 +576,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
 
                 ValidateFinancialAdvisorOrderAdmission(order, isUpdate: false);
+                if (order.Contingency != null)
+                {
+                    // contingent orders are placed together, atomically, once they have all arrived
+                    if (ContingentOrderCache.TryGetContingentCachedOrders(order, out var contingentOrders))
+                    {
+                        ValidateFinancialAdvisorContingentOrders(contingentOrders);
+                        IBPlaceContingentOrders(contingentOrders);
+                    }
+                    return true;
+                }
+
                 IBPlaceOrder(order, true);
                 return true;
             }
@@ -659,6 +718,48 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
+        /// <summary>
+        /// Rebuilds, best effort, the contingencies of the given open orders: orders attached to a parent which is still open are held
+        /// until it fills, and the open orders sharing an OCA group are related to each other
+        /// </summary>
+        internal static void SetContingencies(List<(IBApi.Order Order, List<Order> LeanOrders)> openOrders)
+        {
+            try
+            {
+                var leanOpenOrders = openOrders.Where(x => x.LeanOrders.Count > 0);
+
+                // attached orders: if the parent is gone it already filled, so its children are plain working orders now
+                var childrenByParentId = leanOpenOrders.Where(x => x.Order.ParentId != 0).ToLookup(x => x.Order.ParentId);
+                foreach (var parent in leanOpenOrders)
+                {
+                    var children = childrenByParentId[parent.Order.OrderId];
+                    if (children.Any())
+                    {
+                        OrderContingency.Trigger(parent.LeanOrders, children.SelectMany(child => child.LeanOrders));
+                    }
+                }
+
+                foreach (var members in leanOpenOrders.Where(x => !string.IsNullOrEmpty(x.Order.OcaGroup)).GroupBy(x => x.Order.OcaGroup))
+                {
+                    if (members.Count() > 1)
+                    {
+                        // 1: cancel all remaining orders. 2 & 3: remaining orders are proportionately reduced in size
+                        var type = members.First().Order.OcaType is 2 or 3 ? ContingencyType.OneUpdatesOther : ContingencyType.OneCancelsOther;
+                        OrderContingency.Relate(type, members.SelectMany(member => member.LeanOrders));
+                    }
+                }
+            }
+            catch (Exception err)
+            {
+                // best effort, they will be handled as plain orders
+                Log.Error(err, "Failed to rebuild the contingencies of the open orders");
+                foreach (var order in openOrders.SelectMany(x => x.LeanOrders))
+                {
+                    order.Contingency = null;
+                }
+            }
+        }
+
         private List<Order> GetOpenOrdersInternal(bool all)
         {
             var orders = new List<(IBApi.Order Order, Contract Contract, OrderState OrderState)>();
@@ -753,7 +854,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             // convert results to Lean Orders outside the eventhandler to avoid nesting requests, as conversion may request
             // contract details
-            return orders.Select(orderContract => ConvertOrders(orderContract.Order, orderContract.Contract, orderContract.OrderState)).SelectMany(orders => orders).ToList();
+            var convertedOrders = orders.Select(orderContract => (orderContract.Order, LeanOrders: ConvertOrders(orderContract.Order, orderContract.Contract, orderContract.OrderState))).ToList();
+            SetContingencies(convertedOrders);
+            return convertedOrders.SelectMany(x => x.LeanOrders).ToList();
         }
 
         private Contract GetOpenOrderContract(int orderId)
@@ -1462,7 +1565,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="ibVersion">The IB Gateway version</param>
         /// <param name="userName">The login user name</param>
         /// <param name="password">The login password</param>
-        /// <param name="tradingMode">The trading mode: 'live' or 'paper'</param>
         /// <param name="agentDescription">Used for Rule 80A describes the type of trader.</param>
         /// <param name="loadExistingHoldings">False will ignore existing security holdings from being loaded.</param>
         /// <param name="weeklyRestartUtcTime">The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)</param>
@@ -1480,7 +1582,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             string ibVersion,
             string userName,
             string password,
-            string tradingMode,
             string agentDescription = IB.AgentDescription.Individual,
             bool loadExistingHoldings = true,
             TimeSpan? weeklyRestartUtcTime = null,
@@ -1544,6 +1645,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             // the automater instance is always created, it also provides the IB server reset times schedule
             var exportIbGatewayLogs = true; // Config.GetBool("ib-export-ibgateway-logs");
+            // IB paper account ids start with a 'D' (DU..., DF...)
+            var tradingMode = account.StartsWith("d", StringComparison.InvariantCultureIgnoreCase) ? "paper" : "live";
             _ibAutomater = new IBAutomater.IBAutomater(ibDirectory, ibVersion, userName, password, tradingMode, port, exportIbGatewayLogs, financialAdvisorUnifiedGroupsEnabled);
             _ibAutomater.OutputDataReceived += OnIbAutomaterOutputDataReceived;
             _ibAutomater.ErrorDataReceived += OnIbAutomaterErrorDataReceived;
@@ -1580,6 +1683,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             Log.Trace($"InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Host: {host}, Port: {port}, Account: {account}, AgentDescription: {agentDescription}");
+
+            DeploymentDetailsHelper.Add("ib-account", account);
+            DeploymentDetailsHelper.Add("ib-user-name", userName);
+            DeploymentDetailsHelper.Add("ib-trading-mode", tradingMode);
+            DeploymentDetailsHelper.Add("ib-financial-advisors-group-filter", financialAdvisorsGroupFilter);
 
             _client = new IB.InteractiveBrokersClient(_signal);
             InitializeFinancialAdvisorAccountState();
@@ -1655,11 +1763,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="exchange">The exchange to send the order to, defaults to "Smart" to use IB's smart routing</param>
         private void IBPlaceOrder(Order order, bool needsNewId, string exchange = null)
         {
-            if (!_groupOrderCacheManager.TryGetGroupCachedOrders(order, out var orders))
+            if (GroupOrderCacheManager.TryGetGroupCachedOrders(order, out var orders))
             {
-                return;
+                IBPlaceOrder(order, orders, needsNewId, exchange);
             }
+        }
 
+        /// <summary>
+        /// Places the order with InteractiveBrokers
+        /// </summary>
+        /// <param name="order">The order to be placed</param>
+        /// <param name="orders">The orders of the IB order: the order itself or the legs of a combo order</param>
+        /// <param name="needsNewId">Set to true to generate a new order ID, false to leave it alone</param>
+        /// <param name="exchange">The exchange to send the order to, defaults to "Smart" to use IB's smart routing</param>
+        /// <param name="contingency">The IB attributes of a contingent order: the parent it's attached to, its OCA group and whether it's transmitted</param>
+        private void IBPlaceOrder(Order order, List<Order> orders, bool needsNewId, string exchange = null,
+            (int ParentId, string OcaGroup, int OcaType, bool Transmit)? contingency = null)
+        {
             // MOO/MOC require directed option orders.
             // We resolve non-equity markets in the `CreateContract` method.
             if (exchange == null &&
@@ -1728,7 +1848,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         throw new ArgumentException("Expected order with populated BrokerId for updating orders.");
                     }
 
-                    Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}. BrokerId: {ibOrderId}");
+                    Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}. BrokerId: {ibOrderId}" +
+                        (contingency.HasValue ? $". Contingency: {contingency.Value}" : string.Empty));
 
                     _requestInformation[ibOrderId] = new RequestInformation
                     {
@@ -1746,13 +1867,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                     else
                     {
-                        _pendingOrderResponse[ibOrderId] = orderSubmittedEvent = new ManualResetEventSlim(false);
                         var ibOrder = ConvertOrder(orders, contract, ibOrderId);
+                        if (contingency is { } attributes)
+                        {
+                            ibOrder.ParentId = attributes.ParentId;
+                            if (attributes.OcaGroup != null)
+                            {
+                                ibOrder.OcaGroup = attributes.OcaGroup;
+                                ibOrder.OcaType = attributes.OcaType;
+                            }
+                            // IB won't answer until it's transmitted
+                            ibOrder.Transmit = attributes.Transmit;
+                        }
+                        if (ibOrder.Transmit)
+                        {
+                            _pendingOrderResponse[ibOrderId] = orderSubmittedEvent = new ManualResetEventSlim(false);
+                        }
                         _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
                     }
                 }
 
-                if (order.Type != OrderType.OptionExercise)
+                if (orderSubmittedEvent != null)
                 {
                     var noSubmissionOrderTypes = _noSubmissionOrderTypes.Contains(order.Type);
                     if (!orderSubmittedEvent.Wait(noSubmissionOrderTypes ? _noSubmissionOrdersResponseTimeout : _responseTimeout))
@@ -1803,6 +1938,78 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     // release the batch even when this order timed out
                     _financialAdvisorFirstOrderAnswered.Set();
                 }
+            }
+        }
+
+        /// <summary>
+        /// Places a set of contingent orders (OCO, OTO, OUO, brackets) with InteractiveBrokers. Orders triggered by another are attached to their
+        /// parent through the parent id, and orders related to each other share an OCA group. None of them is transmitted until the last one is
+        /// placed, removing the risk of any of them executing before the rest is in place.
+        /// </summary>
+        /// <param name="contingentOrders">All the orders of the set, parents come before the orders they trigger</param>
+        private void IBPlaceContingentOrders(List<Order> contingentOrders)
+        {
+            // each unit is an IB order: a single order or the legs of a combo order
+            var units = OrderContingency.GetUnits(contingentOrders);
+
+            // the unit of the parent each unit is attached to, -1 if none. Parents come first
+            var unitIndexes = new Dictionary<int, int>(contingentOrders.Count);
+            var parentUnits = new int[units.Count];
+            for (var i = 0; i < units.Count; i++)
+            {
+                foreach (var order in units[i])
+                {
+                    unitIndexes[order.Id] = i;
+                }
+                var parent = units[i][0].GetContingentParents(contingentOrders).FirstOrDefault();
+                parentUnits[i] = parent != null ? unitIndexes[parent.Id] : -1;
+            }
+
+            // OCA group names have to be unique, even across deployments: reusing them is not allowed
+            var ocaGroupSuffix = DateTime.UtcNow.Ticks.ToStringInvariant();
+
+            var placedUnits = 0;
+            try
+            {
+                for (; placedUnits < units.Count; placedUnits++)
+                {
+                    var unit = units[placedUnits];
+                    var parentUnit = parentUnits[placedUnits];
+                    var member = unit[0].GetSiblingLink();
+
+                    // IB transmits the not yet transmitted orders attached to an order, its parent chain and siblings, along with the last
+                    // one attached to it which is transmitted. So an order is not transmitted only if a later one is attached to it: its
+                    // children, or its siblings under the same parent. Orders which are not attached, like the members of a plain OCA group,
+                    // have to be transmitted one by one
+                    var transmit = true;
+                    for (var later = placedUnits + 1; later < units.Count && transmit; later++)
+                    {
+                        transmit = parentUnits[later] != placedUnits && (parentUnit == -1 || parentUnits[later] != parentUnit);
+                    }
+
+                    IBPlaceOrder(unit[0], unit, true, contingency: (
+                        parentUnit != -1 ? Parse.Int(units[parentUnit][0].BrokerId[0]) : 0,
+                        member != null ? $"LEAN-{unit[0].Contingency.Id.ToStringInvariant()}-{member.Id.ToStringInvariant()}-{ocaGroupSuffix}" : null,
+                        // 1: cancel all remaining orders with block. 2: remaining orders are proportionately reduced in size with block
+                        member?.Type == ContingencyType.OneUpdatesOther ? 2 : 1,
+                        transmit));
+                }
+            }
+            catch
+            {
+                // we do not leave orders behind which were never transmitted
+                for (var i = 0; i < placedUnits; i++)
+                {
+                    try
+                    {
+                        _client.ClientSocket.cancelOrder(Parse.Int(units[i][0].BrokerId[0]), new OrderCancel());
+                    }
+                    catch (Exception err)
+                    {
+                        Log.Error(err);
+                    }
+                }
+                throw;
             }
         }
 
@@ -2355,10 +2562,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _competingSessionErrorHandler.Value.Handle(DateTime.UtcNow, errorCode, errorMsg);
             }
 
+            // 10148 for an order which is already pending cancel or canceled: IB canceled it on its own, like the remaining orders of an OCA
+            // group once one of them fills or is canceled or the children of a canceled parent, so our cancel request raced it
+            var alreadyCanceled = errorCode == 10148 && (errorMsg.Contains("PendingCancel", StringComparison.OrdinalIgnoreCase)
+                || errorMsg.Contains("state: Cancelled", StringComparison.OrdinalIgnoreCase));
+            if (alreadyCanceled && _pendingOrderResponse.TryRemove(requestId, out var pendingCancelEvent))
+            {
+                pendingCancelEvent.Set();
+            }
+
             // error 200 is not an invalidating code: unlike the codes in the collection it answers any request
             // type (e.g. contract details or market data), so it's only an order rejection when we know it is
             // answering an order request
-            if (InvalidatingCodes.Contains(errorCode) || (errorCode == 200 && requestInfo?.IsOrderRequest == true))
+            if (!alreadyCanceled && (InvalidatingCodes.Contains(errorCode) || (errorCode == 200 && requestInfo?.IsOrderRequest == true)))
             {
                 // let's unblock the waiting thread right away
                 if (_pendingOrderResponse.TryRemove(requestId, out var eventSlim))
@@ -2368,6 +2584,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                 var message = $"{errorCode} - {errorMsg}";
                 Log.Trace($"InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): IBOrderId: {requestId} ErrorCode: {message}");
+
+                // the members of an OCA group are transmitted one by one: if one of them fills before the rest reached IB, they are rejected
+                // instead of canceled. That's the one cancels other semantic, the order is canceled rather than invalid
+                var status = errorCode == 201 && errorMsg.Contains("OCA group is already filled", StringComparison.OrdinalIgnoreCase)
+                    ? OrderStatus.Canceled : OrderStatus.Invalid;
 
                 // invalidate the order
                 var orders = _orderProvider.GetOrdersByBrokerageId(requestId);
@@ -2379,15 +2600,77 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     OnOrderEvents(orders.Where(order => order != null).Select(order => new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
                     {
-                        Status = OrderStatus.Invalid,
+                        Status = status,
                         Message = message
                     }).ToList());
+
+                    if (status == OrderStatus.Invalid)
+                    {
+                        CancelNotTransmittedContingentOrders(requestId, orders, message);
+                    }
                 }
             }
 
             if (!alreadyReportedUnsupportedAsset && !FilteredCodes.Contains(errorCode) && errorCode != -1)
             {
                 OnMessage(new BrokerageMessageEvent(brokerageMessageType, errorCode, errorMsg));
+            }
+        }
+
+        /// <summary>
+        /// A contingent order was rejected: the orders of its set IB holds without transmitting, waiting for a later order of the set to
+        /// transmit them, won't ever be transmitted if the rejected order was that one. They are canceled, the contingency is canceled as a whole
+        /// </summary>
+        /// <param name="rejectedIbOrderId">The IB order id of the rejected order</param>
+        /// <param name="rejectedOrders">The rejected order, all the legs for a combo order</param>
+        /// <param name="reason">The rejection reason</param>
+        private void CancelNotTransmittedContingentOrders(int rejectedIbOrderId, List<Order> rejectedOrders, string reason)
+        {
+            var rejected = rejectedOrders.FirstOrDefault(order => order?.Contingency != null);
+            if (rejected == null)
+            {
+                return;
+            }
+
+            List<OrderEvent> cancelEvents = null;
+            var canceledIbOrderId = rejectedIbOrderId;
+            foreach (var orderId in rejected.Contingency.OrderIds)
+            {
+                var order = _orderProvider.GetOrderById(orderId);
+                // orders not acknowledged by IB and already placed, the rest are rejected by IB on their own as their parent is gone
+                if (order == null || order.Status != OrderStatus.New || order.BrokerId.Count == 0)
+                {
+                    continue;
+                }
+
+                var ibOrderId = Parse.Int(order.BrokerId[0]);
+                if (ibOrderId == rejectedIbOrderId)
+                {
+                    continue;
+                }
+                if (ibOrderId != canceledIbOrderId)
+                {
+                    // the legs of a combo order share the IB order
+                    canceledIbOrderId = ibOrderId;
+                    try
+                    {
+                        _client.ClientSocket.cancelOrder(ibOrderId, new OrderCancel());
+                    }
+                    catch (Exception err)
+                    {
+                        Log.Error(err);
+                    }
+                }
+                (cancelEvents ??= new()).Add(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
+                {
+                    Status = OrderStatus.Canceled,
+                    Message = $"Contingent order {rejected.Id} was rejected: {reason}"
+                });
+            }
+
+            if (cancelEvents != null)
+            {
+                OnOrderEvents(cancelEvents);
             }
         }
 
@@ -2598,6 +2881,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 Log.Trace($"InteractiveBrokersBrokerage.HandleOpenOrder(): {e}");
 
+                if (e.Order.ParentId != 0 || !string.IsNullOrEmpty(e.Order.OcaGroup))
+                {
+                    _contingentOrderAttributes[e.Order.OrderId] = (e.Order.ParentId, e.Order.OcaGroup, e.Order.OcaType);
+                }
+
                 if (!CheckIfConnected())
                 {
                     // before we call get open orders which might not be fully initialized/loaded
@@ -2762,12 +3050,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return;
                 }
 
-                // For financial advisor orders, we first receive executions and commission reports for the master order,
-                // followed by executions and commission reports for all allocations.
-                // We don't want to emit fills for these allocation events,
-                // so we ignore events received after the order is completely filled or
-                // executions for allocations which are already included in the master execution.
-
+                // For financial advisor group orders, IB sends executions only for the master account, for the whole order quantity.
+                // IB splits the shares into the client accounts on its side, and Lean tracks the group total, so the master executions are enough.
+// The client account allocations come only in a reqExecutions answer, with order id 0, so they match no order.
                 if (_commissionReports.TryGetValue(executionDetails.Execution.ExecId, out var commissionReport))
                 {
                     if (CanEmitFill(order, executionDetails.Execution))
@@ -2849,7 +3134,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 if (executionDetails.Execution.Liquidation == 1)
                 {
-                    var currentQuantityFilled = Convert.ToInt32(executionDetails.Execution.Shares);
+                    var currentQuantityFilled = executionDetails.Execution.Shares;
                     if (executionDetails.Execution.Side == "SLD")
                     {
                         // BOT for bought, SLD for sold
@@ -2978,42 +3263,24 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 var targetOrderCommissionReport = fillDetails.CommissionReport;
 
                 var absoluteQuantity = targetOrder.AbsoluteQuantity;
-                decimal currentQuantityFilled;
-                decimal remainingQuantity;
-                OrderStatus status;
-                if (UsesExactFinancialAdvisorFillQuantity(targetOrder))
+                var currentQuantityFilled = targetOrderExecutionDetails.Execution.Shares;
+                var totalQuantityFilled = targetOrderExecutionDetails.Execution.CumQty;
+                var remainingQuantity = absoluteQuantity - totalQuantityFilled;
+                if (UsesFinancialAdvisorFillResidualTolerance(targetOrder))
                 {
-                    currentQuantityFilled =
-                        targetOrderExecutionDetails.Execution.Shares;
-                    remainingQuantity =
-                        absoluteQuantity -
-                        targetOrderExecutionDetails.Execution.CumQty;
-                    var lotSize =
-                        GetSymbolProperties(targetOrder.Symbol).LotSize;
-                    var residualTolerance = Math.Abs(lotSize) / 1000000m;
+                    var residualTolerance = Math.Abs(GetSymbolProperties(targetOrder.Symbol).LotSize) / 1000000m;
                     if (Math.Abs(remainingQuantity) < residualTolerance)
                     {
                         remainingQuantity = 0m;
                     }
-
-                    status = remainingQuantity > 0
-                        ? OrderStatus.PartiallyFilled
-                        : OrderStatus.Filled;
                 }
-                else
-                {
-                    currentQuantityFilled = Convert.ToInt32(targetOrderExecutionDetails.Execution.Shares);
-                    var totalQuantityFilled = Convert.ToInt32(targetOrderExecutionDetails.Execution.CumQty);
-                    remainingQuantity = Convert.ToInt32(absoluteQuantity - totalQuantityFilled);
-
-                    // set order status based on remaining quantity
-                    status = remainingQuantity > 0 ? OrderStatus.PartiallyFilled : OrderStatus.Filled;
-                }
-
                 var price = NormalizePriceToLean(targetOrderExecutionDetails.Execution.Price, targetOrder.Symbol);
                 var orderFee = new OrderFee(new CashAmount(
                     Convert.ToDecimal(targetOrderCommissionReport.CommissionAndFees),
                     targetOrderCommissionReport.Currency.ToUpperInvariant()));
+
+                // set order status based on remaining quantity
+                var status = remainingQuantity > 0 ? OrderStatus.PartiallyFilled : OrderStatus.Filled;
 
                 // mark sells as negative quantities
                 var fillQuantity = targetOrder.Direction == OrderDirection.Buy ? currentQuantityFilled : -currentQuantityFilled;
@@ -3035,6 +3302,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 // fire the order fill events
                 OnOrderEvents(fillEvents);
+
+                // contingent orders: the orders attached to the one which filled are no longer held
+                OnContingentOrdersTriggered(fillEvents, _orderProvider);
             }
         }
 
@@ -3210,7 +3480,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // check trailing stop before stop market because TrailingStopOrder inherits StopMarketOrder
             else if (trailingStopOrder != null)
             {
-                ibOrder.TrailStopPrice = NormalizePriceToBrokerage(trailingStopOrder.StopPrice, contract, order.Symbol);
+                // a held contingent order has no stop price yet, IB starts trailing from the market price once it's activated
+                if (trailingStopOrder.StopPrice != 0)
+                {
+                    ibOrder.TrailStopPrice = NormalizePriceToBrokerage(trailingStopOrder.StopPrice, contract, order.Symbol);
+                }
                 if (trailingStopOrder.TrailingAsPercentage)
                 {
                     ibOrder.TrailingPercent = (double)trailingStopOrder.TrailingAmount * 100;
@@ -3290,7 +3564,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                         ibOrder.FaMethod = orderProperties.FaMethod;
 
-                        if (ibOrder.FaMethod == "PctChange")
+                        if (IsPercentChangeAllocationMethod(ibOrder.FaMethod))
                         {
                             ibOrder.FaPercentage = orderProperties.FaPercentage.ToStringInvariant();
                             ibOrder.TotalQuantity = 0;
@@ -3305,9 +3579,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ConfigureFinancialAdvisorOrder(ibOrder, order);
             }
 
-            // not yet supported
-            //ibOrder.ParentId =
-            //ibOrder.OcaGroup =
+            // contingent orders update: IB expects back the parent id and OCA group it reports for the order
+            if (_contingentOrderAttributes.TryGetValue(ibOrderId, out var contingentOrderAttributes))
+            {
+                ibOrder.ParentId = contingentOrderAttributes.ParentId;
+                ibOrder.OcaGroup = contingentOrderAttributes.OcaGroup;
+                ibOrder.OcaType = contingentOrderAttributes.OcaType;
+            }
 
             return ibOrder;
         }
@@ -3316,9 +3594,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             var result = new List<Order>();
             var quantitySign = ConvertOrderDirection(ibOrder.Action) == OrderDirection.Sell ? -1 : 1;
-            var properties = CreateRecoveredOrderProperties(ibOrder);
-            var quantity = (properties != null && contract.SecType != IB.SecurityType.Bag
-                ? ibOrder.TotalQuantity : Convert.ToInt32(ibOrder.TotalQuantity)) * quantitySign;
+            var orderProperties = ConvertOrderProperties(ibOrder);
+            var quantity = ibOrder.TotalQuantity * quantitySign;
 
             if (contract.SecType == IB.SecurityType.Bag)
             {
@@ -3350,7 +3627,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!TryConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, orderType,
                             comboLeg.Ratio * quantitySignLeg * quantity, legLimitPrice, 0, 0, contractDetails.Contract, group, orderState,
-                            properties?.Clone(), out var leanOrder))
+                            orderProperties?.Clone(), out var leanOrder))
                     {
                         // if we fail to convert one leg, we fail the whole order
                         return new List<Order>();
@@ -3360,12 +3637,63 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
             else if (TryConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, ConvertOrderType(ibOrder), quantity,
-                ibOrder.LmtPrice, ibOrder.TrailStopPrice, ibOrder.TrailingPercent, contract, null, orderState, properties, out var leanOrder))
+                ibOrder.LmtPrice, ibOrder.TrailStopPrice, ibOrder.TrailingPercent, contract, null, orderState, orderProperties,
+                out var leanOrder))
             {
                 result.Add(leanOrder);
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Converts an IB open order into Lean order properties: its account group or managed account
+        /// and its outside regular trading hours flag
+        /// </summary>
+        private InteractiveBrokersOrderProperties ConvertOrderProperties(IBApi.Order ibOrder)
+        {
+            try
+            {
+                var orderProperties = new InteractiveBrokersOrderProperties { OutsideRegularTradingHours = ibOrder.OutsideRth };
+
+                if (!string.IsNullOrWhiteSpace(ibOrder.FaGroup))
+                {
+                    // order for an account group
+                    orderProperties.FaGroup = ibOrder.FaGroup;
+                    // https://interactivebrokers.github.io/tws-api/financial_advisor.html#groups_merge
+                    // IB has no such field: "openOrder callback will report Profile in place of Group if order was for profile"
+                    // orderProperties.FaProfile = ibOrder.FaGroup;
+                    orderProperties.FaMethod = ibOrder.FaMethod;
+                    if (IsPercentChangeAllocationMethod(ibOrder.FaMethod)
+                        && int.TryParse(ibOrder.FaPercentage, NumberStyles.Integer, CultureInfo.InvariantCulture, out var faPercentage))
+                    {
+                        orderProperties.FaPercentage = faPercentage;
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(ibOrder.Account) && ibOrder.Account != _account)
+                {
+                    // order for a single managed account
+                    orderProperties.Account = ibOrder.Account;
+                }
+
+                ConfigureFinancialAdvisorRecoveredOrderProperties(ibOrder, orderProperties);
+                return orderProperties;
+            }
+            catch (Exception err)
+            {
+                // the order is rebuilt with the default order properties, like before
+                Log.Error(err, $"Failed to convert the order properties of the open order {ibOrder.OrderId}: Account: {ibOrder.Account}, " +
+                    $"FaGroup: {ibOrder.FaGroup}, FaMethod: {ibOrder.FaMethod}, FaPercentage: {ibOrder.FaPercentage}, OutsideRth: {ibOrder.OutsideRth}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Whether the allocation method of an account group order is the percent change method
+        /// </summary>
+        private static bool IsPercentChangeAllocationMethod(string allocationMethod)
+        {
+            return string.Equals(allocationMethod, PercentChangeAllocationMethod, StringComparison.InvariantCultureIgnoreCase);
         }
 
         private void CheckContractConversionError(Exception exception, Contract contract, bool rethrow = true)
@@ -3390,12 +3718,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private bool TryConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
             double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState,
-            IOrderProperties properties, out Order leanOrder)
+            IOrderProperties orderProperties, out Order leanOrder)
         {
             try
             {
                 leanOrder = ConvertOrder(timeInForce, goodTillDate, ibOrderId, auxPrice, orderType, quantity,
-                    limitPrice, trailingStopPrice, trailingPercentage, contract, groupOrderManager, orderState, properties);
+                    limitPrice, trailingStopPrice, trailingPercentage, contract, groupOrderManager, orderState, orderProperties);
                 return true;
             }
             catch (Exception ex)
@@ -3408,7 +3736,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private Order ConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
             double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState,
-            IOrderProperties properties)
+            IOrderProperties orderProperties)
         {
             // GetOpenOrders rebuilds orders that predate the algorithm; IB doesn't report their original
             // submission time, so we stamp the discovery time instead of DateTime.MinValue to keep
@@ -3424,7 +3752,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new MarketOrder(mappedSymbol,
                         quantity,
                         orderTime,
-                        properties: properties
+                        properties: orderProperties
                         );
                     break;
 
@@ -3432,14 +3760,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new MarketOnOpenOrder(mappedSymbol,
                         quantity,
                         orderTime,
-                        properties: properties);
+                        properties: orderProperties);
                     break;
 
                 case OrderType.MarketOnClose:
                     order = new MarketOnCloseOrder(mappedSymbol,
                         quantity,
                         orderTime,
-                        properties: properties
+                        properties: orderProperties
                         );
                     break;
 
@@ -3448,7 +3776,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
                         orderTime,
-                        properties: properties
+                        properties: orderProperties
                         );
                     break;
 
@@ -3457,7 +3785,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         NormalizePriceToLean(auxPrice, mappedSymbol),
                         orderTime,
-                        properties: properties
+                        properties: orderProperties
                         );
                     break;
 
@@ -3467,7 +3795,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         NormalizePriceToLean(auxPrice, mappedSymbol),
                         NormalizePriceToLean(limitPrice, mappedSymbol),
                         orderTime,
-                        properties: properties
+                        properties: orderProperties
                         );
                     break;
 
@@ -3491,7 +3819,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         trailingAmount,
                         trailingAsPecentage,
                         orderTime,
-                        properties: properties
+                        properties: orderProperties
                     );
                     break;
 
@@ -3501,7 +3829,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         NormalizePriceToLean(auxPrice, mappedSymbol),
                         NormalizePriceToLean(limitPrice, mappedSymbol),
                         orderTime,
-                        properties: properties
+                        properties: orderProperties
                     );
                     break;
 
@@ -3510,7 +3838,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         quantity,
                         orderTime,
                         groupOrderManager,
-                        properties: properties
+                        properties: orderProperties
                     );
                     break;
 
@@ -3520,7 +3848,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         NormalizePriceToLean(limitPrice, mappedSymbol),
                         orderTime,
                         groupOrderManager,
-                        properties: properties
+                        properties: orderProperties
                     );
                     break;
 
@@ -3530,7 +3858,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         NormalizePriceToLean(limitPrice, mappedSymbol),
                         orderTime,
                         groupOrderManager,
-                        properties: properties
+                        properties: orderProperties
                     );
                     break;
 
@@ -4301,7 +4629,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var account = job.BrokerageData["ib-account"];
             var userId = job.BrokerageData["ib-user-name"];
             var password = job.BrokerageData["ib-password"];
-            var tradingMode = job.BrokerageData["ib-trading-mode"];
             var agentDescription = job.BrokerageData["ib-agent-description"];
             var financialAdvisorErrors = new List<string>();
             InteractiveBrokersBrokerageFactory.ParseFinancialAdvisorSettings(
@@ -4331,7 +4658,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ibVersion,
                 userId,
                 password,
-                tradingMode,
                 agentDescription,
                 loadExistingHoldings,
                 financialAdvisorsGroupFilter: financialAdvisorsGroupFilter,

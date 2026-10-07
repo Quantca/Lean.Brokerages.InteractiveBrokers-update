@@ -33,14 +33,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// The number of positions held.
         /// If the position is 0, it means the position has just cleared.
         /// </summary>
-        public int Position => Convert.ToInt32(PositionQuantity);
+        public decimal Position { get; }
 
         /// <summary>
-        /// The exact position quantity reported by Interactive Brokers. Unlike <see cref="Position"/>, this
-        /// value preserves fractional quantities without applying the legacy integer projection.
+        /// The exact position quantity reported by Interactive Brokers, an alias for <see cref="Position"/>.
         /// If the position is 0, it means the position has just cleared.
         /// </summary>
-        public decimal PositionQuantity { get; }
+        public decimal PositionQuantity => Position;
 
         /// <summary>
         /// Gets the originating positions-multi request identifier, if any.
@@ -80,6 +79,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         /// <summary>
         /// Initializes a new instance of the <see cref="UpdatePortfolioEventArgs"/> class
         /// </summary>
+        public UpdatePortfolioEventArgs(Contract contract, decimal position, double marketPrice, double marketValue, double averageCost, double unrealisedPnl, double realisedPnl, string accountName)
+            : this(contract, position, marketPrice, marketValue, averageCost, unrealisedPnl, realisedPnl, accountName, null)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance with an integer position, retaining the previous constructor signature.
+        /// </summary>
         public UpdatePortfolioEventArgs(Contract contract, int position, double marketPrice, double marketValue, double averageCost, double unrealisedPnl, double realisedPnl, string accountName)
             : this(contract, (decimal)position, marketPrice, marketValue, averageCost, unrealisedPnl, realisedPnl, accountName)
         {
@@ -97,10 +104,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
             double unrealisedPnl,
             double realisedPnl,
             string accountName,
-            int? positionsMultiRequestId = null)
+            int? positionsMultiRequestId)
         {
             Contract = contract;
-            PositionQuantity = position;
+            Position = position;
             PositionsMultiRequestId = positionsMultiRequestId;
             MarketPrice = marketPrice;
             MarketValue = marketValue;

@@ -108,7 +108,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreSame(contract, positionUpdate.Contract);
                 Assert.AreEqual(1.25m, positionUpdate.Position);
                 Assert.AreEqual(100.5, positionUpdate.AverageCost);
-                Assert.AreEqual(1, legacyPositionUpdate.Position);
+                Assert.AreEqual(1.25m, legacyPositionUpdate.Position);
                 Assert.AreEqual(1.25m, legacyPositionUpdate.PositionQuantity);
                 Assert.AreEqual("DU123", legacyPositionUpdate.AccountName);
                 Assert.AreEqual(18, legacyPositionUpdate.PositionsMultiRequestId);
@@ -390,7 +390,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void PortfolioCallbacksPreserveExactQuantityAndLegacyConversion()
+        public void PortfolioCallbacksPreserveUpstreamDecimalQuantity()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
             UpdatePortfolioEventArgs update = null;
@@ -403,22 +403,20 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.Multiple(() =>
             {
-                Assert.AreEqual(1, update.Position);
+                Assert.AreEqual(1.25m, update.Position);
                 Assert.AreEqual(1.25m, update.PositionQuantity);
                 Assert.IsNull(update.PositionsMultiRequestId);
                 Assert.IsNull(accountUpdate.AccountUpdatesMultiRequestId);
             });
         }
 
-        [TestCase(1.5, 2)]
-        [TestCase(2.5, 2)]
-        [TestCase(0.5, 0)]
-        [TestCase(-1.5, -2)]
-        [TestCase(-2.5, -2)]
-        [TestCase(-0.5, 0)]
-        public void LegacyPositionProjectionUsesUpstreamRounding(
-            double position,
-            int expected)
+        [TestCase(1.5)]
+        [TestCase(2.5)]
+        [TestCase(0.5)]
+        [TestCase(-1.5)]
+        [TestCase(-2.5)]
+        [TestCase(-0.5)]
+        public void PortfolioPositionPreservesFractionalQuantity(double position)
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
             UpdatePortfolioEventArgs update = null;
@@ -436,7 +434,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.Multiple(() =>
             {
-                Assert.AreEqual(expected, update.Position);
+                Assert.AreEqual(Convert.ToDecimal(position), update.Position);
                 Assert.AreEqual(Convert.ToDecimal(position), update.PositionQuantity);
             });
         }
@@ -462,7 +460,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void PositionMultiPreservesExactOverflowAndThrowsOnlyOnLegacyRead()
+        public void PositionMultiPreservesFullDecimalRange()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
             var exactUpdates = new List<PositionMultiEventArgs>();
@@ -498,12 +496,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 CollectionAssert.AreEqual(new[] { 41, 42 }, internalEndRequestIds);
                 Assert.AreEqual(2, publicEndCount);
             });
-            Assert.Throws<OverflowException>(() => _ = legacyUpdates[0].Position);
-            Assert.Throws<OverflowException>(() => _ = legacyUpdates[1].Position);
+            Assert.AreEqual(decimal.MaxValue, legacyUpdates[0].Position);
+            Assert.AreEqual(decimal.MinValue, legacyUpdates[1].Position);
         }
 
         [Test]
-        public void OrdinaryPortfolioUpdatePreservesExactOverflowAndThrowsOnlyOnLegacyRead()
+        public void OrdinaryPortfolioUpdatePreservesFullDecimalRange()
         {
             using var client = new InteractiveBrokersClient(new EReaderMonitorSignal());
             var updates = new List<UpdatePortfolioEventArgs>();
@@ -523,8 +521,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.IsNull(updates[0].PositionsMultiRequestId);
                 Assert.IsNull(updates[1].PositionsMultiRequestId);
             });
-            Assert.Throws<OverflowException>(() => _ = updates[0].Position);
-            Assert.Throws<OverflowException>(() => _ = updates[1].Position);
+            Assert.AreEqual(decimal.MaxValue, updates[0].Position);
+            Assert.AreEqual(decimal.MinValue, updates[1].Position);
         }
 
         private static readonly decimal[] DiagnosticPositionQuantities =

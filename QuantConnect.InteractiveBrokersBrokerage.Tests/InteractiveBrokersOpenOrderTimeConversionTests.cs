@@ -92,7 +92,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 contract,             // contract
                 null,                 // groupOrderManager
                 orderState,           // orderState
-                null                  // properties
+                null                  // orderProperties
             });
         }
 

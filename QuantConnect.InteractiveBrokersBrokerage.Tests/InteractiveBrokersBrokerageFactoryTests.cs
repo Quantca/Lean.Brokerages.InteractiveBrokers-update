@@ -37,7 +37,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         public static readonly IAlgorithm AlgorithmDependency = new InteractiveBrokersBrokerageFactoryAlgorithmDependency();
 
         [Test]
-        public void PublicConstructorsPreserveBinaryCompatibilityTest()
+        public void PublicConstructorsMatchCurrentUpstreamAndRetainExplicitFaOverloadTest()
         {
             var constructors = typeof(InteractiveBrokersBrokerage)
                 .GetConstructors(BindingFlags.Instance | BindingFlags.Public);
@@ -52,7 +52,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 new[] { typeof(IAlgorithm), typeof(IOrderProvider), typeof(ISecurityProvider), typeof(string) },
                 new[] { "algorithm", "orderProvider", "securityProvider", "account" });
 
-            var legacyParameters = AssertConstructor(
+            var upstreamParameters = AssertConstructor(
                 constructors,
                 new[]
                 {
@@ -62,7 +62,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     typeof(string),
                     typeof(string),
                     typeof(int),
-                    typeof(string),
                     typeof(string),
                     typeof(string),
                     typeof(string),
@@ -84,7 +83,6 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     "ibVersion",
                     "userName",
                     "password",
-                    "tradingMode",
                     "agentDescription",
                     "loadExistingHoldings",
                     "weeklyRestartUtcTime",
@@ -133,17 +131,29 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     "financialAdvisorUnifiedGroupsEnabled"
                 });
 
+            var accountInferredUnifiedParameters = AssertConstructor(
+                constructors,
+                unifiedParameters.Where((_, index) => index != 10).Select(parameter => parameter.ParameterType).ToArray(),
+                unifiedParameters.Where((_, index) => index != 10).Select(parameter => parameter.Name).ToArray());
+
+            // Compile the current upstream positional call without constructing a brokerage or connecting.
+            Func<InteractiveBrokersBrokerage> upstreamPositionalCall = () => new InteractiveBrokersBrokerage(
+                null, null, null, "DU123", "127.0.0.1", 0, string.Empty, string.Empty,
+                string.Empty, string.Empty, IB.AgentDescription.Individual);
+
             Assert.Multiple(() =>
             {
-                Assert.IsTrue(legacyParameters.Take(11).All(parameter => !parameter.IsOptional));
-                Assert.IsTrue(legacyParameters.Skip(11).All(parameter => parameter.IsOptional));
+                Assert.IsNotNull(upstreamPositionalCall);
+                Assert.IsTrue(upstreamParameters.Take(10).All(parameter => !parameter.IsOptional));
+                Assert.IsTrue(upstreamParameters.Skip(10).All(parameter => parameter.IsOptional));
                 Assert.AreEqual(
                     IB.AgentDescription.Individual,
-                    legacyParameters[11].DefaultValue);
-                Assert.AreEqual(true, legacyParameters[12].DefaultValue);
-                Assert.IsNull(legacyParameters[13].DefaultValue);
-                Assert.IsNull(legacyParameters[14].DefaultValue);
+                    upstreamParameters[10].DefaultValue);
+                Assert.AreEqual(true, upstreamParameters[11].DefaultValue);
+                Assert.IsNull(upstreamParameters[12].DefaultValue);
+                Assert.IsNull(upstreamParameters[13].DefaultValue);
                 Assert.IsTrue(unifiedParameters.All(parameter => !parameter.IsOptional));
+                Assert.IsTrue(accountInferredUnifiedParameters.All(parameter => !parameter.IsOptional));
             });
         }
 

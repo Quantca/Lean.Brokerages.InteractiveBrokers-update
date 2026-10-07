@@ -295,8 +295,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         [TestCase(
             "PctChange",
-            9926d,
-            TestName = "UnifiedPctChangeGroupFillUsesLegacyQuantityPath")]
+            9925.5d,
+            TestName = "UnifiedPctChangeGroupFillUsesUpstreamDecimalQuantityPath")]
         [TestCase(
             "Percent",
             9925.5d,
@@ -337,7 +337,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
         [TestCase(false, true)]
         [TestCase(true, false)]
-        public void LegacyFillAccountingRemainsUnchangedTest(
+        public void NonUnifiedFillAccountingUsesUpstreamDecimalQuantityTest(
             bool unifiedGroupsEnabled,
             bool financialAdvisorAccount)
         {
@@ -360,7 +360,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 9925.5m,
                 9925.5m);
 
-            Assert.AreEqual(9926m, orderEvent.FillQuantity);
+            Assert.AreEqual(9925.5m, orderEvent.FillQuantity);
             Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
             Assert.AreEqual(
                 "Interactive Brokers Order Fill Event",
@@ -488,8 +488,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual("OriginalMethod", ibOrder.FaMethod);
                 Assert.AreEqual("12.5", ibOrder.FaPercentage);
                 Assert.AreEqual(7m, ibOrder.TotalQuantity);
-                Assert.AreEqual(2m, orderEvent.FillQuantity);
-                Assert.AreEqual(OrderStatus.Filled, orderEvent.Status);
+                Assert.AreEqual(1.5m, orderEvent.FillQuantity);
+                Assert.AreEqual(OrderStatus.PartiallyFilled, orderEvent.Status);
             });
         }
 
@@ -1634,8 +1634,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             });
         }
 
-        [Test]
-        public void AdmissionValidationFailureLeavesBrokerageOrderStateUntouchedTest()
+        [TestCase(false)]
+        [TestCase(true)]
+        public void AdmissionValidationFailureLeavesBrokerageOrderStateUntouchedTest(bool isContingent)
         {
             var brokerage = CreateOfflineBrokerage();
             UnifiedGroupsField.SetValue(brokerage, true);
@@ -1655,6 +1656,14 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 FaMethod = "PctChange",
                 FaPercentage = 25
             });
+            if (isContingent)
+            {
+                var provider = new OrderProvider();
+                var sibling = CreateOrder(new InteractiveBrokersOrderProperties { Account = "ManagedAccount" });
+                provider.Add(order);
+                provider.Add(sibling);
+                OrderContingency.Relate(ContingencyType.OneCancelsOther, new[] { order, sibling });
+            }
             var client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
             var connectedField = FindSocketConnectedField(client.ClientSocket);
             ClientField.SetValue(brokerage, client);
@@ -1667,12 +1676,143 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(0, GetCollectionCount(RequestInformationField.GetValue(brokerage)));
                 Assert.AreEqual(0, GetCollectionCount(PendingOrderResponseField.GetValue(brokerage)));
                 Assert.AreEqual(0, FirstFinancialAdvisorOrderClaimedField.GetValue(brokerage));
+                var cache = typeof(QuantConnect.Brokerages.Brokerage).GetProperty("ContingentOrderCache",
+                    BindingFlags.Instance | BindingFlags.NonPublic).GetValue(brokerage);
+                Assert.AreEqual(0, GetCollectionCount(cache.GetType().GetField("_pendingOrders",
+                    BindingFlags.Instance | BindingFlags.NonPublic).GetValue(cache)));
             }
             finally
             {
                 connectedField.SetValue(client.ClientSocket, false);
                 client.Dispose();
                 ClientField.SetValue(brokerage, null);
+            }
+        }
+
+        [Test]
+        public void ContingentOrdersCanUseDifferentRoutesAcrossUnitsTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var orders = new List<LeanOrder>
+            {
+                CreateOrder(new InteractiveBrokersOrderProperties { FaGroup = FaGroupName, FaMethod = "Equal" }),
+                CreateOrder(new InteractiveBrokersOrderProperties { Account = "ManagedAccount" })
+            };
+            var provider = new OrderProvider();
+            foreach (var order in orders)
+            {
+                provider.Add(order);
+            }
+            OrderContingency.Relate(ContingencyType.OneCancelsOther, orders);
+
+            Assert.DoesNotThrow(() => ValidateContingentOrders(brokerage, orders));
+        }
+
+        [Test]
+        public void ContingentComboLegsMustHaveEquivalentRoutesWithoutProviderTest()
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            var orders = CreateComboOrders(brokerage,
+                new InteractiveBrokersOrderProperties { FaGroup = FaGroupName, FaMethod = "Equal" },
+                new InteractiveBrokersOrderProperties { Account = "ManagedAccount" });
+            OrderProviderField.SetValue(brokerage, null);
+            var sibling = CreateOrder(new InteractiveBrokersOrderProperties { Account = "ManagedAccount" });
+            var provider = new OrderProvider();
+            foreach (var order in orders.Cast<LeanOrder>().Append(sibling))
+            {
+                provider.Add(order);
+            }
+            OrderContingency.Relate(ContingencyType.OneCancelsOther,
+                orders.Cast<LeanOrder>().Append(sibling));
+
+            StringAssert.Contains("All combo legs", Assert.Throws<InvalidOperationException>(
+                () => ValidateContingentOrders(brokerage, orders.Cast<LeanOrder>().ToList())).Message);
+        }
+
+        [TestCase("ExplicitPctChange")]
+        [TestCase("Blocked")]
+        [TestCase("SavedAllocationChanged")]
+        public void CompletedContingentSetRevalidatesPreviouslyCachedOrderBeforeWriteTest(string drift)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, true);
+            using var stateFixture = new FinancialAdvisorAccountStateFixture();
+            AccountStateField.SetValue(brokerage, stateFixture.State);
+            var orders = new List<LeanOrder>
+            {
+                CreateOrder(new InteractiveBrokersOrderProperties { FaGroup = FaGroupName, FaMethod = "Equal" }),
+                CreateOrder(new InteractiveBrokersOrderProperties { Account = "ManagedAccount" })
+            };
+            var provider = new OrderProvider();
+            foreach (var order in orders)
+            {
+                provider.Add(order);
+            }
+            OrderContingency.Relate(ContingencyType.OneCancelsOther, orders);
+            using var client = new IB.InteractiveBrokersClient(new EReaderMonitorSignal());
+            var connectedField = FindSocketConnectedField(client.ClientSocket);
+            ClientField.SetValue(brokerage, client);
+            connectedField.SetValue(client.ClientSocket, true);
+            try
+            {
+                Assert.IsTrue(brokerage.PlaceOrder(orders[0]), "The first order waits in the upstream cache.");
+                if (drift == "ExplicitPctChange")
+                {
+                    ((InteractiveBrokersOrderProperties)orders[0].Properties).FaMethod = "PctChange";
+                }
+                else if (drift == "Blocked")
+                {
+                    GroupTradingBlockedField.SetValue(stateFixture.State, true);
+                }
+                else
+                {
+                    ((InteractiveBrokersOrderProperties)orders[0].Properties).FaMethod = string.Empty;
+                    SnapshotField.SetValue(stateFixture.State,
+                        CreateSnapshot(BrokerageAccountSnapshotStatus.Ready,
+                            new BrokerageAccountGroup(FaGroupName, "ContractsOrShares",
+                                new[] { "ManagedAccount" },
+                                new Dictionary<string, decimal> { ["ManagedAccount"] = 9m })));
+                }
+
+                Assert.IsFalse(brokerage.PlaceOrder(orders[1]));
+                Assert.IsTrue(orders.All(order => order.BrokerId.Count == 0));
+                Assert.AreEqual(0, GetCollectionCount(RequestInformationField.GetValue(brokerage)));
+                Assert.AreEqual(0, GetCollectionCount(PendingOrderResponseField.GetValue(brokerage)));
+                Assert.AreEqual(0, FirstFinancialAdvisorOrderClaimedField.GetValue(brokerage));
+            }
+            finally
+            {
+                connectedField.SetValue(client.ClientSocket, false);
+                ClientField.SetValue(brokerage, null);
+            }
+        }
+
+        [TestCase(false, true)]
+        [TestCase(true, false)]
+        public void ContingentValidationLeavesNonUnifiedOrNonFaOrdersUntouchedTest(bool unified, bool isFa)
+        {
+            var brokerage = CreateOfflineBrokerage();
+            UnifiedGroupsField.SetValue(brokerage, unified);
+            AccountField.SetValue(brokerage, isFa ? FaMasterAccount : "DU1234567");
+            var orders = new List<LeanOrder>
+            {
+                CreateOrder(new InteractiveBrokersOrderProperties { FaGroup = FaGroupName, FaMethod = "PctChange" })
+            };
+            Assert.DoesNotThrow(() => ValidateContingentOrders(brokerage, orders));
+        }
+
+        private static void ValidateContingentOrders(InteractiveBrokersBrokerage brokerage, List<LeanOrder> orders)
+        {
+            try
+            {
+                typeof(InteractiveBrokersBrokerage).GetMethod("ValidateFinancialAdvisorContingentOrders",
+                    BindingFlags.Instance | BindingFlags.NonPublic).Invoke(brokerage, new object[] { orders });
+            }
+            catch (TargetInvocationException exception)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
             }
         }
 
@@ -2053,8 +2193,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.Multiple(() =>
             {
-                Assert.AreEqual(20m, recovered.Quantity);
-                Assert.AreEqual(typeof(OrderProperties), recovered.Properties.GetType());
+                Assert.AreEqual(19.75m, recovered.Quantity);
+                Assert.AreEqual(typeof(InteractiveBrokersOrderProperties), recovered.Properties.GetType());
+                Assert.AreEqual(FaGroupName, ((InteractiveBrokersOrderProperties)recovered.Properties).FaGroup);
+                Assert.IsNull(((InteractiveBrokersOrderProperties)recovered.Properties).Account);
             });
         }
 

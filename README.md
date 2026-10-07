@@ -135,6 +135,8 @@ LEAN supports IB's current unified Allocation Groups model, configured in TWS as
 
 Unified Financial Advisor activation uses the brokerage's existing FA-master account recognition. It does not broaden that classifier to additional IBroker account-code formats.
 
+FA integration follows the current upstream brokerage: the account identifier determines paper or live mode, and incoming positions, executions, and recovered quantities retain decimals regardless of FA activation. The explicit FA constructor with a `tradingMode` argument remains a compatibility wrapper, but that argument no longer selects the mode. The current upstream constructor omits it. Outgoing ordinary order quantities retain upstream conversion; unified FA group orders retain their existing exact-quantity validation and routing. Contingent sets use upstream OCO/OTO/OUO/bracket handling, with FA admission rechecked for every cached member before submission. Combo legs must share an effective route; independent contingent units may use different routes. Unified `PctChange` remains unsupported.
+
 | Setting | Description |
 | --- | --- |
 | `ib-financial-advisors-group-filter` | Limits the deployment to one FA group. Leave it empty for multi-group operation and select `FaGroup` on each group order. When unified groups are enabled, a nonempty filter is a strict boundary and LEAN rejects a group order whose explicit `FaGroup` does not match it. Direct managed-account orders remain a separate route. |

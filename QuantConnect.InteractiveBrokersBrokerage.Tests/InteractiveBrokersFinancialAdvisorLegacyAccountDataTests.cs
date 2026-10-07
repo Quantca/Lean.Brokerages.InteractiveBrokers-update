@@ -101,7 +101,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                     upstream.GetHoldingQuantity(),
                     unified.GetHoldingQuantity());
                 Assert.AreEqual(
-                    Convert.ToInt32(ExactPosition) + Convert.ToInt32(999.5m),
+                    ExactPosition + 999.5m,
                     unified.GetHoldingQuantity(),
                     "Unified FA settings must preserve upstream negative-ID rows for a non-FA account.");
             });
@@ -185,9 +185,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             {
                 Assert.AreEqual(CashBalance, scenario.GetCashBalance());
                 Assert.AreEqual(
-                    unifiedGroupsEnabled
-                        ? ExactPosition
-                        : Convert.ToInt32(ExactPosition),
+                    ExactPosition,
                     scenario.GetHoldingQuantity());
                 Assert.AreEqual(
                     "SPY",
